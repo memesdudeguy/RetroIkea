@@ -6,9 +6,13 @@ A first-person Vulkan + SDL2 game: explore a big-box store, avoid staff at night
 
 ## Demo
 
-Screen recording **2026-03-30 21-50-04** (source: `~/2026-03-30 21-50-04.mp4`, committed as [`media/demo.mp4`](media/demo.mp4)):
+Screen recording **2026-03-30 21-50-04** (source: `~/2026-03-30 21-50-04.mp4`, committed as [`media/demo.mp4`](media/demo.mp4)).
 
-<video src="https://github.com/memesdudeguy/RetroIkea/raw/main/media/demo.mp4" controls width="100%"></video>
+GitHub **does not show** `<video>` embeds in READMEs (they are stripped). Use the poster (click) or the link below to watch the MP4.
+
+[![Watch demo — opens MP4](media/demo-poster.jpg)](https://github.com/memesdudeguy/RetroIkea/raw/main/media/demo.mp4)
+
+**[Open demo video (MP4)](https://github.com/memesdudeguy/RetroIkea/raw/main/media/demo.mp4)**
 
 ## Requirements
 
