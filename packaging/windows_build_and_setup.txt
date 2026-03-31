@@ -1,0 +1,48 @@
+Windows build + installer steps
+==============================
+
+1) Install dependencies on Windows
+- Vulkan SDK (includes glslc and vulkan-1 import library)
+- SDL2 development package
+- SDL2_image development package
+- CMake
+- MinGW-w64 or MSVC toolchain
+- Inno Setup 6 (iscc.exe)
+
+2) Configure + build game executable
+Example (MinGW):
+
+  cmake -S . -B build-win -G "MinGW Makefiles"
+  cmake --build build-win --config Release -j
+
+Expected output:
+  build-win/Release/RetroIkea.exe
+  (or build-win/RetroIkea.exe depending on generator)
+
+3) Create installer with Inno Setup
+
+  iscc packaging/windows_setup.iss
+
+Output:
+  packaging/RetroIkea.exe
+
+Notes
+- If you build with a different generator/path, update the Source path in
+  packaging/windows_setup.iss to point at your actual RetroIkea.exe.
+- Keep the assets folder next to the executable in the installer package.
+
+MinGW cross-build from Linux (this repo’s CMake)
+- The Windows target links Assimp statically and uses -static-libgcc,
+  -static-libstdc++, and static winpthread so you do NOT need to ship
+  libgcc_s_seh-1.dll, libstdc++-6.dll, libwinpthread-1.dll, or libassimp-5.dll.
+- After changing Assimp from shared to static, delete build-win/_deps/assimp-build
+  (or use a fresh build dir) and reconfigure so Assimp rebuilds as a static .a.
+
+Vulkan loader (vulkan-1.dll)
+- On real Windows, the Vulkan loader is normally already installed with the GPU
+  driver (System32). Do not bundle a random vulkan-1.dll in the installer; use
+  the system loader.
+- Under Wine, if you run the .exe from a Unix path and see “vulkan-1.dll not
+  found”, copy vulkan-1.dll from your Wine prefix, e.g.
+  ~/.wine/drive_c/windows/system32/vulkan-1.dll, into the same folder as
+  RetroIkea.exe for testing only.

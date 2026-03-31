@@ -1,0 +1,9 @@
+# CMake / FetchContent / local build (regenerate with cmake -B build)
+/build/
+/build-win/
+
+# MinGW Vulkan import lib generated for cross-builds (see CMake / vkshim)
+/vkshim/
+
+# Windows installer output (large; attach via GitHub Releases instead)
+packaging/*.exe
