@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(vulkan_game LANGUAGES CXX)
+project(vulkan_game VERSION 1.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -188,6 +188,7 @@ else()
 endif()
 
 target_compile_definitions(vulkan_game PRIVATE
+  "VULKAN_GAME_VERSION_STRING=\"${PROJECT_VERSION}\""
   SHADER_DIR="${CMAKE_CURRENT_BINARY_DIR}"
   "VULKAN_GAME_ASSETS_DIR=\"${VULKAN_GAME_ASSETS_DIR}\""
   "VULKAN_GAME_STORE_AMBIENT_WAV=\"${STORE_AMBIENT_WAV}\""

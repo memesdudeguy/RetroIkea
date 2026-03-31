@@ -1,4 +1,7 @@
 // Vulkan 3D mini-game: flat infinite ground (SDL2 + GLM)
+#ifndef VULKAN_GAME_VERSION_STRING
+#define VULKAN_GAME_VERSION_STRING "1.1.0"
+#endif
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_filesystem.h>
 #include <SDL2/SDL_image.h>
@@ -6815,7 +6818,8 @@ struct App {
     if (std::getenv("VULKAN_GAME_WINDOWED"))
       winFlags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE;
     window = SDL_CreateWindow(
-        "Vulkan 3D — hall — WASD | Shift sprint | crouch | slide | Space jump / air ledge grab (parkour)",
+        "retro ikea v" VULKAN_GAME_VERSION_STRING
+        " — hall — WASD | Shift sprint | crouch | slide | Space jump / air ledge grab (parkour)",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, winW, winH, winFlags);
     if (!window)
       throw std::runtime_error(std::string("SDL_CreateWindow: ") + SDL_GetError());
@@ -11925,7 +11929,8 @@ struct App {
       return;
     char tb[220];
     std::snprintf(tb, sizeof(tb),
-                  "retro ikea — hall — HP %.0f/%.0f — WASD | sprint | slide | Space jump + ledge grab",
+                  "retro ikea v" VULKAN_GAME_VERSION_STRING
+                  " — hall — HP %.0f/%.0f — WASD | sprint | slide | Space jump + ledge grab",
                   playerHealth, kPlayerHealthMax);
     SDL_SetWindowTitle(window, tb);
   }
@@ -12842,6 +12847,9 @@ struct App {
       playerPreFallAnimRemain = 0.f;
       playerJumpAwaitPreLandSecondHalf = false;
       playerJumpLedgeSecondHalfAir = false;
+      // Squat dip stacked into landingPitchOfs; without clearing, the view stays pitched down in the air
+      // after charged (big) jumps.
+      landingPitchOfs = 0.f;
     };
 
     // Commit jump-squat on Space release even if mantle probe flickers this frame.
@@ -13264,10 +13272,11 @@ struct App {
           glm::clamp(1.f - playerPreFallAnimRemain / kPlayerPreFallBeforeFallSec, 0.f, 1.f);
       const float dip = std::sin(tCh * glm::pi<float>());
       landingPitchOfs = -kPreFallChargeViewPitchAmp * std::pow(dip, 1.22f);
-    }
-    if (playerJumpSquatCharging && ledgeClimbT < 0.f && !slideActive) {
+    } else if (playerJumpSquatCharging && ledgeClimbT < 0.f && !slideActive) {
+      // Absolute pitch from charge phase (matches pre-fall). Cumulative -= + decay stacked into a deep
+      // negative offset and felt “camera locked” looking at the floor during/after big jumps.
       const float dip = std::sin(playerJumpSquatCharge * glm::pi<float>());
-      landingPitchOfs -= kJumpSquatViewPitchAmp * std::pow(dip, 1.15f);
+      landingPitchOfs = -kJumpSquatViewPitchAmp * std::pow(dip, 1.15f);
     }
     if (!wasGrounded && groundedEnd) {
         playerJumpAwaitPreLandSecondHalf = false;

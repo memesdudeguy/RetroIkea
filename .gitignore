@@ -1,5 +1,6 @@
 # CMake / FetchContent / local build (regenerate with cmake -B build)
 /build/
+/build-linux/
 /build-win/
 
 # MinGW Vulkan import lib generated for cross-builds (see CMake / vkshim)
