@@ -6,7 +6,7 @@ A first-person Vulkan + SDL2 game: explore a big-box store, avoid staff at night
 
 ## Demo
 
-Screen recording **2026-03-30 21-50-04** (source: `~/2026-03-30 21-50-04.mp4`, committed as [`media/demo.mp4`](media/demo.mp4)).
+Demo video source file: **`/home/memesdudeguy/2026-03-30 21-50-04.mp4`** (same recording committed as [`media/demo.mp4`](media/demo.mp4) for the repo).
 
 GitHub **does not show** `<video>` embeds in READMEs (they are stripped). Use the poster (click) or the link below to watch the MP4.
 
