@@ -56,6 +56,27 @@ git remote add origin https://github.com/memesdudeguy/RetroIkea.git
 git push -u origin main
 ```
 
+**Authentication:** GitHub does **not** accept your account password for `git push` over HTTPS. Use one of these:
+
+1. **HTTPS + Personal Access Token (PAT)** — [Create a token](https://github.com/settings/tokens) (classic: enable `repo`). When `git push` asks for a password, paste the **token**, not your GitHub password.
+2. **SSH** — [Add an SSH key](https://docs.github.com/en/authentication/connecting-to-github-with-ssh) to your GitHub account, then:
+   ```bash
+   git remote set-url origin git@github.com:memesdudeguy/RetroIkea.git
+   git push -u origin main
+   ```
+3. **GitHub CLI** — `pacman -S github-cli` then `gh auth login` and push as usual.
+
+## Inno Setup under Wine (Linux)
+
+There is no `iscc` in Arch repos; install Inno Setup with Wine (download [is.exe](https://jrsoftware.org/isdl.php)), then compile from the **project root** (this folder is named `retro ikea`):
+
+```bash
+wine "$HOME/.wine/drive_c/Program Files (x86)/Inno Setup 6/ISCC.exe" \
+  "Z:\\home\\$(whoami)\\Downloads\\retro ikea\\packaging\\windows_setup.iss"
+```
+
+Adjust the `Z:\\...` path if your clone lives elsewhere. Output: `packaging/RetroIkea.exe` (see `OutputBaseFilename` in `packaging/windows_setup.iss`).
+
 ## License
 
 No license file is included yet; add one if you want to clarify redistribution.
