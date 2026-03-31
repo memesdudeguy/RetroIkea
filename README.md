@@ -6,7 +6,9 @@ A first-person Vulkan + SDL2 game: explore a big-box store, avoid staff at night
 
 ## Demo
 
-Screen recording (2026-03-30): [`media/demo.mp4`](media/demo.mp4)
+Screen recording **2026-03-30 21-50-04** (source: `~/2026-03-30 21-50-04.mp4`, committed as [`media/demo.mp4`](media/demo.mp4)):
+
+<video src="https://github.com/memesdudeguy/RetroIkea/raw/main/media/demo.mp4" controls width="100%"></video>
 
 ## Requirements
 
