@@ -1,7 +1,5 @@
 #include "audio.hpp"
 
-#include "vulkan_embedded_assets.h"
-
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
 
@@ -11,9 +9,12 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <random>
 #include <string>
 #include <vector>
+
+namespace fs = std::filesystem;
 
 // Night / day cues fire at this fraction through each switch SFX (0.5 = middle of the clip).
 constexpr float kPowerSwitchBlackoutMidFrac = 0.5f;
@@ -33,17 +34,15 @@ constexpr float kChaseMusicFadeSec = 2.6f;
 constexpr float kChaseMusicFadeInPursuitSec = 0.95f;
 constexpr float kChaseMusicFadeOutAfterPursuitSec = 1.85f;
 constexpr float kChaseMusicPursuitVolMul = 1.18f;
-constexpr float kStaffSpottedVol = 1.1f;
-constexpr float kStaffChaseVoVol = 1.2f;
+constexpr float kStaffSpottedVol = 2.2f;
+constexpr float kStaffChaseVoVol = 2.4f;
 constexpr float kLowHealthHeartbeatVol = 1.0f;
 constexpr float kBigFallImpactVol = 1.1f;
 constexpr float kStaffMeleeImpactVol = 1.1f;
-constexpr float kTitleMenuMusicVol = 17.0f;
+constexpr float kTitleMenuMusicVol = 52.0f;
 
 static ma_engine gEngine{};
-static ma_audio_buffer gFootstepBuffers[8]{};
 static ma_sound gFootstep[8]{};
-static ma_audio_buffer gSlideBuffer{};
 static ma_sound gSlideSound{};
 // Store music: two short feedback combs in series + LPF (dense tail, damped highs — hall-ish, not slap echo).
 static ma_delay_node gStoreComb{};
@@ -54,6 +53,9 @@ static ma_delay_node gTitleComb{};
 static ma_delay_node gTitleComb2{};
 static ma_lpf_node gTitleHallLpf{};
 static ma_sound gStoreMusic{};
+// Daytime store bed: multiple MP3s; shuffle when a new “day” starts after lights return.
+static std::vector<std::string> gStoreDayMusicPaths{};
+static size_t gStoreDayMusicIdx = 0;
 static ma_sound gPowerSwitchSfx{};
 static ma_sound gHorrorMusic{};
 static ma_sound gChaseMusic{};
@@ -90,6 +92,9 @@ static bool gStaffMeleeImpactReady = false;
 static ma_sound gTitleMenuMusic{};
 static bool gTitleMenuMusicReady = false;
 static bool gTitleMenuMusicActive = false;
+static ma_sound gLoadingScreenSfx{};
+static bool gLoadingScreenSfxReady = false;
+static bool gLoadingScreenSfxActive = false;
 static float gChaseVoCooldown = 0.f;
 static float gChaseVoDiceAccum = 0.f;
 static std::atomic<int> gStoreSeqEvent{0};
@@ -113,6 +118,7 @@ enum class StoreAnimPhase : std::uint8_t {
   DayLoop,
 };
 static StoreAnimPhase gStorePhase = StoreAnimPhase::DayOnce;
+static int gDayCount = 1;
 // Fluorescents off/on at engine times (same timeline as miniaudio mix), not game dt.
 static bool gBlackoutScheduled = false;
 static ma_uint64 gBlackoutAtEngineMs = 0;
@@ -156,6 +162,8 @@ static void horrorEndedCb(void* /*pUserData*/, ma_sound* /*pSound*/) {
     return;
   gStoreSeqEvent.store(3, std::memory_order_release);
 }
+
+static void refreshStoreMusicVolumeWithDuck();
 
 static void shutdownPowerSwitchSfx() {
   if (!gPowerSwitchReady)
@@ -556,6 +564,90 @@ static void shutdownStoreAmbience() {
   ma_delay_node_uninit(&gStoreComb2, nullptr);
   ma_delay_node_uninit(&gStoreComb, nullptr);
   gStoreAmbienceReady = false;
+  gStoreDayMusicPaths.clear();
+  gStoreDayMusicIdx = 0;
+}
+
+static void appendEnvMusicPathList(const char* raw, std::vector<std::string>& out) {
+  if (!raw || !*raw)
+    return;
+  std::string s(raw);
+  size_t start = 0;
+  while (start < s.size()) {
+    const size_t sep = s.find_first_of(";|", start);
+    std::string tok = sep == std::string::npos ? s.substr(start) : s.substr(start, sep - start);
+    while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t'))
+      tok.erase(0, 1);
+    while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t'))
+      tok.pop_back();
+    if (!tok.empty())
+      out.push_back(std::move(tok));
+    if (sep == std::string::npos)
+      break;
+    start = sep + 1;
+  }
+}
+
+// Optional bundled names (copy your Downloads MP3s here). YouTube sources must be exported to MP3 locally
+// (e.g. https://www.youtube.com/watch?v=jZoFzZ8pBmg ) — the engine only loads files from disk.
+static void gatherStoreDayMusicCandidates(std::vector<std::string>& out) {
+  out.clear();
+  if (const char* e = std::getenv("VULKAN_GAME_STORE_DAY_MUSIC_PATHS"))
+    appendEnvMusicPathList(e, out);
+#ifdef VULKAN_GAME_ASSETS_DIR
+  {
+    const std::string ad = VULKAN_GAME_ASSETS_DIR;
+    out.push_back("/home/memesdudeguy/Downloads/80s Retrowave _ Synthwave Music - Hackers by Karl Casey __ Royalty Free Copyright Safe Music.mp3");
+    out.push_back(ad + "/audio/store_ambient_loop.mp3");
+    out.push_back(ad + "/audio/store_ambient_loop.wav");
+  }
+#endif
+#ifdef VULKAN_GAME_STORE_AMBIENT_WAV
+  out.emplace_back(VULKAN_GAME_STORE_AMBIENT_WAV);
+#endif
+}
+
+static bool reinitStoreMusicToIndex(size_t idx) {
+  if (!gStoreAmbienceReady || idx >= gStoreDayMusicPaths.size())
+    return false;
+  ma_sound_set_end_callback(&gStoreMusic, nullptr, nullptr);
+  if (ma_sound_is_playing(&gStoreMusic))
+    ma_sound_stop(&gStoreMusic);
+  ma_sound_uninit(&gStoreMusic);
+
+  ma_sound_config mc = ma_sound_config_init_2(&gEngine);
+  mc.pFilePath = gStoreDayMusicPaths[idx].c_str();
+  mc.flags = MA_SOUND_FLAG_STREAM | MA_SOUND_FLAG_NO_SPATIALIZATION;
+  mc.pInitialAttachment = &gStoreComb.baseNode;
+  mc.initialAttachmentInputBusIndex = 0;
+  const ma_result r = ma_sound_init_ex(&gEngine, &mc, &gStoreMusic);
+  if (r != MA_SUCCESS) {
+    std::fprintf(stderr, "[audio] store day music: could not load \"%s\" (ma_result %d)\n",
+                 gStoreDayMusicPaths[idx].c_str(), static_cast<int>(r));
+    return false;
+  }
+  gStoreDayMusicIdx = idx;
+  ma_sound_set_volume(&gStoreMusic, kStoreDayMusicVol * gStoreMusicLinear01);
+  ma_sound_set_looping(&gStoreMusic, MA_FALSE);
+  ma_sound_set_end_callback(&gStoreMusic, dayMusicOnceEndedCb, nullptr);
+  refreshStoreMusicVolumeWithDuck();
+  return true;
+}
+
+static void shuffleStoreDayMusicForNewDay() {
+  if (!gStoreAmbienceReady || gStoreDayMusicPaths.empty())
+    return;
+  if (gStoreDayMusicPaths.size() == 1u) {
+    reinitStoreMusicToIndex(0);
+    return;
+  }
+  std::uniform_int_distribution<size_t> dist(0, gStoreDayMusicPaths.size() - 1);
+  for (int attempt = 0; attempt < 48; ++attempt) {
+    const size_t j = dist(gRng);
+    if (j != gStoreDayMusicIdx && reinitStoreMusicToIndex(j))
+      return;
+  }
+  reinitStoreMusicToIndex(gStoreDayMusicIdx);
 }
 
 static bool initStoreAmbience() {
@@ -619,43 +711,68 @@ static bool initStoreAmbience() {
   ma_delay_node_set_dry(&gStoreComb2, 0.44f);
   ma_delay_node_set_decay(&gStoreComb2, 0.5f);
 
-  static const char* const paths[] = {
-#ifdef VULKAN_GAME_STORE_AMBIENT_WAV
-      VULKAN_GAME_STORE_AMBIENT_WAV,
-#endif
-#ifdef VULKAN_GAME_ASSETS_DIR
-      VULKAN_GAME_ASSETS_DIR "/audio/store_ambient_loop.wav",
-#endif
-      nullptr,
-  };
+  std::vector<std::string> candidates;
+  gatherStoreDayMusicCandidates(candidates);
+  gStoreDayMusicPaths.clear();
+  for (const std::string& p : candidates) {
+    std::error_code ec;
+    if (fs::is_regular_file(fs::path(p), ec))
+      gStoreDayMusicPaths.push_back(p);
+  }
+  if (gStoreDayMusicPaths.empty()) {
+    ma_lpf_node_uninit(&gStoreHallLpf, nullptr);
+    ma_delay_node_uninit(&gStoreComb2, nullptr);
+    ma_delay_node_uninit(&gStoreComb, nullptr);
+    return false;
+  }
+  std::shuffle(gStoreDayMusicPaths.begin(), gStoreDayMusicPaths.end(), gRng);
 
-  for (const char* const* p = paths; *p != nullptr; ++p) {
+  bool loaded = false;
+  for (size_t i = 0; i < gStoreDayMusicPaths.size(); ++i) {
     ma_sound_config mc = ma_sound_config_init_2(&gEngine);
-    mc.pFilePath = *p;
+    mc.pFilePath = gStoreDayMusicPaths[i].c_str();
     mc.flags = MA_SOUND_FLAG_STREAM | MA_SOUND_FLAG_NO_SPATIALIZATION;
     mc.pInitialAttachment = &gStoreComb.baseNode;
     mc.initialAttachmentInputBusIndex = 0;
     r = ma_sound_init_ex(&gEngine, &mc, &gStoreMusic);
     if (r == MA_SUCCESS) {
-      gStoreMusicLinear01 = 1.f;
-      ma_sound_set_volume(&gStoreMusic, kStoreDayMusicVol * gStoreMusicLinear01);
-      ma_sound_set_looping(&gStoreMusic, MA_FALSE);
-      ma_sound_set_end_callback(&gStoreMusic, dayMusicOnceEndedCb, nullptr);
-      gStorePhase = StoreAnimPhase::DayOnce;
-      gStoreFluoroOn.store(true, std::memory_order_relaxed);
-      gStoreSeqEvent.store(0, std::memory_order_relaxed);
-      gBlackoutScheduled = false;
-      gDayRestoreScheduled = false;
-      // Do not start here: title menu / boot uses audioSetStoreDayNightCyclePaused(true) with no audible day bed.
-      // Gameplay entry calls audioSetStoreDayNightCyclePaused(false), which cold-starts the day loop when needed.
-      return true;
+      gStoreDayMusicIdx = i;
+      loaded = true;
+      break;
     }
+    std::fprintf(stderr, "[audio] store day music: skip (decode/init failed) \"%s\"\n",
+                 gStoreDayMusicPaths[i].c_str());
+  }
+  if (!loaded) {
+    gStoreDayMusicPaths.clear();
+    ma_lpf_node_uninit(&gStoreHallLpf, nullptr);
+    ma_delay_node_uninit(&gStoreComb2, nullptr);
+    ma_delay_node_uninit(&gStoreComb, nullptr);
+    return false;
   }
 
-  ma_lpf_node_uninit(&gStoreHallLpf, nullptr);
-  ma_delay_node_uninit(&gStoreComb2, nullptr);
-  ma_delay_node_uninit(&gStoreComb, nullptr);
-  return false;
+  gStoreMusicLinear01 = 1.f;
+  ma_sound_set_volume(&gStoreMusic, kStoreDayMusicVol * gStoreMusicLinear01);
+  ma_sound_set_looping(&gStoreMusic, MA_FALSE);
+  ma_sound_set_end_callback(&gStoreMusic, dayMusicOnceEndedCb, nullptr);
+  gStorePhase = StoreAnimPhase::DayOnce;
+  gStoreFluoroOn.store(true, std::memory_order_relaxed);
+  gStoreSeqEvent.store(0, std::memory_order_relaxed);
+  gBlackoutScheduled = false;
+  gDayRestoreScheduled = false;
+  // Do not start here: title menu / boot uses audioSetStoreDayNightCyclePaused(true) with no audible day bed.
+  // Gameplay entry calls audioSetStoreDayNightCyclePaused(false), which cold-starts the day loop when needed.
+  return true;
+}
+
+static void shutdownLoadingScreenSfx() {
+  if (gLoadingScreenSfxReady) {
+    if (ma_sound_is_playing(&gLoadingScreenSfx))
+      ma_sound_stop(&gLoadingScreenSfx);
+    ma_sound_uninit(&gLoadingScreenSfx);
+    gLoadingScreenSfxReady = false;
+    gLoadingScreenSfxActive = false;
+  }
 }
 
 static void shutdownTitleMenuMusic() {
@@ -677,6 +794,7 @@ static bool initTitleMenuMusic() {
   pathStrs.emplace_back(VULKAN_GAME_TITLE_MENU_WAV);
 #endif
 #ifdef VULKAN_GAME_ASSETS_DIR
+  pathStrs.emplace_back(std::string(VULKAN_GAME_ASSETS_DIR) + "/audio/New_Project.wav");
   pathStrs.emplace_back(std::string(VULKAN_GAME_ASSETS_DIR) + "/audio/the_long_hall.wav");
 #endif
   if (const char* e = std::getenv("VULKAN_GAME_TITLE_MENU_WAV")) {
@@ -684,9 +802,11 @@ static bool initTitleMenuMusic() {
       pathStrs.emplace_back(e);
   }
   if (const char* home = std::getenv("HOME")) {
+    pathStrs.emplace_back(std::string(home) + "/Downloads/New_Project.wav");
     pathStrs.emplace_back(std::string(home) + "/Downloads/the_long_hall.wav");
   }
   if (const char* userProfile = std::getenv("USERPROFILE")) {
+    pathStrs.emplace_back(std::string(userProfile) + "/Downloads/New_Project.wav");
     pathStrs.emplace_back(std::string(userProfile) + "/Downloads/the_long_hall.wav");
   }
 
@@ -764,55 +884,73 @@ static bool initTitleMenuMusic() {
   return false;
 }
 
+static void initLoadingScreenSfx() {
+  std::vector<std::string> paths;
+#ifdef VULKAN_GAME_ASSETS_DIR
+  paths.emplace_back(std::string(VULKAN_GAME_ASSETS_DIR) + "/audio/freesound_community-space-ambience-56265.mp3");
+#endif
+  if (const char* home = std::getenv("HOME"))
+    paths.emplace_back(std::string(home) + "/Downloads/freesound_community-space-ambience-56265.mp3");
+  if (const char* up = std::getenv("USERPROFILE"))
+    paths.emplace_back(std::string(up) + "/Downloads/freesound_community-space-ambience-56265.mp3");
+  for (const auto& p : paths) {
+    ma_sound_config sc = ma_sound_config_init_2(&gEngine);
+    sc.pFilePath = p.c_str();
+    sc.flags = MA_SOUND_FLAG_STREAM | MA_SOUND_FLAG_NO_SPATIALIZATION;
+    if (ma_sound_init_ex(&gEngine, &sc, &gLoadingScreenSfx) == MA_SUCCESS) {
+      ma_sound_set_looping(&gLoadingScreenSfx, MA_FALSE);
+      ma_sound_set_volume(&gLoadingScreenSfx, 2.0f);
+      gLoadingScreenSfxReady = true;
+      return;
+    }
+  }
+}
+
 bool audioInit() {
-  ma_decoder_config decCfg = ma_decoder_config_init_default();
-  ma_uint64 frameCount = 0;
-  void* pPcm = nullptr;
-  ma_result r = ma_decode_memory(kFootstepSoundData, kFootstepSoundData_size, &decCfg, &frameCount, &pPcm);
-  if (r != MA_SUCCESS || !pPcm || frameCount == 0)
+  ma_engine_config engCfg = ma_engine_config_init();
+  ma_result r = ma_engine_init(&engCfg, &gEngine);
+  if (r != MA_SUCCESS)
     return false;
 
-  ma_audio_buffer_config bufCfg =
-      ma_audio_buffer_config_init(decCfg.format, decCfg.channels, frameCount, pPcm, nullptr);
-  bufCfg.sampleRate = decCfg.sampleRate;
-
+  std::string footPath;
+#ifdef VULKAN_GAME_ASSETS_DIR
+  footPath = std::string(VULKAN_GAME_ASSETS_DIR) + "/audio/sfx_footstep_concrete.mp3";
+#endif
+  const char* footC = footPath.empty() ? nullptr : footPath.c_str();
+  const ma_uint32 streamFlags = MA_SOUND_FLAG_STREAM | MA_SOUND_FLAG_NO_SPATIALIZATION;
   for (int i = 0; i < 8; ++i) {
-    r = ma_audio_buffer_init_copy(&bufCfg, &gFootstepBuffers[i]);
+    ma_sound_config sc = ma_sound_config_init_2(&gEngine);
+    sc.pFilePath = footC;
+    sc.flags = streamFlags;
+    r = ma_sound_init_ex(&gEngine, &sc, &gFootstep[i]);
     if (r != MA_SUCCESS) {
       for (int j = 0; j < i; ++j)
-        ma_audio_buffer_uninit(&gFootstepBuffers[j]);
-      ma_free(pPcm, nullptr);
+        ma_sound_uninit(&gFootstep[j]);
+      ma_engine_uninit(&gEngine);
       return false;
     }
+    ma_sound_set_looping(&gFootstep[i], MA_FALSE);
   }
-  ma_free(pPcm, nullptr);
 
-  void* pSlidePcm = nullptr;
-  ma_uint64 slideFrames = 0;
-  ma_decoder_config slideDecCfg = ma_decoder_config_init_default();
-  r = ma_decode_memory(kSlideSoundData, kSlideSoundData_size, &slideDecCfg, &slideFrames, &pSlidePcm);
-  if (r != MA_SUCCESS || !pSlidePcm || slideFrames == 0) {
-    pSlidePcm = nullptr;
-  } else {
-    ma_audio_buffer_config slideBufCfg =
-        ma_audio_buffer_config_init(slideDecCfg.format, slideDecCfg.channels, slideFrames, pSlidePcm, nullptr);
-    slideBufCfg.sampleRate = slideDecCfg.sampleRate;
-    r = ma_audio_buffer_init_copy(&slideBufCfg, &gSlideBuffer);
-    ma_free(pSlidePcm, nullptr);
-    if (r == MA_SUCCESS)
+  gSlideReady = false;
+#ifdef VULKAN_GAME_ASSETS_DIR
+  {
+    std::string slidePath = std::string(VULKAN_GAME_ASSETS_DIR) + "/audio/sfx_slide_body_fall.mp3";
+    ma_sound_config scSlide = ma_sound_config_init_2(&gEngine);
+    scSlide.pFilePath = slidePath.c_str();
+    scSlide.flags = streamFlags;
+    r = ma_sound_init_ex(&gEngine, &scSlide, &gSlideSound);
+    if (r == MA_SUCCESS) {
+      ma_sound_set_looping(&gSlideSound, MA_FALSE);
+      ma_sound_set_volume(&gSlideSound, 0.68f);
       gSlideReady = true;
-  }
-
-  ma_engine_config engCfg = ma_engine_config_init();
-  r = ma_engine_init(&engCfg, &gEngine);
-  if (r != MA_SUCCESS) {
-    for (int i = 0; i < 8; ++i)
-      ma_audio_buffer_uninit(&gFootstepBuffers[i]);
-    if (gSlideReady) {
-      ma_audio_buffer_uninit(&gSlideBuffer);
-      gSlideReady = false;
     }
-    return false;
+  }
+#endif
+
+  {
+    std::random_device rd;
+    gRng.seed(rd());
   }
 
   gStoreAmbienceReady = initStoreAmbience();
@@ -851,56 +989,14 @@ bool audioInit() {
     std::fprintf(stderr,
                  "Staff/push impact: could not load fist-fight MP3 (silent on staff hits and shoves).\n");
 
-  const ma_uint32 flags = MA_SOUND_FLAG_NO_SPATIALIZATION;
-  for (int i = 0; i < 8; ++i) {
-    r = ma_sound_init_from_data_source(&gEngine, reinterpret_cast<ma_data_source*>(&gFootstepBuffers[i].ref.ds),
-                                       flags, nullptr, &gFootstep[i]);
-    if (r != MA_SUCCESS) {
-      shutdownLightSwitchOnSfx();
-      shutdownStaffMeleeImpactSfx();
-      shutdownBigFallSfx();
-      shutdownHeartbeatSfx();
-      shutdownStaffChaseVoSfx();
-      shutdownStaffSpottedSfx();
-      shutdownShrekEggMusic();
-      shutdownChaseMusic();
-      shutdownHorrorAmbient();
-      shutdownPowerSwitchSfx();
-      shutdownStoreAmbience();
-      for (int j = 0; j < i; ++j)
-        ma_sound_uninit(&gFootstep[j]);
-      ma_engine_uninit(&gEngine);
-      for (int k = 0; k < 8; ++k)
-        ma_audio_buffer_uninit(&gFootstepBuffers[k]);
-      if (gSlideReady) {
-        ma_audio_buffer_uninit(&gSlideBuffer);
-        gSlideReady = false;
-      }
-      return false;
-    }
-  }
-
-  if (gSlideReady) {
-    r = ma_sound_init_from_data_source(&gEngine, reinterpret_cast<ma_data_source*>(&gSlideBuffer.ref.ds), flags,
-                                       nullptr, &gSlideSound);
-    if (r != MA_SUCCESS) {
-      ma_audio_buffer_uninit(&gSlideBuffer);
-      gSlideReady = false;
-    } else {
-      ma_sound_set_looping(&gSlideSound, MA_FALSE);
-      ma_sound_set_volume(&gSlideSound, 0.68f);
-    }
-  }
-
   float lenSec = 0.f;
   if (ma_sound_get_length_in_seconds(&gFootstep[0], &lenSec) == MA_SUCCESS && lenSec > 0.01f)
     gFullLengthSec = lenSec;
 
-  std::random_device rd;
-  gRng.seed(rd());
-
   if (!initTitleMenuMusic())
     std::fprintf(stderr, "Title menu music: could not load the_long_hall.wav (title screen will be quiet).\n");
+
+  initLoadingScreenSfx();
 
   gReady = true;
   return true;
@@ -909,6 +1005,7 @@ bool audioInit() {
 void audioShutdown() {
   if (!gReady)
     return;
+  shutdownLoadingScreenSfx();
   shutdownTitleMenuMusic();
   shutdownStaffMeleeImpactSfx();
   shutdownBigFallSfx();
@@ -923,14 +1020,11 @@ void audioShutdown() {
   shutdownPowerSwitchSfx();
   if (gSlideReady) {
     ma_sound_uninit(&gSlideSound);
-    ma_audio_buffer_uninit(&gSlideBuffer);
     gSlideReady = false;
   }
   for (int i = 0; i < 8; ++i)
     ma_sound_uninit(&gFootstep[i]);
   ma_engine_uninit(&gEngine);
-  for (int i = 0; i < 8; ++i)
-    ma_audio_buffer_uninit(&gFootstepBuffers[i]);
   gStoreFluoroOn.store(true, std::memory_order_relaxed);
   gStoreSeqEvent.store(0, std::memory_order_relaxed);
   gBlackoutScheduled = false;
@@ -1019,10 +1113,12 @@ static void storeFluoroSet(bool on) {
 static void startDayLoopMusic() {
   stopChaseMusicLayer();
   storeFluoroSet(true);
+  ++gDayCount;
   if (!gStoreAmbienceReady)
     return;
-  ma_sound_set_end_callback(&gStoreMusic, nullptr, nullptr);
-  ma_sound_set_looping(&gStoreMusic, MA_TRUE);
+  shuffleStoreDayMusicForNewDay();
+  ma_sound_set_end_callback(&gStoreMusic, dayMusicOnceEndedCb, nullptr);
+  ma_sound_set_looping(&gStoreMusic, MA_FALSE);
   ma_sound_stop(&gStoreMusic);
   ma_sound_reset_stop_time_and_fade(&gStoreMusic);
   ma_sound_seek_to_pcm_frame(&gStoreMusic, 0);
@@ -1105,9 +1201,33 @@ void audioSetTitleMenuMusicActive(bool active) {
     ma_sound_stop(&gTitleMenuMusic);
     ma_sound_reset_stop_time_and_fade(&gTitleMenuMusic);
     ma_sound_seek_to_pcm_frame(&gTitleMenuMusic, 0);
+    ma_sound_set_fade_in_milliseconds(&gTitleMenuMusic, 0, 1, 800);
     ma_sound_start(&gTitleMenuMusic);
   } else {
-    ma_sound_stop(&gTitleMenuMusic);
+    constexpr ma_uint64 kFadeOutMs = 2200;
+    ma_sound_set_fade_in_milliseconds(&gTitleMenuMusic, -1, 0, kFadeOutMs);
+    const ma_uint64 now = ma_engine_get_time_in_milliseconds(&gEngine);
+    ma_sound_set_stop_time_in_milliseconds(&gTitleMenuMusic, now + kFadeOutMs);
+  }
+}
+
+void audioSetLoadingScreenActive(bool active) {
+  if (!gReady || !gLoadingScreenSfxReady)
+    return;
+  if (active == gLoadingScreenSfxActive)
+    return;
+  gLoadingScreenSfxActive = active;
+  if (active) {
+    ma_sound_stop(&gLoadingScreenSfx);
+    ma_sound_reset_stop_time_and_fade(&gLoadingScreenSfx);
+    ma_sound_seek_to_pcm_frame(&gLoadingScreenSfx, 0);
+    ma_sound_set_fade_in_milliseconds(&gLoadingScreenSfx, 0, 1, 1400);
+    ma_sound_start(&gLoadingScreenSfx);
+  } else {
+    constexpr ma_uint64 kFadeOutMs = 2400;
+    ma_sound_set_fade_in_milliseconds(&gLoadingScreenSfx, -1, 0, kFadeOutMs);
+    const ma_uint64 now = ma_engine_get_time_in_milliseconds(&gEngine);
+    ma_sound_set_stop_time_in_milliseconds(&gLoadingScreenSfx, now + kFadeOutMs);
   }
 }
 
@@ -1142,10 +1262,12 @@ void audioSetStoreDayNightCyclePaused(bool paused) {
       ma_sound_start(&gStoreMusic);
       refreshStoreMusicVolumeWithDuck();
     } else if (gStoreAmbienceReady && !ma_sound_is_playing(&gStoreMusic) &&
-               gStorePhase == StoreAnimPhase::DayOnce) {
-      // First gameplay session after boot or title: store init no longer auto-plays; start day loop cold.
+               (gStorePhase == StoreAnimPhase::DayOnce || gStorePhase == StoreAnimPhase::DayLoop) &&
+               gStoreFluoroOn.load(std::memory_order_relaxed)) {
+      // Start day bed at current cursor (0 after audioResetToNewGame; saved PCM after restore). Never seek to 0 here
+      // or Continue would wipe the loaded store track position.
       ma_sound_set_end_callback(&gStoreMusic, dayMusicOnceEndedCb, nullptr);
-      ma_sound_seek_to_pcm_frame(&gStoreMusic, 0);
+      ma_sound_set_looping(&gStoreMusic, MA_FALSE);
       ma_sound_start(&gStoreMusic);
       refreshStoreMusicVolumeWithDuck();
     }
@@ -1175,7 +1297,7 @@ void audioUpdateStore(float /*dt*/) {
     if (ev == 0)
       break;
 
-    if (ev == 1 && gStorePhase == StoreAnimPhase::DayOnce) {
+    if (ev == 1 && (gStorePhase == StoreAnimPhase::DayOnce || gStorePhase == StoreAnimPhase::DayLoop)) {
       if (gPowerSwitchReady) {
         ma_sound_set_end_callback(&gPowerSwitchSfx, powerSwitchOffEndedCb, nullptr);
         ma_sound_stop(&gPowerSwitchSfx);
@@ -1210,6 +1332,34 @@ void audioUpdateStore(float /*dt*/) {
   if (gDayRestoreScheduled && engNow >= gDayRestoreAtEngineMs) {
     gDayRestoreScheduled = false;
     startDayLoopMusic();
+  }
+
+  // Self-heal sequencing if an expected clip did not resume (e.g., state survived but stream stopped).
+  // This keeps the day/night state machine from getting stuck silent.
+  if (!gStoreDayNightPaused.load(std::memory_order_relaxed)) {
+    if (gStorePhase == StoreAnimPhase::SwitchOff) {
+      const bool swPlaying = gPowerSwitchReady && ma_sound_is_playing(&gPowerSwitchSfx);
+      if (!gBlackoutScheduled && !swPlaying) {
+        storeFluoroSet(false);
+        afterPowerSwitchOffComplete();
+      }
+    } else if (gStorePhase == StoreAnimPhase::Horror) {
+      const bool horrorPlaying = gHorrorReady && ma_sound_is_playing(&gHorrorMusic);
+      if (!gDayRestoreScheduled && !horrorPlaying)
+        afterHorrorTrackComplete();
+    } else if (gStorePhase == StoreAnimPhase::DayOnce || gStorePhase == StoreAnimPhase::DayLoop) {
+      if (gStoreAmbienceReady && gStoreFluoroOn.load(std::memory_order_relaxed) && !gBlackoutScheduled &&
+          !gDayRestoreScheduled) {
+        const bool swPlaying = gPowerSwitchReady && ma_sound_is_playing(&gPowerSwitchSfx);
+        if (!swPlaying && !ma_sound_is_playing(&gStoreMusic)) {
+          ma_sound_set_end_callback(&gStoreMusic, dayMusicOnceEndedCb, nullptr);
+          ma_sound_set_looping(&gStoreMusic, MA_FALSE);
+          ma_sound_start(&gStoreMusic);
+          gStorePhase = StoreAnimPhase::DayLoop;
+          refreshStoreMusicVolumeWithDuck();
+        }
+      }
+    }
   }
 }
 
@@ -1318,6 +1468,7 @@ void audioPlayStaffMeleeImpact() {
 bool audioCaptureStoreCycleSaveState(AudioStoreCycleSaveState* outState) {
   if (!outState || !gReady)
     return false;
+  const bool paused = gStoreDayNightPaused.load(std::memory_order_relaxed);
   AudioStoreCycleSaveState st{};
   st.version = 1;
   st.storePhase = static_cast<uint32_t>(gStorePhase);
@@ -1327,14 +1478,28 @@ bool audioCaptureStoreCycleSaveState(AudioStoreCycleSaveState* outState) {
     st.flags |= (1u << 1);
   if (gDayRestoreScheduled)
     st.flags |= (1u << 2);
-  if (gStoreAmbienceReady && ma_sound_is_playing(&gStoreMusic))
+  const bool storePlaying = gStoreAmbienceReady &&
+                            (ma_sound_is_playing(&gStoreMusic) || (paused && gDeathPauseHadStoreMusic));
+  const bool horrorPlaying = gHorrorReady &&
+                             (ma_sound_is_playing(&gHorrorMusic) || (paused && gDeathPauseHadHorror));
+  const bool chasePlaying = gChaseReady &&
+                            (ma_sound_is_playing(&gChaseMusic) || (paused && gDeathPauseHadChase));
+  const bool shrekPlaying = gShrekEggMusicReady &&
+                            (ma_sound_is_playing(&gShrekEggMusic) || (paused && gDeathPauseHadShrekEgg));
+  if (storePlaying)
     st.flags |= (1u << 3);
-  if (gHorrorReady && ma_sound_is_playing(&gHorrorMusic))
+  if (horrorPlaying)
     st.flags |= (1u << 4);
-  if (gChaseReady && ma_sound_is_playing(&gChaseMusic))
+  if (chasePlaying)
     st.flags |= (1u << 5);
-  if (gShrekEggMusicReady && ma_sound_is_playing(&gShrekEggMusic))
+  if (shrekPlaying)
     st.flags |= (1u << 6);
+  st.flags |= (static_cast<uint32_t>(std::max(gDayCount, 1)) << 16);
+  st.version = 2;
+  st.storeDayMusicTrackIdx =
+      gStoreAmbienceReady && !gStoreDayMusicPaths.empty()
+          ? static_cast<uint32_t>(std::min(gStoreDayMusicIdx, gStoreDayMusicPaths.size() - 1u))
+          : 0u;
   st.storeCursorFrames = gStoreAmbienceReady ? soundCursorOrZero(&gStoreMusic) : 0;
   st.horrorCursorFrames = gHorrorReady ? soundCursorOrZero(&gHorrorMusic) : 0;
   st.chaseCursorFrames = gChaseReady ? soundCursorOrZero(&gChaseMusic) : 0;
@@ -1351,6 +1516,8 @@ void audioRestoreStoreCycleSaveState(const AudioStoreCycleSaveState& state) {
     return;
   const ma_uint64 now = ma_engine_get_time_in_milliseconds(&gEngine);
   gStorePhase = static_cast<StoreAnimPhase>(std::min<uint32_t>(state.storePhase, 3u));
+  const int savedDay = static_cast<int>((state.flags >> 16) & 0xFFFFu);
+  gDayCount = savedDay > 0 ? savedDay : 1;
   gStoreFluoroOn.store((state.flags & (1u << 0)) != 0, std::memory_order_relaxed);
   gBlackoutScheduled = (state.flags & (1u << 1)) != 0;
   gDayRestoreScheduled = (state.flags & (1u << 2)) != 0;
@@ -1358,14 +1525,17 @@ void audioRestoreStoreCycleSaveState(const AudioStoreCycleSaveState& state) {
   gDayRestoreAtEngineMs = now + state.dayRestoreRemainingMs;
 
   if (gStoreAmbienceReady) {
-    if (gStorePhase == StoreAnimPhase::DayLoop) {
-      ma_sound_set_end_callback(&gStoreMusic, nullptr, nullptr);
-      ma_sound_set_looping(&gStoreMusic, MA_TRUE);
-    } else {
-      ma_sound_set_looping(&gStoreMusic, MA_FALSE);
-      ma_sound_set_end_callback(&gStoreMusic, dayMusicOnceEndedCb, nullptr);
+    if (state.version >= 2u && !gStoreDayMusicPaths.empty()) {
+      const size_t want =
+          static_cast<size_t>(state.storeDayMusicTrackIdx) % gStoreDayMusicPaths.size();
+      if (want != gStoreDayMusicIdx)
+        reinitStoreMusicToIndex(want);
     }
-    stopSeekMaybeStart(&gStoreMusic, state.storeCursorFrames, (state.flags & (1u << 3)) != 0);
+    ma_sound_set_looping(&gStoreMusic, MA_FALSE);
+    ma_sound_set_end_callback(&gStoreMusic, dayMusicOnceEndedCb, nullptr);
+    // Seek only while the cycle is still paused; audioSetStoreDayNightCyclePaused(false) then starts the day
+    // bed at this cursor when phase is day + lights on (avoids relying on a fragile "was playing" save bit).
+    stopSeekMaybeStart(&gStoreMusic, state.storeCursorFrames, false);
     refreshStoreMusicVolumeWithDuck();
   }
   if (gHorrorReady)
@@ -1450,4 +1620,39 @@ bool audioAreStoreFluorescentsOn() {
   if (!gReady)
     return true;
   return gStoreFluoroOn.load(std::memory_order_relaxed);
+}
+
+int audioGetDayCount() {
+  return gDayCount;
+}
+
+void audioResetToNewGame() {
+  if (!gReady)
+    return;
+  gDayCount = 1;
+  gStorePhase = StoreAnimPhase::DayOnce;
+  gStoreFluoroOn.store(true, std::memory_order_relaxed);
+  gStoreSeqEvent.store(0, std::memory_order_relaxed);
+  gBlackoutScheduled = false;
+  gDayRestoreScheduled = false;
+  gDeathPauseHadStoreMusic = false;
+  gDeathPauseHadHorror = false;
+  gDeathPauseHadChase = false;
+  gDeathPauseHadShrekEgg = false;
+  if (gStoreAmbienceReady) {
+    shuffleStoreDayMusicForNewDay();
+    ma_sound_stop(&gStoreMusic);
+    ma_sound_reset_stop_time_and_fade(&gStoreMusic);
+    ma_sound_seek_to_pcm_frame(&gStoreMusic, 0);
+    ma_sound_set_looping(&gStoreMusic, MA_FALSE);
+    ma_sound_set_end_callback(&gStoreMusic, dayMusicOnceEndedCb, nullptr);
+    gStoreMusicLinear01 = 1.f;
+    ma_sound_set_volume(&gStoreMusic, kStoreDayMusicVol * gStoreMusicLinear01);
+  }
+  if (gHorrorReady)
+    ma_sound_stop(&gHorrorMusic);
+  if (gChaseReady)
+    ma_sound_stop(&gChaseMusic);
+  if (gShrekEggMusicReady)
+    ma_sound_stop(&gShrekEggMusic);
 }

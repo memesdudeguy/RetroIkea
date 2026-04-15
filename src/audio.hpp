@@ -2,8 +2,10 @@
 
 #include <cstdint>
 
+// Packed for on-disk GameSaveFile (see main.cpp).
+#pragma pack(push, 1)
 struct AudioStoreCycleSaveState {
-  uint32_t version = 1;
+  uint32_t version = 2;
   uint32_t storePhase = 0;
   uint32_t flags = 0;
   uint64_t storeCursorFrames = 0;
@@ -12,7 +14,11 @@ struct AudioStoreCycleSaveState {
   uint64_t shrekCursorFrames = 0;
   uint64_t blackoutRemainingMs = 0;
   uint64_t dayRestoreRemainingMs = 0;
+  /// Index into runtime day-music path list (shuffle). Added v2; v1 saves treat as 0.
+  uint32_t storeDayMusicTrackIdx = 0;
 };
+#pragma pack(pop)
+static_assert(sizeof(AudioStoreCycleSaveState) == 64);
 
 bool audioInit();
 void audioShutdown();
@@ -22,6 +28,8 @@ void audioSetStoreAmbienceVolume(float linear01);
 // Call each frame (pass dt): store music / lights / switch SFX sequencing.
 void audioUpdateStore(float dt);
 bool audioAreStoreFluorescentsOn();
+int audioGetDayCount();
+void audioResetToNewGame();
 // Freeze day↔night sequencing (fluorescents + store music events) while player is dead; store / horror / chase /
 // Shrek beds pause in place (same PCM on respawn). Scheduled blackout/restore times shift by pause duration.
 void audioSetStoreDayNightCyclePaused(bool paused);
@@ -46,3 +54,4 @@ void audioPlayStaffMeleeImpact();
 // Save/restore in-game music/day-cycle runtime so Continue resumes where the player left off.
 bool audioCaptureStoreCycleSaveState(AudioStoreCycleSaveState* outState);
 void audioRestoreStoreCycleSaveState(const AudioStoreCycleSaveState& state);
+void audioSetLoadingScreenActive(bool active);

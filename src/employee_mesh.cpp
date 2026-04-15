@@ -282,7 +282,7 @@ static bool pathLooksLikeGltf(const char* path) {
 
 bool loadFbx(const char* path, float targetHeightMeters, std::vector<LoadedVertex>& out,
              std::string& errOut, std::vector<uint8_t>* outDiffuseRgba, uint32_t* outDiffuseW,
-             uint32_t* outDiffuseH) {
+             uint32_t* outDiffuseH, size_t maxVertsForDecimation) {
   out.clear();
   errOut.clear();
   if (!path || !*path) {
@@ -331,8 +331,17 @@ bool loadFbx(const char* path, float targetHeightMeters, std::vector<LoadedVerte
     v.normal = glm::normalize(v.normal);
   }
 
-  // High-poly FBX characters × instancing tank the GPU; keep a hard cap on triangle count.
-  constexpr size_t kMaxVerts = 20'000;  // ~6.7k tris — lighter instanced draws
+  // Vertex cap: instanced draws multiply this cost. Tall meshes default to ~6.7k tris; small props
+  // (GLB tools, pipes, etc.) default to a tight cap — they used to skip decimation and could ship 100k–800k verts.
+  constexpr size_t kDefaultTallMaxVerts = 20'000;
+  constexpr size_t kDefaultPropMaxVerts = 8'192;
+  size_t kMaxVerts;
+  if (maxVertsForDecimation > 0)
+    kMaxVerts = maxVertsForDecimation;
+  else if (targetHeightMeters >= 1.0f)
+    kMaxVerts = kDefaultTallMaxVerts;
+  else
+    kMaxVerts = kDefaultPropMaxVerts;
   if (out.size() > kMaxVerts) {
     const size_t nTri = out.size() / 3;
     const size_t keepTri = kMaxVerts / 3;

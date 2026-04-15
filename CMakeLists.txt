@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.20)
 project(vulkan_game VERSION 1.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -103,7 +103,6 @@ endif()
 find_package(SDL2 REQUIRED)
 find_package(SDL2_image REQUIRED)
 find_package(Threads REQUIRED)
-find_package(Python3 3.6 COMPONENTS Interpreter REQUIRED)
 
 find_program(GLSL_COMPILER glslc
   HINTS "$ENV{VULKAN_SDK}/bin" "$ENV{VULKAN_SDK}/Bin"
@@ -112,6 +111,7 @@ if(NOT GLSL_COMPILER)
   message(FATAL_ERROR "glslc not found. Install Vulkan SDK or set GLSL_COMPILER to the glslc path.")
 endif()
 set(VULKAN_GAME_ASSETS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/assets")
+set(VULKAN_GAME_MESHY_REEXPORT_DIR "${VULKAN_GAME_ASSETS_DIR}/meshy_reexport")
 set(SHADER_DIR ${VULKAN_GAME_ASSETS_DIR}/shaders)
 set(SHADER_SOURCES ${SHADER_DIR}/shader.vert ${SHADER_DIR}/shader.frag ${SHADER_DIR}/shader_staff.vert
                    ${SHADER_DIR}/post.vert ${SHADER_DIR}/post.frag)
@@ -145,12 +145,18 @@ add_dependencies(vulkan_game shaders)
 
 target_include_directories(vulkan_game PRIVATE
   ${CMAKE_CURRENT_BINARY_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party
   ${glm_SOURCE_DIR}
 )
 
 # All shipped art/audio under vulkan_game/assets/ (see assets/models, assets/audio, assets/textures).
-set(STORE_AMBIENT_WAV "${VULKAN_GAME_ASSETS_DIR}/audio/store_ambient_loop.wav")
+# Prefer compressed loop when present (see scripts/shrink_audio_assets.sh); else ship WAV.
+if(EXISTS "${VULKAN_GAME_ASSETS_DIR}/audio/store_ambient_loop.mp3")
+  set(STORE_AMBIENT_WAV "${VULKAN_GAME_ASSETS_DIR}/audio/store_ambient_loop.mp3")
+else()
+  set(STORE_AMBIENT_WAV "${VULKAN_GAME_ASSETS_DIR}/audio/store_ambient_loop.wav")
+endif()
 set(POWER_SWITCH_SFX "${VULKAN_GAME_ASSETS_DIR}/audio/power_switch.mp3")
 set(HORROR_AMBIENT_MP3 "${VULKAN_GAME_ASSETS_DIR}/audio/horror_ambient.mp3")
 set(CHASE_MUSIC_MP3 "${VULKAN_GAME_ASSETS_DIR}/audio/chase_music.mp3")
@@ -172,9 +178,23 @@ set(VULKAN_GAME_MESHY_SLIDE_LIGHT_GLB "${VULKAN_GAME_STAFF_MODEL_DIR}/slide_ligh
 set(VULKAN_GAME_MESHY_STEP_PUSH_GLB "${VULKAN_GAME_STAFF_MODEL_DIR}/step_push.glb")
 set(VULKAN_GAME_MESHY_CROUCH_IDLE_BOW_GLB "${VULKAN_GAME_STAFF_MODEL_DIR}/crouch_idle_bow.glb")
 set(VULKAN_GAME_MESHY_SLOW_LADDER_CLIMB_GLB "${VULKAN_GAME_STAFF_MODEL_DIR}/ledge_ladder_climb.glb")
+# Optional: full slow ladder clip from Meshy (same rig); prefer in-repo reexport, then Downloads.
+set(_MESHY_SLOW_LADDER_EXT "/home/memesdudeguy/Downloads/Meshy_AI_biped/Meshy_AI_biped_Animation_Slow_Ladder_Climb_withSkin.glb")
+set(_MESHY_SLOW_LADDER_REEXPORT "${VULKAN_GAME_MESHY_REEXPORT_DIR}/Meshy_AI_biped_Animation_Slow_Ladder_Climb_withSkin.glb")
+if(EXISTS "${_MESHY_SLOW_LADDER_REEXPORT}")
+  set(VULKAN_GAME_MESHY_SLOW_LADDER_CLIMB_GLB "${_MESHY_SLOW_LADDER_REEXPORT}")
+  message(STATUS "vulkan_game: using Meshy slow ladder GLB (meshy_reexport): ${VULKAN_GAME_MESHY_SLOW_LADDER_CLIMB_GLB}")
+elseif(EXISTS "${_MESHY_SLOW_LADDER_EXT}")
+  set(VULKAN_GAME_MESHY_SLOW_LADDER_CLIMB_GLB "${_MESHY_SLOW_LADDER_EXT}")
+  message(STATUS "vulkan_game: using Meshy slow ladder GLB: ${VULKAN_GAME_MESHY_SLOW_LADDER_CLIMB_GLB}")
+endif()
+set(VULKAN_GAME_MESHY_LEDGE_GRAB_WALL_GLB "${VULKAN_GAME_STAFF_MODEL_DIR}/ledge_grab_wall.glb")
+set(VULKAN_GAME_MESHY_SHIMMY_LEFT_GLB "${VULKAN_GAME_STAFF_MODEL_DIR}/ledge_shimmy_left.glb")
+set(VULKAN_GAME_MESHY_SHIMMY_RIGHT_GLB "${VULKAN_GAME_STAFF_MODEL_DIR}/ledge_shimmy_right.glb")
 set(VULKAN_GAME_JUMPING_FBX "${VULKAN_GAME_STAFF_MODEL_DIR}/jump_regular.glb")
 set(VULKAN_GAME_JUMP_RUN_GLB "${VULKAN_GAME_STAFF_MODEL_DIR}/jump_run.glb")
 set(VULKAN_GAME_MESHY_PUNCH_GLB "${VULKAN_GAME_STAFF_MODEL_DIR}/punch_combo.glb")
+set(VULKAN_GAME_MESHY_KICK_GLB "${VULKAN_GAME_STAFF_MODEL_DIR}/kick.glb")
 set(VULKAN_GAME_MESHY_FALL_GLB "${VULKAN_GAME_STAFF_MODEL_DIR}/fall_knockdown.glb")
 set(VULKAN_GAME_MESHY_STANDUP_GLB "${VULKAN_GAME_STAFF_MODEL_DIR}/stand_up.glb")
 set(VULKAN_GAME_MESHY_LAND_GLB "${VULKAN_GAME_STAFF_MODEL_DIR}/land_hit_reaction.glb")
@@ -182,6 +202,9 @@ set(VULKAN_GAME_MESHY_HAIR_GLB "${VULKAN_GAME_STAFF_MODEL_DIR}/hair_shove_reacti
 if(EXISTS "${VULKAN_GAME_MESHY_IDLE_GLB}")
   set(VULKAN_GAME_EMPLOYEE_FBX "${VULKAN_GAME_MESHY_IDLE_GLB}")
   message(STATUS "vulkan_game staff mesh: ${VULKAN_GAME_MESHY_IDLE_GLB}")
+elseif(EXISTS "${VULKAN_GAME_ASSETS_DIR}/models/character_base.glb")
+  set(VULKAN_GAME_EMPLOYEE_FBX "${VULKAN_GAME_ASSETS_DIR}/models/character_base.glb")
+  message(STATUS "vulkan_game staff mesh: fallback ${VULKAN_GAME_EMPLOYEE_FBX}")
 else()
   set(VULKAN_GAME_EMPLOYEE_FBX "${VULKAN_GAME_ASSETS_DIR}/models/character_base.fbx")
   message(STATUS "vulkan_game staff mesh: fallback ${VULKAN_GAME_EMPLOYEE_FBX}")
@@ -211,18 +234,29 @@ target_compile_definitions(vulkan_game PRIVATE
   "VULKAN_GAME_MESHY_STEP_PUSH_GLB=\"${VULKAN_GAME_MESHY_STEP_PUSH_GLB}\""
   "VULKAN_GAME_MESHY_CROUCH_IDLE_BOW_GLB=\"${VULKAN_GAME_MESHY_CROUCH_IDLE_BOW_GLB}\""
   "VULKAN_GAME_MESHY_SLOW_LADDER_CLIMB_GLB=\"${VULKAN_GAME_MESHY_SLOW_LADDER_CLIMB_GLB}\""
+  "VULKAN_GAME_MESHY_LEDGE_GRAB_WALL_GLB=\"${VULKAN_GAME_MESHY_LEDGE_GRAB_WALL_GLB}\""
+  "VULKAN_GAME_MESHY_SHIMMY_LEFT_GLB=\"${VULKAN_GAME_MESHY_SHIMMY_LEFT_GLB}\""
+  "VULKAN_GAME_MESHY_SHIMMY_RIGHT_GLB=\"${VULKAN_GAME_MESHY_SHIMMY_RIGHT_GLB}\""
   "VULKAN_GAME_JUMPING_FBX=\"${VULKAN_GAME_JUMPING_FBX}\""
   "VULKAN_GAME_JUMP_RUN_GLB=\"${VULKAN_GAME_JUMP_RUN_GLB}\""
   "VULKAN_GAME_MESHY_PUNCH_GLB=\"${VULKAN_GAME_MESHY_PUNCH_GLB}\""
+  "VULKAN_GAME_MESHY_KICK_GLB=\"${VULKAN_GAME_MESHY_KICK_GLB}\""
   "VULKAN_GAME_MESHY_FALL_GLB=\"${VULKAN_GAME_MESHY_FALL_GLB}\""
   "VULKAN_GAME_MESHY_STANDUP_GLB=\"${VULKAN_GAME_MESHY_STANDUP_GLB}\""
   "VULKAN_GAME_MESHY_LAND_GLB=\"${VULKAN_GAME_MESHY_LAND_GLB}\""
   "VULKAN_GAME_STAFF_MELEE_IMPACT_MP3=\"${VULKAN_GAME_ASSETS_DIR}/audio/sfx_staff_melee_impact.mp3\""
+  "VULKAN_GAME_PIZZA_SLICE_GLB=\"${VULKAN_GAME_ASSETS_DIR}/models/pizza_slice.glb\""
 )
 
-# Title screen loop (default: the_long_hall.wav in assets or ~/Downloads).
+# Title screen loop (default: New_Project.wav in assets or ~/Downloads).
 set(_VULK_TITLE_MENU_WAV "")
-if(EXISTS "${VULKAN_GAME_ASSETS_DIR}/audio/the_long_hall.wav")
+if(EXISTS "${VULKAN_GAME_ASSETS_DIR}/audio/New_Project.wav")
+  set(_VULK_TITLE_MENU_WAV "${VULKAN_GAME_ASSETS_DIR}/audio/New_Project.wav")
+elseif(DEFINED ENV{HOME} AND EXISTS "$ENV{HOME}/Downloads/New_Project.wav")
+  set(_VULK_TITLE_MENU_WAV "$ENV{HOME}/Downloads/New_Project.wav")
+elseif(DEFINED ENV{USERPROFILE} AND EXISTS "$ENV{USERPROFILE}/Downloads/New_Project.wav")
+  set(_VULK_TITLE_MENU_WAV "$ENV{USERPROFILE}/Downloads/New_Project.wav")
+elseif(EXISTS "${VULKAN_GAME_ASSETS_DIR}/audio/the_long_hall.wav")
   set(_VULK_TITLE_MENU_WAV "${VULKAN_GAME_ASSETS_DIR}/audio/the_long_hall.wav")
 elseif(DEFINED ENV{HOME} AND EXISTS "$ENV{HOME}/Downloads/the_long_hall.wav")
   set(_VULK_TITLE_MENU_WAV "$ENV{HOME}/Downloads/the_long_hall.wav")
@@ -249,6 +283,9 @@ set(_VULK_STAFF_DANCE_SEARCH "")
 if(VULKAN_GAME_STAFF_SHREK_DANCE_GLB_PATH)
   list(APPEND _VULK_STAFF_DANCE_SEARCH "${VULKAN_GAME_STAFF_SHREK_DANCE_GLB_PATH}")
 endif()
+list(APPEND _VULK_STAFF_DANCE_SEARCH
+  "${VULKAN_GAME_MESHY_REEXPORT_DIR}/Meshy_AI_Animation_Hip_Hop_Dance_3_withSkin.glb"
+  "${VULKAN_GAME_MESHY_REEXPORT_DIR}/Meshy_AI_biped_Animation_Hip_Hop_Dance_3_withSkin.glb")
 # Hip-hop source (user-requested) before bundled character/proximity_dance.glb so staff + H emote match this motion.
 list(APPEND _VULK_STAFF_DANCE_SEARCH "${CMAKE_CURRENT_SOURCE_DIR}/../Meshy_AI_Animation_Hip_Hop_Dance_3_withSkin.glb")
 if(DEFINED ENV{HOME})
@@ -287,6 +324,8 @@ if(VULKAN_GAME_SHREK_EGG_GLB_PATH)
   list(APPEND _VULK_SHREK_SEARCH "${VULKAN_GAME_SHREK_EGG_GLB_PATH}")
 endif()
 list(APPEND _VULK_SHREK_SEARCH "${VULKAN_GAME_STAFF_MODEL_DIR}/${_VULK_SHREK_FN}")
+list(APPEND _VULK_SHREK_SEARCH
+  "${VULKAN_GAME_MESHY_REEXPORT_DIR}/Meshy_AI_biped_Animation_Hip_Hop_Dance_3_withSkin.glb")
 list(APPEND _VULK_SHREK_SEARCH
   "${CMAKE_CURRENT_SOURCE_DIR}/../Meshy_AI_biped/Meshy_AI_biped_Animation_Hip_Hop_Dance_3_withSkin.glb"
   "${CMAKE_CURRENT_SOURCE_DIR}/../Meshy_AI_biped/${_VULK_SHREK_FN}"
@@ -334,6 +373,107 @@ if(VULKAN_GAME_SHREK_EGG_MP3_CAND)
   message(STATUS "vulkan_game: Shrek easter egg music: ${VULKAN_GAME_SHREK_EGG_MP3_CAND}")
 endif()
 
+# Optional deli prop: meatballs GLB for pickup/eat (same interaction flow as pizza).
+set(VULKAN_GAME_DELI_MEATBALL_GLB_PATH "/home/memesdudeguy/Downloads/Meshy_AI_sweetish_meat_balls_o_0404203406_texture.glb"
+    CACHE FILEPATH "Path to deli meatballs GLB")
+set(_VULK_DELI_MEATBALL_FN "Meshy_AI_sweetish_meat_balls_o_0404203406_texture.glb")
+set(_VULK_DELI_MEATBALL_SEARCH "")
+if(VULKAN_GAME_DELI_MEATBALL_GLB_PATH)
+  list(APPEND _VULK_DELI_MEATBALL_SEARCH "${VULKAN_GAME_DELI_MEATBALL_GLB_PATH}")
+endif()
+list(APPEND _VULK_DELI_MEATBALL_SEARCH "${VULKAN_GAME_MESHY_REEXPORT_DIR}/${_VULK_DELI_MEATBALL_FN}")
+if(DEFINED ENV{HOME})
+  list(APPEND _VULK_DELI_MEATBALL_SEARCH "$ENV{HOME}/Downloads/${_VULK_DELI_MEATBALL_FN}")
+endif()
+if(DEFINED ENV{USERPROFILE})
+  list(APPEND _VULK_DELI_MEATBALL_SEARCH "$ENV{USERPROFILE}/Downloads/${_VULK_DELI_MEATBALL_FN}")
+endif()
+set(VULKAN_GAME_DELI_MEATBALL_GLB_CAND "")
+foreach(_p IN LISTS _VULK_DELI_MEATBALL_SEARCH)
+  if(EXISTS "${_p}")
+    set(VULKAN_GAME_DELI_MEATBALL_GLB_CAND "${_p}")
+    break()
+  endif()
+endforeach()
+if(VULKAN_GAME_DELI_MEATBALL_GLB_CAND)
+  target_compile_definitions(vulkan_game PRIVATE
+    "VULKAN_GAME_DELI_MEATBALL_GLB=\"${VULKAN_GAME_DELI_MEATBALL_GLB_CAND}\"")
+  message(STATUS "vulkan_game: deli meatballs GLB: ${VULKAN_GAME_DELI_MEATBALL_GLB_CAND}")
+else()
+  message(STATUS "vulkan_game: deli meatballs GLB not found — set VULKAN_GAME_DELI_MEATBALL_GLB_PATH or place ${_VULK_DELI_MEATBALL_FN} in Downloads.")
+endif()
+
+# Box cutter + rusty pipe on shelf decks (off by default). Enable with -DVULKAN_GAME_SHELF_DECK_PROPS=ON.
+option(VULKAN_GAME_SHELF_DECK_PROPS "Instanced box cutter and rusty pipe on shelf decks" OFF)
+
+# Optional shelf prop: Meshy box cutter GLB (rarer spawn than ladders in-game).
+set(VULKAN_GAME_SHELF_BOX_CUTTER_GLB_PATH "" CACHE FILEPATH "Path to box cutter GLB for shelf instancing")
+set(_VULK_BOXCUT_FN "Meshy_AI_box_cutter_0402120433_texture.glb")
+set(_VULK_BOXCUT_SEARCH "")
+if(VULKAN_GAME_SHELF_BOX_CUTTER_GLB_PATH)
+  list(APPEND _VULK_BOXCUT_SEARCH "${VULKAN_GAME_SHELF_BOX_CUTTER_GLB_PATH}")
+endif()
+list(APPEND _VULK_BOXCUT_SEARCH "${VULKAN_GAME_MESHY_REEXPORT_DIR}/${_VULK_BOXCUT_FN}")
+list(APPEND _VULK_BOXCUT_SEARCH
+  "${CMAKE_CURRENT_SOURCE_DIR}/../${_VULK_BOXCUT_FN}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../Downloads/${_VULK_BOXCUT_FN}")
+if(DEFINED ENV{HOME})
+  list(APPEND _VULK_BOXCUT_SEARCH "$ENV{HOME}/Downloads/${_VULK_BOXCUT_FN}")
+endif()
+if(DEFINED ENV{USERPROFILE})
+  list(APPEND _VULK_BOXCUT_SEARCH "$ENV{USERPROFILE}/Downloads/${_VULK_BOXCUT_FN}")
+endif()
+set(VULKAN_GAME_SHELF_BOX_CUTTER_GLB_CAND "")
+foreach(_p IN LISTS _VULK_BOXCUT_SEARCH)
+  if(EXISTS "${_p}")
+    set(VULKAN_GAME_SHELF_BOX_CUTTER_GLB_CAND "${_p}")
+    break()
+  endif()
+endforeach()
+if(VULKAN_GAME_SHELF_DECK_PROPS AND VULKAN_GAME_SHELF_BOX_CUTTER_GLB_CAND)
+  target_compile_definitions(vulkan_game PRIVATE
+    "VULKAN_GAME_SHELF_BOX_CUTTER_GLB=\"${VULKAN_GAME_SHELF_BOX_CUTTER_GLB_CAND}\"")
+  message(STATUS "vulkan_game: shelf box cutter GLB: ${VULKAN_GAME_SHELF_BOX_CUTTER_GLB_CAND}")
+elseif(VULKAN_GAME_SHELF_BOX_CUTTER_GLB_CAND)
+  message(STATUS "vulkan_game: shelf box cutter GLB found but disabled (set VULKAN_GAME_SHELF_DECK_PROPS=ON to enable).")
+else()
+  message(STATUS "vulkan_game: shelf box cutter GLB not found — optional prop disabled (set VULKAN_GAME_SHELF_BOX_CUTTER_GLB_PATH or place ${_VULK_BOXCUT_FN} in Downloads).")
+endif()
+
+# Optional shelf prop: rusty pipe GLB (more common in-game than the box cutter).
+set(VULKAN_GAME_SHELF_RUSTY_PIPE_GLB_PATH "" CACHE FILEPATH "Path to rusty pipe GLB for shelf instancing")
+set(_VULK_PIPE_FN "Meshy_AI_rusty_pipe_0402121715_texture.glb")
+set(_VULK_PIPE_SEARCH "")
+if(VULKAN_GAME_SHELF_RUSTY_PIPE_GLB_PATH)
+  list(APPEND _VULK_PIPE_SEARCH "${VULKAN_GAME_SHELF_RUSTY_PIPE_GLB_PATH}")
+endif()
+list(APPEND _VULK_PIPE_SEARCH "${VULKAN_GAME_MESHY_REEXPORT_DIR}/${_VULK_PIPE_FN}")
+list(APPEND _VULK_PIPE_SEARCH
+  "${CMAKE_CURRENT_SOURCE_DIR}/../${_VULK_PIPE_FN}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../Downloads/${_VULK_PIPE_FN}")
+if(DEFINED ENV{HOME})
+  list(APPEND _VULK_PIPE_SEARCH "$ENV{HOME}/Downloads/${_VULK_PIPE_FN}")
+endif()
+if(DEFINED ENV{USERPROFILE})
+  list(APPEND _VULK_PIPE_SEARCH "$ENV{USERPROFILE}/Downloads/${_VULK_PIPE_FN}")
+endif()
+set(VULKAN_GAME_SHELF_RUSTY_PIPE_GLB_CAND "")
+foreach(_p IN LISTS _VULK_PIPE_SEARCH)
+  if(EXISTS "${_p}")
+    set(VULKAN_GAME_SHELF_RUSTY_PIPE_GLB_CAND "${_p}")
+    break()
+  endif()
+endforeach()
+if(VULKAN_GAME_SHELF_DECK_PROPS AND VULKAN_GAME_SHELF_RUSTY_PIPE_GLB_CAND)
+  target_compile_definitions(vulkan_game PRIVATE
+    "VULKAN_GAME_SHELF_RUSTY_PIPE_GLB=\"${VULKAN_GAME_SHELF_RUSTY_PIPE_GLB_CAND}\"")
+  message(STATUS "vulkan_game: shelf rusty pipe GLB: ${VULKAN_GAME_SHELF_RUSTY_PIPE_GLB_CAND}")
+elseif(VULKAN_GAME_SHELF_RUSTY_PIPE_GLB_CAND)
+  message(STATUS "vulkan_game: shelf rusty pipe GLB found but disabled (set VULKAN_GAME_SHELF_DECK_PROPS=ON to enable).")
+else()
+  message(STATUS "vulkan_game: shelf rusty pipe GLB not found — optional prop disabled (set VULKAN_GAME_SHELF_RUSTY_PIPE_GLB_PATH or place ${_VULK_PIPE_FN} in Downloads).")
+endif()
+
 set(VULKAN_GAME_HEARTBEAT_MP3_CAND "${VULKAN_GAME_ASSETS_DIR}/audio/ui_low_health_heartbeat.mp3")
 if(NOT EXISTS "${VULKAN_GAME_HEARTBEAT_MP3_CAND}")
   set(VULKAN_GAME_HEARTBEAT_MP3_CAND "${CMAKE_CURRENT_SOURCE_DIR}/../brvhrtz-heartbeat-02-225103.mp3")
@@ -364,34 +504,17 @@ if(EXISTS "${VULKAN_GAME_UI_FONT}")
   target_compile_definitions(vulkan_game PRIVATE "VULKAN_GAME_UI_FONT_PATH=\"${VULKAN_GAME_UI_FONT}\"")
 endif()
 
-# Embed runtime textures / SFX directly into the executable (paths must exist at configure time).
-set(SCENE_TEXTURE_ASSET "${VULKAN_GAME_ASSETS_DIR}/textures/wall_concrete_gray.png")
-set(SIGN_TEXTURE_ASSET "${VULKAN_GAME_ASSETS_DIR}/textures/sign.png")
-set(SHELF_TEXTURE_ASSET "${VULKAN_GAME_ASSETS_DIR}/textures/shelf_rack_metal_osb.jpg")
-set(CRATE_TEXTURE_ASSET "${VULKAN_GAME_ASSETS_DIR}/textures/crate_cardboard.jpeg")
-set(FOOTSTEP_SOUND_ASSET "${VULKAN_GAME_ASSETS_DIR}/audio/sfx_footstep_concrete.mp3")
-set(SLIDE_SOUND_ASSET "${VULKAN_GAME_ASSETS_DIR}/audio/sfx_slide_body_fall.mp3")
-
-set(EMBEDDED_ASSETS_HEADER "${CMAKE_CURRENT_BINARY_DIR}/vulkan_embedded_assets.h")
-set(EMBED_MANIFEST "${CMAKE_CURRENT_BINARY_DIR}/embed_assets_manifest.txt")
-set(EMBED_ALL_PY "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_all_assets.py")
-# One Python process writes the whole header (sequential CMake execute_process runs interleave badly).
-file(WRITE "${EMBED_MANIFEST}" "")
-function(embed_manifest_line SYMBOL PATH)
-  file(APPEND "${EMBED_MANIFEST}" "${SYMBOL}\t${PATH}\n")
-endfunction()
-embed_manifest_line(kSceneTextureData "${SCENE_TEXTURE_ASSET}")
-embed_manifest_line(kSignTextureData "${SIGN_TEXTURE_ASSET}")
-embed_manifest_line(kShelfRackTextureData "${SHELF_TEXTURE_ASSET}")
-embed_manifest_line(kCrateTextureData "${CRATE_TEXTURE_ASSET}")
-embed_manifest_line(kFootstepSoundData "${FOOTSTEP_SOUND_ASSET}")
-embed_manifest_line(kSlideSoundData "${SLIDE_SOUND_ASSET}")
-execute_process(
-  COMMAND ${Python3_EXECUTABLE} "${EMBED_ALL_PY}" "${EMBEDDED_ASSETS_HEADER}" "${EMBED_MANIFEST}"
-  RESULT_VARIABLE _embed_rv)
-if(NOT _embed_rv EQUAL 0)
-  message(FATAL_ERROR "embed_all_assets.py failed (${_embed_rv})")
+# Scene textures load from disk at runtime under VULKAN_GAME_ASSETS_DIR (see main.cpp create*TextureResources).
+# Optional override for deli brushed-metal (default: assets/textures/deli_metal_brushed.jpg).
+set(VULKAN_GAME_DELI_METAL_TEXTURE_PATH "" CACHE FILEPATH
+  "Path to deli counter brushed-metal image (empty: use assets/textures/deli_metal_brushed.jpg)")
+if(VULKAN_GAME_DELI_METAL_TEXTURE_PATH)
+  set(VULKAN_GAME_DELI_METAL_TEXTURE "${VULKAN_GAME_DELI_METAL_TEXTURE_PATH}")
+else()
+  set(VULKAN_GAME_DELI_METAL_TEXTURE "${VULKAN_GAME_ASSETS_DIR}/textures/deli_metal_brushed.jpg")
 endif()
+target_compile_definitions(vulkan_game PRIVATE
+  "VULKAN_GAME_DELI_METAL_TEXTURE=\"${VULKAN_GAME_DELI_METAL_TEXTURE}\"")
 
 set(_VULKAN_GAME_SDL2_IMAGE_LINK_TARGET "")
 if(TARGET SDL2_image::SDL2_image)
