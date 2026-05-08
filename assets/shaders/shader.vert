@@ -57,6 +57,8 @@ void main() {
                        inColor.b > 0.068 && inColor.b < 0.075;
     bool isUiIkeaPanel = inColor.r > 0.008 && inColor.r < 0.016 && inColor.g > 0.308 && inColor.g < 0.328 &&
                          inColor.b > 0.702 && inColor.b < 0.728;
+    bool isUiOptionBtn = inColor.r > 0.011 && inColor.r < 0.014 && inColor.g > 0.310 && inColor.g < 0.326 &&
+                         inColor.b > 0.625 && inColor.b < 0.645;
     bool isUiMenuFrame = inColor.r > 0.0095 && inColor.r < 0.0135 && inColor.g > 0.310 && inColor.g < 0.326 &&
                          inColor.b > 0.498 && inColor.b < 0.512;
     bool isUiIkeaLogo = inColor.r > 0.0105 && inColor.r < 0.0135 && inColor.g > 0.315 && inColor.g < 0.324 &&
@@ -67,17 +69,18 @@ void main() {
                               inColor.b > 0.104 && inColor.b < 0.114;
     if (isUiBackdrop || isUiText || isUiHealthTrack || isUiHealthFill || isUiHealthFillCrit ||
         isUiHealthFrame || isUiPipHud || isUiHudVignette || isUiDeathVignette || isUiHudFont ||
-        isUiIkeaPanel || isUiMenuFrame || isUiIkeaLogo || isUiIkeaFont || isUiDeathTitleFont) {
-        // Vulkan clip space is Y-down; our UI verts use Y-up — flip Y so text reads upright.
-        gl_Position = vec4(inPosition.x, -inPosition.y, 0.0, 1.0);
+        isUiIkeaPanel || isUiMenuFrame || isUiOptionBtn || isUiIkeaLogo || isUiIkeaFont || isUiDeathTitleFont) {
+        vec2 uiOff = push.model[3].xy;
+        gl_Position = vec4(inPosition.x + uiOff.x, -(inPosition.y + uiOff.y), 0.0, 1.0);
         fragWorldPos = ubo.cameraPos.xyz;
         fragNormal = vec3(0.0, 0.0, 1.0);
-        fragLocalPos = inPosition;
-        // Pip HUD: per-vert UV for fragment AA. TrueType HUD: glyph UVs. Menu vignettes: NDC→UV radial.
-        fragTexCoord = (isUiPipHud || isUiHudFont || isUiIkeaFont || isUiIkeaLogo || isUiDeathTitleFont) ? inUv
+        fragLocalPos = vec3(inPosition.xy, push.staffShade.z);
+        fragTexCoord = (isUiPipHud || isUiHudFont || isUiIkeaFont || isUiIkeaLogo || isUiDeathTitleFont ||
+                        isUiIkeaPanel || isUiMenuFrame || isUiOptionBtn)
+                           ? inUv
                        : (isUiHudVignette || isUiDeathVignette) ? inPosition.xy * 0.5 + 0.5
-                                                               : vec2(0.5);
-        fragLocalNormal = inNormal;
+                                                                : vec2(0.5);
+        fragLocalNormal = isUiDeathVignette ? vec3(inNormal.xy, push.staffShade.w) : inNormal;
         return;
     }
     // Screen-space crosshair (NDC quad, drawn last).
@@ -121,10 +124,9 @@ void main() {
     }
     vec4 worldPos = model * vec4(posL, 1.0);
     fragWorldPos = worldPos.xyz;
-    // Normal transform: upper 3×3 inverse-transpose (cheaper than full mat4 inverse).
     mat3 m3 = mat3(model);
-    mat3 normalMat = transpose(inverse(m3));
-    fragNormal = normalize(normalMat * inNormal);
+    mat3 cofactor = mat3(cross(m3[1], m3[2]), cross(m3[2], m3[0]), cross(m3[0], m3[1]));
+    fragNormal = normalize(cofactor * inNormal);
     fragLocalPos = inPosition;
     fragTexCoord = inUv;
     fragLocalNormal = inNormal;
@@ -140,20 +142,24 @@ void main() {
     bool isFluoro = tag.r > 0.92 && tag.g > 0.88 && tag.b > 0.40 && tag.b < 0.52;
     bool isEmployee = isEmployeeV;
     bool isWarehouse = isWarehouseMetal || isWarehouseWood || isWarehouseCrate || isFluoro;
-    // PS1-style geometry wobble (kept moderate to avoid giant artifacts).
-    const float clipSnap = 120.0;
-    if (!isSign && !isString && !isWarehouse && !isEmployee) {
+    // PS1-style geometry wobble on all world geometry.
+    bool fpMode = ubo.employeeFadeH.w > 0.5;
+    float clipSnap = 120.0;
+    if (fpMode) clipSnap = 180.0;
+    if (!isSign && !isString && !isEmployee) {
         clip.xy = floor(clip.xy * clipSnap) / clipSnap;
     }
-    // Staff: chunky clip-space verts (separate from shelves); tighter under parkour (PS1 × DL motion).
     if (isEmployee) {
-        float snap = mix(68.0, 38.0, parkourPs1Pk * 0.92);
+        float snap = mix(140.0, 80.0, parkourPs1Pk * 0.92);
+        if (fpMode) snap *= 1.6;
         clip.xy = floor(clip.xy * snap) / snap;
         float wv = fract(sin(dot(worldPos.xyz * vec3(2.71, 6.11, 3.83) + vec3(ubo.staffAnim.x * 6.2),
                                vec3(12.9898, 78.233, 45.164))) *
                         43758.5453) -
                  0.5;
-        clip.z += wv * 0.0021 * parkourPs1Pk * clip.w;
+        float zJit = 0.0008 * parkourPs1Pk;
+        if (fpMode) zJit *= 0.3;
+        clip.z += wv * zJit * clip.w;
     }
     gl_Position = clip;
 }

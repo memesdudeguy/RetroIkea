@@ -22,28 +22,38 @@ void main() {
     vec2 uv = (floor(st * texSz) + vec2(0.5)) / texSz;
     vec3 col = texture(sceneTex, uv).rgb;
 
-    // No colour grade / grey film — pc.g.y only ramps scan, grain, crush when lights are out.
+    // No grey film — pc.g.y ramps scan, grain, posterize when lights are out (PS1 horror CRT).
     float filmW = clamp(pc.g.y, 0.0, 1.0);
     float ps1Pk = clamp(pc.v.z, 0.0, 1.0);
     float pursuit = clamp(pc.v.w, 0.0, 1.0);
 
+    // Corner vignette first (cheap depth / dread in blackout).
+    vec2 cn = st * 2.0 - 1.0;
+    float vig = 1.0 - filmW * 0.24 * clamp(dot(cn, cn), 0.0, 1.0);
+    col *= mix(1.0, vig, filmW);
+
     const float scanPeriodPx = 10.0;
     float scan = sin(gl_FragCoord.y * 6.283185307 / scanPeriodPx);
-    float scanAmt = 0.012 + filmW * 0.085 + pursuit * filmW * 0.055;
+    float scanAmt = 0.014 + filmW * 0.118 + pursuit * filmW * 0.072;
     col *= 1.0 - scanAmt * (0.5 + 0.5 * scan);
     float scan2 = sin(gl_FragCoord.y * 6.283185307 / (scanPeriodPx * 3.17) + 1.1);
-    col *= 1.0 - (0.005 + filmW * 0.032) * (0.5 + 0.5 * scan2);
+    col *= 1.0 - (0.006 + filmW * 0.048) * (0.5 + 0.5 * scan2);
 
-    float gn = hash12(gl_FragCoord.xy + pc.g.x * vec2(113.0, 197.0)) - 0.5;
-    col += gn * (0.009 + filmW * 0.048 + ps1Pk * 0.034 + pursuit * filmW * 0.028);
+    float ps1Base = max(ps1Pk, 0.12);
+    float gn = hash12(gl_FragCoord.xy + vec2(pc.g.x * 13.7, pc.g.x * 9.2)) - 0.5;
+    col += gn * (0.007 + filmW * 0.048 + ps1Base * 0.028 + pursuit * filmW * 0.026);
 
-    float levels = mix(56.0, 18.0 + filmW * 4.0, filmW);
-    levels = mix(levels, levels * (0.72 + filmW * 0.18), ps1Pk * 0.62);
+    // Fewer discrete shades at night + extra crush when PS1 mix is high (Silent Hill-ish banding).
+    float levels = mix(56.0, 15.0 + filmW * 5.0, filmW);
+    levels = mix(levels, levels * (0.72 + filmW * 0.18), ps1Base * 0.55);
     col = floor(col * levels + vec3(0.5)) / levels;
 
+    // Slight sickly cool lift in darkness (not full colour grade).
+    col = mix(col, col * vec3(0.93, 0.96, 1.04), filmW * 0.14);
+
     col = clamp(col * (1.0 + 0.04 * (1.0 - filmW)) + vec3(0.006) * (1.0 - filmW * 0.65), 0.0, 1.0);
-    // Night (high filmW): small lift so blackout stays readable without washing out day.
-    col = clamp(col + vec3(0.014) * filmW, 0.0, 1.0);
+    // Night: small lift so blackout stays readable without washing out day.
+    col = clamp(col + vec3(0.016) * filmW, 0.0, 1.0);
 
     // Red screen edges: recent damage (pulse) + persistent rim while health is critically low.
     float dx = min(st.x, 1.0 - st.x);

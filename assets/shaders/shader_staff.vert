@@ -28,7 +28,7 @@ layout(push_constant) uniform PushModel {
 } push;
 
 // Must match staff_skin::kMaxPaletteBones and C++ SSBO stride.
-const int STAFF_MAX_BONES = 64;
+const int STAFF_MAX_BONES = 32;
 
 layout(std430, binding = 7) readonly buffer StaffBoneSSBO {
     mat4 bones[];
@@ -89,8 +89,8 @@ void main() {
     vec4 worldPos = M * vec4(inPosition, 1.0);
     fragWorldPos = worldPos.xyz;
     mat3 m3 = mat3(M);
-    mat3 normalMat = transpose(inverse(m3));
-    fragNormal = normalize(normalMat * inNormal);
+    mat3 cofactor = mat3(cross(m3[1], m3[2]), cross(m3[2], m3[0]), cross(m3[0], m3[1]));
+    fragNormal = normalize(cofactor * inNormal);
     fragLocalPos = inPosition;
     fragTexCoord = inUv;
     fragLocalNormal = inNormal;
@@ -106,18 +106,28 @@ void main() {
     bool isFluoro = tag.r > 0.92 && tag.g > 0.88 && tag.b > 0.40 && tag.b < 0.52;
     bool isEmployee = isEmployeeV;
     bool isWarehouse = isWarehouseMetal || isWarehouseWood || isWarehouseCrate || isFluoro;
-    const float clipSnap = 120.0;
-    if (!isSign && !isString && !isWarehouse && !isEmployee) {
+    bool fpMode = ubo.employeeFadeH.w > 0.5;
+    float clipSnap = 120.0;
+    if (fpMode) clipSnap = 180.0;
+    if (!isSign && !isString && !isEmployee) {
         clip.xy = floor(clip.xy * clipSnap) / clipSnap;
     }
     if (isEmployee) {
-        float snap = mix(68.0, 38.0, parkourPs1Pk * 0.92);
+        float snap = mix(140.0, 80.0, parkourPs1Pk * 0.92);
+        if (push.staffShade.y > 0.5) {
+            snap = mix(180.0, 140.0, parkourPs1Pk * 0.86);
+        }
+        if (fpMode) snap *= 1.6;
         clip.xy = floor(clip.xy * snap) / snap;
         float wv = fract(sin(dot(worldPos.xyz * vec3(2.71, 6.11, 3.83) + vec3(ubo.staffAnim.x * 6.2),
                                vec3(12.9898, 78.233, 45.164))) *
                         43758.5453) -
                  0.5;
-        clip.z += wv * 0.0021 * parkourPs1Pk * clip.w;
+        float zJit = 0.0008 * parkourPs1Pk;
+        if (push.staffShade.y > 0.5)
+            zJit *= 0.42;
+        if (fpMode) zJit *= 0.3;
+        clip.z += wv * zJit * clip.w;
     }
     gl_Position = clip;
 }

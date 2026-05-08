@@ -38,6 +38,11 @@ layout(binding = 6) uniform sampler2D staffGlbTex;
 layout(binding = 8) uniform sampler2D shrekEggTex;
 layout(binding = 9) uniform sampler2D hudFontTex;
 layout(binding = 10) uniform sampler2D titleIkeaLogoTex;
+layout(binding = 11) uniform sampler2D boxCutterTex;
+layout(binding = 12) uniform sampler2D rustyPipeTex;
+layout(binding = 13) uniform sampler2D palletTex;
+layout(binding = 14) uniform sampler2D deliMetalTex;
+layout(binding = 15) uniform sampler2D deliBaseTex;
 
 // Staff: extraTex[0]=pants, [1]=shirt, [2]=skin. Unrolled for Vulkan sampler arrays.
 vec2 staffUvToTexelCenter(vec2 uv, vec2 texDims, float blockMul) {
@@ -81,6 +86,8 @@ float atmosphereFogAmt(float dist) {
     float t = smoothstep(ubo.fogParams.x, ubo.fogParams.y, dist);
     if (ubo.fogParams.w > 0.5)
         t = 1.0 - pow(max(1.0 - t, 0.0), 1.22);
+    else
+        t = pow(clamp(t, 0.0, 1.0), 1.28);
     return clamp(t, 0.0, 1.0);
 }
 
@@ -93,18 +100,61 @@ vec3 atmosphereFogColor() {
 vec3 fogMixLit(vec3 lit, float dist) {
     float a = atmosphereFogAmt(dist);
     if (ubo.fogParams.w > 0.5)
-        a *= 0.82;
+        a *= 0.88;
+    else
+        a = min(1.0, a * 1.22);
     return mix(lit, atmosphereFogColor(), a);
+}
+
+// Deli counter centers match main.cpp kShelfAisleModulePitch / kShelfAlongAislePitch (must stay in sync).
+float deliPizzaHash21(vec2 p) {
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+}
+
+// Round cheese + crust ring + pepperoni disks — procedural (no pizza bitmap).
+vec3 deliPizzaProceduralBase(vec3 N, vec3 worldPos) {
+    const float kPitchAisle = 7.85;
+    const float kPitchAlong = 5.95;
+    const float kRad = 0.48;
+    vec2 pitch = vec2(kPitchAisle, kPitchAlong);
+    vec2 cell = floor(worldPos.xz / pitch);
+    vec2 centerXZ = (cell + vec2(0.5)) * pitch;
+    vec2 rel = worldPos.xz - centerXZ;
+    float r = length(rel);
+    vec3 Nn = normalize(N);
+    if (Nn.y > 0.5 && r > kRad)
+        discard;
+    float moz = 0.92 + 0.08 * sin(rel.x * 38.0) * sin(rel.y * 41.0);
+    vec3 cheese = vec3(0.97, 0.80, 0.38) * moz;
+    float crustW = smoothstep(kRad * 0.66, kRad * 0.90, r);
+    vec3 crustCol = vec3(0.70, 0.44, 0.19);
+    vec3 base = mix(cheese, crustCol, crustW);
+    float seed = deliPizzaHash21(cell * 14.3 + vec2(2.7, 8.1));
+    for (int i = 0; i < 12; i++) {
+        float fi = float(i);
+        float h1 = deliPizzaHash21(cell + vec2(fi * 1.9 + seed, fi * 0.7));
+        float h2 = deliPizzaHash21(cell + vec2(fi * 0.6 + 1.1, fi * 2.3 + seed));
+        float ang = h1 * 6.2831853;
+        float rr = (0.11 + h2 * 0.64) * kRad;
+        vec2 o = vec2(cos(ang), sin(ang)) * rr;
+        float pr = 0.040 * (kRad / 0.48);
+        float d = length(rel - o);
+        float t = 1.0 - smoothstep(pr * 0.55, pr, d);
+        if (t > 0.01)
+            base = mix(base, vec3(0.60, 0.15, 0.09), t * 0.93);
+    }
+    float sideCrust = smoothstep(0.18, 0.72, 1.0 - abs(Nn.y));
+    base = mix(base, vec3(0.54, 0.33, 0.15), sideCrust * 0.9);
+    return base;
 }
 
 // One textureSize per pass; avoids three lookups in triplanar.
 vec2 crunchyUvDims(vec2 uv, vec2 texDims) {
-    vec2 q = fract(uv) * texDims;
-    return (floor(q) + vec2(0.5)) / texDims;
+    return fract(uv);
 }
 
 vec3 retroWorldSamplePos(vec3 worldPos) {
-    const float k = 6.0;
+    const float k = 14.0;
     return floor(worldPos * k) / k;
 }
 
@@ -181,21 +231,12 @@ float bayer4x4(vec2 p) {
 
 // N must be unit; avoids redundant normalize in callers.
 vec3 applyPlayerShadow(vec3 lit, vec3 N, vec3 worldPos) {
-    vec4 sp = ubo.shadowParams;
-    float ndUp = dot(N, vec3(0.0, 1.0, 0.0));
-    if (ndUp < 0.48)
-        return lit;
-    float h = abs(worldPos.y - sp.z);
-    if (h > 0.16)
-        return lit;
-    float d = length(worldPos.xz - sp.xy);
-    float r = max(sp.w, 0.08);
-    float falloff = 1.0 - smoothstep(0.0, r, d);
-    float shadowAmt = falloff * falloff * 0.36;
-    return lit * (1.0 - shadowAmt);
+    return lit;
 }
 
 vec3 ditherQuantize(vec3 rgb, float pixelSize, float levels, float ditherScale) {
+    levels = max(levels, 36.0);
+    ditherScale *= 0.40;
     vec2 blockCoord = floor(gl_FragCoord.xy / pixelSize) * pixelSize;
     float di = (bayer4x4(blockCoord) - 0.5) / levels;
     rgb = clamp(rgb + di * ditherScale, 0.0, 1.0);
@@ -237,6 +278,15 @@ void main() {
         tag.r > 0.054 && tag.r < 0.063 && tag.g > 0.20 && tag.g < 0.28 && tag.b > 0.075 && tag.b < 0.098;
     bool uiHealthFrame =
         tag.r > 0.065 && tag.r < 0.076 && tag.g > 0.10 && tag.g < 0.13 && tag.b > 0.992;
+    bool uiHungerTrack =
+        tag.r > 0.003 && tag.r < 0.0055 && tag.g > 0.003 && tag.g < 0.0065 && tag.b > 0.447 &&
+        tag.b < 0.455;
+    bool uiHungerFill =
+        tag.r > 0.006 && tag.r < 0.0085 && tag.g > 0.003 && tag.g < 0.0065 && tag.b > 0.447 &&
+        tag.b < 0.455;
+    bool uiHungerFrame =
+        tag.r > 0.009 && tag.r < 0.0115 && tag.g > 0.003 && tag.g < 0.0065 && tag.b > 0.447 &&
+        tag.b < 0.455;
     bool pipBg =
         tag.r > 0.064 && tag.r < 0.072 && tag.g > 0.985 && tag.b > 0.012 && tag.b < 0.032;
     bool pipBright =
@@ -255,6 +305,8 @@ void main() {
                      tag.b < 0.075;
     bool uiIkeaPanel = tag.r > 0.008 && tag.r < 0.016 && tag.g > 0.308 && tag.g < 0.328 && tag.b > 0.702 &&
                        tag.b < 0.728;
+    bool uiOptionBtn = tag.r > 0.011 && tag.r < 0.014 && tag.g > 0.310 && tag.g < 0.326 &&
+                       tag.b > 0.625 && tag.b < 0.645;
     bool uiMenuFrame =
         tag.r > 0.0095 && tag.r < 0.0135 && tag.g > 0.310 && tag.g < 0.326 && tag.b > 0.498 && tag.b < 0.512;
     bool uiIkeaLogo = tag.r > 0.0105 && tag.r < 0.0135 && tag.g > 0.315 && tag.g < 0.324 && tag.b > 0.510 &&
@@ -286,119 +338,246 @@ void main() {
         return;
     }
     if (uiDeathVignette) {
+        float uiFade = fragLocalPos.z > 0.001 ? fragLocalPos.z : 1.0;
+        float uiTime = fragLocalNormal.z;
         vec2 uv = fragTexCoord - 0.5;
         float d = length(uv) * 1.22;
         float falloff = smoothstep(0.28, 1.0, d);
-        vec3 rim = vec3(0.38, 0.03, 0.05);
-        vec3 cen = vec3(0.04, 0.01, 0.02);
-        vec3 tint = mix(cen, rim, falloff);
-        float a = mix(0.44, 0.82, falloff) * fragColor.a;
-        outColor = vec4(tint, a);
+        bool isLoadScreen = uiTime > 0.01;
+        if (isLoadScreen) {
+            float pulse = 0.5 + 0.5 * sin(uiTime * 0.8);
+            float pulse2 = 0.5 + 0.5 * sin(uiTime * 0.5 + 1.2);
+            vec3 cen = vec3(0.38, 0.40, 0.46) + vec3(0.06, 0.05, 0.08) * pulse;
+            vec3 rim = vec3(0.18, 0.19, 0.22) + vec3(0.04, 0.03, 0.05) * pulse2;
+            float softVig = smoothstep(0.15, 1.1, d);
+            vec3 tint = mix(cen, rim, softVig);
+            float glow = 0.08 * exp(-d * d * 3.0) * (0.7 + 0.3 * pulse);
+            tint += vec3(glow * 0.9, glow * 0.92, glow);
+            outColor = vec4(tint, uiFade);
+        } else {
+            vec3 rim = vec3(0.38, 0.03, 0.05);
+            vec3 cen = vec3(0.04, 0.01, 0.02);
+            vec3 tint = mix(cen, rim, falloff);
+            float a = mix(0.44, 0.82, falloff) * fragColor.a;
+            outColor = vec4(tint, a);
+        }
         return;
     }
     if (uiHudVignette) {
         vec2 uv = fragTexCoord - 0.5;
         float d = length(uv) * 1.18;
         float falloff = smoothstep(0.22, 0.98, d);
-        vec3 rim = vec3(0.02, 0.09, 0.16);
-        vec3 cen = vec3(0.006, 0.012, 0.024);
+        // Cool store-floor blue in center → warm rim (pause / menu vignette).
+        vec3 rim = vec3(0.10, 0.09, 0.12);
+        vec3 cen = vec3(0.015, 0.028, 0.055);
         vec3 tint = mix(cen, rim, falloff * 0.88);
         float a = mix(0.46, 0.84, falloff) * fragColor.a;
         outColor = vec4(tint, a);
         return;
     }
     if (uiBackdrop) {
-        outColor = vec4(0.05, 0.055, 0.09, 1.0);
+        float uiFade = fragLocalPos.z > 0.001 ? fragLocalPos.z : 1.0;
+        // Deep blue-black scrim instead of flat black.
+        outColor = vec4(0.018, 0.035, 0.085, uiFade);
         return;
     }
     if (uiMenuFrame) {
-        // Thin rim — neutral grey (replaces bright yellow IKEA frame).
-        outColor = vec4(0.38, 0.40, 0.44, 1.0);
+        vec2 uv = fragTexCoord;
+        vec2 pxSz = fwidth(uv);
+        vec2 panelPx = 1.0 / max(pxSz, vec2(0.0001));
+        vec2 posPx = (uv - 0.5) * panelPx;
+        vec2 halfPx = panelPx * 0.5;
+        float r = clamp(min(halfPx.x, halfPx.y) * 0.40, 22.0, 64.0);
+        vec2 d = abs(posPx) - halfPx + vec2(r);
+        float sdf = min(max(d.x, d.y), 0.0) + length(max(d, vec2(0.0))) - r;
+        float aa = 1.35;
+        const float strokePx = 3.2;
+        float outer = 1.0 - smoothstep(-aa, aa, sdf);
+        float inner = 1.0 - smoothstep(-aa, aa, sdf + strokePx);
+        float stroke = clamp(outer - inner, 0.0, 1.0);
+        if (stroke < 0.02)
+            discard;
+        vec3 rim = mix(vec3(0.52, 0.78, 1.0), vec3(1.0, 0.88, 0.45), 0.38);
+        float pulse = 0.5 + 0.5 * sin(ubo.staffAnim.x * 2.6 + (uv.x + uv.y) * 6.28);
+        rim += vec3(0.04, 0.03, 0.02) * pulse;
+        outColor = vec4(rim, stroke * fragColor.a);
         return;
     }
     if (uiIkeaPanel) {
-        // Options / sign panels: dark grey (replaces blue IKEA gradient).
-        float vy = fragLocalPos.y;
-        vec3 top = vec3(0.22, 0.23, 0.26);
-        vec3 bot = vec3(0.11, 0.12, 0.14);
-        float g = smoothstep(0.38, -0.42, vy);
-        vec3 c = mix(bot, top, g);
-        float cx = abs(fragLocalPos.x);
-        float edge = (1.0 - smoothstep(0.0, 0.72, max(cx, abs(vy - 0.04)))) * 0.10;
-        c += vec3(0.05, 0.05, 0.06) * edge;
-        outColor = vec4(c, 1.0);
+        vec2 uv = fragTexCoord;
+        vec2 pxSz = fwidth(uv);
+        vec2 panelPx = 1.0 / max(pxSz, vec2(0.0001));
+        vec2 posPx = (uv - 0.5) * panelPx;
+        vec2 halfPx = panelPx * 0.5;
+        float r = clamp(min(halfPx.x, halfPx.y) * 0.40, 22.0, 62.0);
+        vec2 d = abs(posPx) - halfPx + vec2(r);
+        float sdf = min(max(d.x, d.y), 0.0) + length(max(d, vec2(0.0))) - r;
+        float aa = 1.25;
+        float mask = 1.0 - smoothstep(-aa, aa, sdf);
+        if (mask < 0.01) discard;
+        float inner = 1.0 - smoothstep(-aa, aa, sdf + 2.8);
+        // Vertical cool gradient + soft top sheen (store signage feel).
+        float gy = smoothstep(0.08, 0.92, uv.y);
+        vec3 fillHi = vec3(0.14, 0.18, 0.26);
+        vec3 fillLo = vec3(0.07, 0.08, 0.11);
+        vec3 edgeHi = vec3(0.32, 0.38, 0.48);
+        vec3 edgeLo = vec3(0.18, 0.19, 0.22);
+        vec3 fill = mix(fillHi, fillLo, gy);
+        vec3 edge = mix(edgeHi, edgeLo, gy);
+        vec3 base = mix(edge, fill, inner);
+        float inward = max(-sdf, 0.0);
+        const float outlinePx = 2.75;
+        float outlineBand = 1.0 - smoothstep(outlinePx - 1.35, outlinePx + 1.15, inward);
+        vec3 outlineBlue = vec3(0.38, 0.62, 0.95);
+        vec3 outlineGold = vec3(0.95, 0.82, 0.38);
+        float goldMix = 0.22 + 0.12 * sin(atan(uv.x - 0.5, uv.y - 0.5) * 3.0);
+        vec3 outlineRgb = mix(outlineBlue, outlineGold, clamp(goldMix, 0.0, 1.0));
+        vec3 col = mix(base, outlineRgb, outlineBand * 0.82);
+        float sheen = smoothstep(0.2, 0.48, uv.y) * smoothstep(0.62, 0.38, uv.y) * inner;
+        col += sheen * vec3(0.12, 0.14, 0.16);
+        outColor = vec4(col, mask);
+        return;
+    }
+    if (uiOptionBtn) {
+        vec2 uv = fragTexCoord;
+        vec2 pxSz = fwidth(uv);
+        vec2 panelPx = 1.0 / max(pxSz, vec2(0.0001));
+        vec2 posPx = (uv - 0.5) * panelPx;
+        vec2 halfPx = panelPx * 0.5;
+        float r = clamp(min(halfPx.x, halfPx.y) * 0.58, 16.0, 44.0);
+        vec2 d = abs(posPx) - halfPx + vec2(r);
+        float sdf = min(max(d.x, d.y), 0.0) + length(max(d, vec2(0.0))) - r;
+        float aa = 1.25;
+        float mask = 1.0 - smoothstep(-aa, aa, sdf);
+        if (mask < 0.01) discard;
+        float inner = 1.0 - smoothstep(-aa, aa, sdf + 2.55);
+        float gx = smoothstep(0.0, 1.0, uv.x);
+        vec3 fillL = vec3(0.22, 0.30, 0.44);
+        vec3 fillR = vec3(0.12, 0.16, 0.26);
+        vec3 edgeL = vec3(0.38, 0.48, 0.62);
+        vec3 edgeR = vec3(0.24, 0.32, 0.44);
+        vec3 fill = mix(fillL, fillR, gx);
+        vec3 edge = mix(edgeL, edgeR, gx);
+        vec3 base = mix(edge, fill, inner);
+        float inward = max(-sdf, 0.0);
+        const float outlinePx = 2.55;
+        float outlineBand = 1.0 - smoothstep(outlinePx - 1.15, outlinePx + 1.1, inward);
+        vec3 outlineRgb = mix(vec3(0.55, 0.78, 1.0), vec3(0.98, 0.86, 0.42), 0.32);
+        vec3 col = mix(base, outlineRgb, outlineBand * 0.92);
+        float cap = smoothstep(0.32, 0.48, abs(uv.x - 0.5) * 2.0);
+        col += (1.0 - cap) * smoothstep(0.58, 0.22, uv.y) * inner * vec3(0.10, 0.12, 0.16);
+        outColor = vec4(col, mask);
         return;
     }
     if (pipBg) {
         float f = pipHudFeatherMask();
-        outColor = vec4(0.025, 0.045, 0.075, 0.82 * f);
+        vec2 u = fragTexCoord;
+        vec3 c = mix(vec3(0.04, 0.06, 0.10), vec3(0.07, 0.09, 0.14), u.y);
+        outColor = vec4(c, 0.84 * f);
         return;
     }
     if (pipDim) {
         float f = pipHudFeatherMask();
-        outColor = vec4(0.14, 0.38, 0.52, f);
+        outColor = vec4(0.28, 0.32, 0.40, f);
         return;
     }
     if (pipBright) {
         float f = pipHudFeatherMask();
-        outColor = vec4(0.31, 0.78, 1.0, f);
+        outColor = vec4(0.78, 0.82, 0.92, f);
         return;
     }
     if (pipCrit) {
         float f = pipHudFeatherMask();
-        outColor = vec4(1.0, 0.38, 0.28, f);
+        outColor = vec4(1.0, 0.42, 0.32, f);
         return;
     }
     if (pipText) {
         // stb_easy_font quads are already blocky; edge feather uses fwidth(uv) and can wipe thin glyphs when
         // coverage is only a few pixels. Solid fill keeps labels readable; HP/compass text is built larger in C++.
-        outColor = vec4(0.36, 0.84, 1.0, 1.0);
+        outColor = vec4(0.88, 0.91, 0.98, 1.0);
         return;
     }
     if (uiHealthFrame) {
-        outColor = vec4(0.42, 0.48, 0.62, 1.0);
+        float gx = fragTexCoord.x;
+        vec3 hi = vec3(0.55, 0.58, 0.65);
+        vec3 lo = vec3(0.35, 0.36, 0.40);
+        outColor = vec4(mix(lo, hi, gx), 1.0);
         return;
     }
     if (uiHealthTrack) {
-        outColor = vec4(0.08, 0.09, 0.12, 1.0);
+        outColor = vec4(0.06, 0.08, 0.12, 1.0);
         return;
     }
     if (uiHealthFill) {
-        outColor = vec4(0.28, 0.88, 0.52, 1.0);
+        float gx = fragTexCoord.x;
+        vec3 a = vec3(0.15, 0.72, 0.42);
+        vec3 b = vec3(0.45, 0.98, 0.62);
+        outColor = vec4(mix(a, b, smoothstep(0.0, 1.0, gx)), 1.0);
         return;
     }
     if (uiHealthFillCrit) {
-        outColor = vec4(0.98, 0.42, 0.32, 1.0);
+        float gx = fragTexCoord.x;
+        vec3 a = vec3(0.75, 0.12, 0.08);
+        vec3 b = vec3(1.0, 0.55, 0.28);
+        outColor = vec4(mix(a, b, smoothstep(0.0, 1.0, gx)), 1.0);
+        return;
+    }
+    if (uiHungerFrame) {
+        float gx = fragTexCoord.x;
+        vec3 hi = vec3(0.62, 0.44, 0.20);
+        vec3 lo = vec3(0.34, 0.22, 0.10);
+        outColor = vec4(mix(lo, hi, gx), 1.0);
+        return;
+    }
+    if (uiHungerTrack) {
+        outColor = vec4(0.16, 0.12, 0.08, 1.0);
+        return;
+    }
+    if (uiHungerFill) {
+        float gx = fragTexCoord.x;
+        vec3 a = vec3(0.85, 0.44, 0.08);
+        vec3 b = vec3(1.0, 0.68, 0.22);
+        outColor = vec4(mix(a, b, smoothstep(0.0, 1.0, gx)), 1.0);
         return;
     }
     if (uiText) {
-        outColor = vec4(0.93, 0.95, 0.98, 1.0);
+        outColor = vec4(0.92, 0.94, 1.0, 1.0);
         return;
     }
     if (uiDeathTitleFont) {
         float cov = texture(hudFontTex, fragTexCoord).a;
         float a = smoothstep(0.12, 0.92, cov);
-        vec3 col = vec3(0.98, 0.16, 0.14);
+        vec3 hot = vec3(1.0, 0.22, 0.12);
+        vec3 deep = vec3(0.55, 0.05, 0.04);
+        float gy = fragTexCoord.y;
+        vec3 col = mix(deep, hot, smoothstep(0.15, 0.85, gy));
+        col += cov * cov * vec3(0.35, 0.12, 0.08);
         outColor = vec4(col, a);
         return;
     }
     if (uiIkeaFont) {
         float cov = texture(hudFontTex, fragTexCoord).a;
         float a = smoothstep(0.12, 0.92, cov);
-        vec3 pri = vec3(1.0, 0.86, 0.0);
-        vec3 acc = vec3(1.0, 0.94, 0.35);
-        vec3 opt = vec3(0.52, 0.55, 0.60);
+        float gy = fragTexCoord.y;
+        // Titles: warm gold; body: cool white; options: icy blue-white.
+        vec3 pri = mix(vec3(0.88, 0.90, 0.96), vec3(0.72, 0.78, 0.92), gy * 0.5);
+        vec3 acc = mix(vec3(0.98, 0.90, 0.48), vec3(0.92, 0.72, 0.28), gy);
+        vec3 opt = mix(vec3(0.78, 0.88, 1.0), vec3(0.55, 0.72, 0.95), gy * 0.65);
         vec3 col = tag.r > 0.0865 ? opt : (fragColor.g > 0.9048 ? acc : pri);
+        col *= 1.0 + 0.18 * cov * cov;
         outColor = vec4(col, a);
         return;
     }
     if (uiHudFont) {
         float cov = texture(hudFontTex, fragTexCoord).a;
         float a = smoothstep(0.04, 0.88, cov);
-        vec3 pri = vec3(0.93, 0.95, 0.98);
-        vec3 acc = vec3(1.0, 0.48, 0.16);
+        float uiFade = fragLocalPos.z > 0.001 ? fragLocalPos.z : 1.0;
+        float gy = fragTexCoord.y;
+        vec3 pri = mix(vec3(0.96, 0.97, 1.0), vec3(0.75, 0.82, 0.95), gy * 0.35);
+        vec3 acc = mix(vec3(0.85, 0.88, 0.95), vec3(0.55, 0.65, 0.88), gy);
         vec3 col = fragColor.g > 0.902 ? acc : pri;
-        outColor = vec4(col, a);
+        col *= 1.0 + 0.1 * cov;
+        outColor = vec4(col, a * uiFade);
         return;
     }
     if (tag.r > 0.97 && tag.b > 0.97 && tag.g < 0.06) {
@@ -420,19 +599,71 @@ void main() {
 
     bool isShelfMetal = tag.r > 0.88 && tag.g < 0.14 && tag.b < 0.14;
     bool isShelfWood = tag.g > 0.90 && tag.r < 0.14 && tag.b < 0.14;
+    bool isShelfLadder = tag.r > 0.10 && tag.r < 0.20 && tag.g > 0.11 && tag.g < 0.22 &&
+                          tag.b > 0.08 && tag.b < 0.19;
+    bool isShelfBoxCutter = tag.r > 0.21 && tag.r < 0.30 && tag.g > 0.04 && tag.g < 0.11 &&
+                             tag.b > 0.48 && tag.b < 0.55;
+    bool isShelfRustyPipe = tag.r > 0.47 && tag.r < 0.59 && tag.g > 0.22 && tag.g < 0.36 &&
+                             tag.b > 0.05 && tag.b < 0.13;
+    bool isShelfPallet = tag.r > 0.62 && tag.r < 0.70 && tag.g > 0.46 && tag.g < 0.54 &&
+                          tag.b > 0.24 && tag.b < 0.32;
     bool isShelfCrate = tag.r > 0.82 && tag.r < 0.92 && tag.g > 0.38 && tag.g < 0.50 &&
                          tag.b > 0.08 && tag.b < 0.22;
     bool isEmployee = tag.r > 0.49 && tag.r < 0.56 && tag.g > 0.84 && tag.g < 0.93 &&
                       tag.b > 0.86 && tag.b < 0.94;
+    bool isDeliCounter = tag.r > 0.10 && tag.r < 0.18 && tag.g > 0.88 && tag.g < 0.96 &&
+                         tag.b > 0.10 && tag.b < 0.18;
+    bool isDeliFrame = tag.r > 0.11 && tag.r < 0.19 && tag.g > 0.04 && tag.g < 0.12 &&
+                       tag.b > 0.88 && tag.b < 0.96;
+    bool isDeliFloor = tag.r > 0.88 && tag.r < 0.96 && tag.g > 0.10 && tag.g < 0.18 &&
+                       tag.b > 0.10 && tag.b < 0.18;
+    bool isDeliPizza = tag.r > 0.78 && tag.r < 0.86 && tag.g > 0.38 && tag.g < 0.46 &&
+                       tag.b > 0.08 && tag.b < 0.16;
+    bool isDeliMeatball = tag.r > 0.366 && tag.r < 0.378 && tag.g > 0.766 && tag.g < 0.778 &&
+                          tag.b > 0.606 && tag.b < 0.618;
     float parkourPs1Pk = clamp(ubo.staffAnim.z, 0.0, 1.0);
 
+    if (fragColor.a < 0.99 && !isEmployee) {
+        float alpha = fragColor.a;
+        ivec2 px = ivec2(gl_FragCoord.xy);
+        int bayer[16] = int[16](0,8,2,10, 12,4,14,6, 3,11,1,9, 15,7,13,5);
+        int idx = (px.x & 3) + (px.y & 3) * 4;
+        float threshold = (float(bayer[idx]) + 0.5) / 16.0;
+        if (alpha < threshold)
+            discard;
+        vec3 Nf = normalize(fragNormal);
+        vec3 toCam = ubo.cameraPos.xyz - fragWorldPos;
+        float dCam = length(toCam);
+        vec3 Vdir = dCam > 1e-4 ? toCam / dCam : vec3(0,0,1);
+        float fresnel = pow(1.0 - max(dot(Nf, Vdir), 0.0), 3.0);
+        vec3 glassCol = mix(vec3(0.78, 0.84, 0.88), vec3(0.92, 0.95, 0.98), fresnel);
+        float fog = clamp((dCam - ubo.fogParams.x) / max(ubo.fogParams.y - ubo.fogParams.x, 0.01), 0.0, 1.0);
+        glassCol = mix(glassCol, ubo.fogParams.rgb, fog * fog);
+        outColor = vec4(glassCol, 1.0);
+        return;
+    }
+
     float employeePopA = 1.0;
-    // Local player body (push.staffShade.w): skip distance pop-in so the mesh stays opaque.
     if (isEmployee && push.staffShade.w < 0.5) {
         float dH = length(fragWorldPos.xz - ubo.cameraPos.xz);
+        // FP near-camera discard: hide NPC fragments inside/near the player capsule.
+        // Arms/weapons during melee can extend past the NPC center, so the radius
+        // must cover the full body extent, not just the torso center.
+        // First-person only: cut fragments that actually intersect the eye (prevents z-fight / inside-mesh
+        // flashes). Older 1.2–2.2 m smoothstep faded whole NPCs at normal conversation range — mix with fog
+        // looked like they "vanished" when you stepped close.
+        if (ubo.employeeFadeH.w > 0.5) {
+            float d3 = length(fragWorldPos - ubo.cameraPos.xyz);
+            const float kEyeHard = 0.42;
+            const float kEyeSoft = 0.58;
+            if (d3 < kEyeHard)
+                discard;
+            if (d3 < kEyeSoft)
+                employeePopA *= smoothstep(kEyeHard, kEyeSoft, d3);
+        }
         float inR = max(ubo.employeeFadeH.x, 0.5);
         float outR = max(ubo.employeeFadeH.y, inR + 0.5);
-        employeePopA = clamp(1.0 - smoothstep(inR, outR, dH), 0.0, 1.0);
+        employeePopA *= clamp(1.0 - smoothstep(inR, outR, dH), 0.0, 1.0);
         if (employeePopA < 0.02)
             discard;
     }
@@ -440,31 +671,38 @@ void main() {
     // Local player skinned body: flat grey (no GLB texture). w in (0.5, 1.5). staffShade.x: FP-only mesh clip.
     // w >= 2: textured skinned draw (e.g. Shrek egg) — skip grey.
     if (isEmployee && push.staffShade.w > 0.5 && push.staffShade.w < 1.5) {
-        if (push.staffShade.x > 0.5) {
-            // Bind-pose local Y: hide head/neck so looking up doesn’t show the face mesh (FP body).
-            const float kFpBodyNeckY = 1.10;
-            if (fragLocalPos.y > kFpBodyNeckY)
+        // FP: hide head/neck center column, keep arms/shoulders. Tiny near-eye clip for z-fights.
+        // staffShade.x marks "local FP body clip". Keep remote players fully visible.
+        if (ubo.employeeFadeH.w > 0.5 && push.staffShade.x < 0.5) {
+            float rxz = length(fragLocalPos.xz);
+            if (fragLocalPos.y > 0.76 && rxz < 0.18)
                 discard;
-            // World Y: hide torso/hips below the eye line when turning / pitching (FP).
-            const float kFpHideBelowEyeM = 0.36;
-            if (fragWorldPos.y < ubo.cameraPos.y - kFpHideBelowEyeM)
+            float d3 = length(fragWorldPos - ubo.cameraPos.xyz);
+            if (d3 < 0.18)
                 discard;
         }
         vec3 Nf = normalize(fragNormal);
         vec3 toCam = ubo.cameraPos.xyz - fragWorldPos;
         float distCam = length(toCam);
-        vec3 Lk = normalize(vec3(0.35, 0.88, 0.32));
-        vec3 Lfill = normalize(vec3(0.5, 0.35, 0.45));
-        float ndk = max(dot(Nf, Lk), 0.0);
-        float ndf = max(dot(Nf, Lfill), 0.0) * 0.48;
-        vec3 base = vec3(0.50, 0.50, 0.52);
-        float shade = pow(ndk * 0.5 + 0.5, 1.08);
-        float amb = 0.22 + 0.07 * max(Nf.y, 0.0);
-        vec3 lit = base * amb + base * (0.48 * shade + ndf);
+        vec3 Vdir = distCam > 1e-4 ? toCam * (1.0 / distCam) : vec3(0.0, 0.0, 1.0);
+        vec3 base = vec3(0.56, 0.56, 0.58);
+        vec3 Lk = normalize(vec3(0.33, 0.90, 0.28));
+        vec3 Lfill = normalize(vec3(0.46, 0.36, 0.48));
+        float wrap = 0.12;
+        float ndkRaw = max(dot(Nf, Lk), 0.0);
+        float ndkW = clamp((ndkRaw + wrap) / (1.0 + wrap), 0.0, 1.0);
+        float shade = pow(ndkW * 0.5 + 0.5, 1.08);
+        float ndf = max(dot(Nf, Lfill), 0.0) * 0.54;
+        float amb = 0.24 + 0.078 * max(Nf.y, 0.0);
+        vec3 lit = base * amb + base * (0.44 * shade + ndf);
+        float ndV = max(dot(Nf, Vdir), 0.0);
+        float rimAmt = pow(1.0 - ndV, 2.2) * 0.08;
+        vec3 rimCol = vec3(0.72, 0.72, 0.74) * rimAmt;
+        lit += rimCol;
+        float spec = pow(max(dot(reflect(-Lk, Nf), Vdir), 0.0), 18.0) * 0.028;
+        lit += vec3(spec);
         lit = applyPlayerShadow(lit, Nf, fragWorldPos);
         vec3 rgb = fogMixLit(lit, distCam);
-        rgb = ditherQuantize(rgb, mix(8.0, 5.2, parkourPs1Pk), mix(9.0, 6.2, parkourPs1Pk),
-                             mix(0.78, 1.08, parkourPs1Pk));
         outColor = vec4(applyStoreLightMul(rgb), 1.0);
         return;
     }
@@ -480,7 +718,7 @@ void main() {
         vec3 Nq = vec3(ivec3(round(Nfac * nStep)));
         vec3 N = length(Nq) > 0.01 ? normalize(Nq) : Nfac;
         // Staff: binding 6 + optional UV block quantize. Shrek egg: binding 8 + direct mesh UV (never staff atlas).
-        if (ubo.extraTexInfo.w != 0 || (push.staffShade.w >= 2.0 && push.staffShade.w < 3.0)) {
+        if ((ubo.extraTexInfo.w != 0 && push.staffShade.w < 0.5) || (push.staffShade.w >= 2.0 && push.staffShade.w < 3.0)) {
             vec2 uvg = vec2(fragTexCoord.x, 1.0 - fragTexCoord.y);
             vec3 base;
             if (push.staffShade.w >= 2.0 && push.staffShade.w < 3.0)
@@ -620,7 +858,7 @@ void main() {
     }
 
     if (isShelfMetal) {
-        vec3 wp = retroWorldSamplePos(fragWorldPos);
+        vec3 wp = fragWorldPos;
         vec3 an = abs(N);
         vec3 blend = pow(max(an, vec3(0.001)), vec3(3.2));
         blend /= (blend.x + blend.y + blend.z);
@@ -646,13 +884,101 @@ void main() {
         vec3 lit = base * amb + base * (0.40 * shade + ndf + ndc) + vec3(spec) + base * fres;
         lit = applyPlayerShadow(lit, N, fragWorldPos);
         vec3 rgb = fogMixLit(lit, distCam);
-        rgb = ditherQuantize(rgb, 4.0, 32.0, 0.45);
+        rgb = ditherQuantize(rgb, 5.0, 20.0, 1.0);
+        outColor = vec4(applyStoreLightMul(rgb), 1.0);
+        return;
+    }
+
+    if (isShelfLadder) {
+        vec3 wp = fragWorldPos;
+        vec3 an = abs(N);
+        vec3 blend = pow(max(an, vec3(0.001)), vec3(2.5));
+        blend /= (blend.x + blend.y + blend.z);
+        vec2 dimS = vec2(textureSize(shelfTex, 0));
+        const float kT = 0.55;
+        vec3 tX = texture(shelfTex, crunchyUvDims(wp.yz * kT, dimS)).rgb;
+        vec3 tY = texture(shelfTex, crunchyUvDims(wp.xz * kT, dimS)).rgb;
+        vec3 tZ = texture(shelfTex, crunchyUvDims(wp.xy * kT, dimS)).rgb;
+        vec3 grain = tX * blend.x + tY * blend.y + tZ * blend.z;
+        float g = dot(grain, vec3(0.299, 0.587, 0.114));
+        vec3 base = vec3(0.22, 0.23, 0.25) * (0.82 + 0.28 * g);
+        vec3 Lk = normalize(vec3(0.28, 0.88, 0.26));
+        vec3 Lfill = normalize(vec3(0.5, 0.35, 0.45));
+        float ndk = max(dot(N, Lk), 0.0);
+        float ndf = max(dot(N, Lfill), 0.0) * 0.42;
+        float shade = pow(ndk * 0.5 + 0.5, 1.06);
+        float amb = 0.18 + 0.06 * max(N.y, 0.0);
+        float spec = pow(max(dot(reflect(-Lk, N), V), 0.0), 28.0) * 0.12;
+        vec3 lit = base * amb + base * (0.42 * shade + ndf) + vec3(spec);
+        lit = applyPlayerShadow(lit, N, fragWorldPos);
+        vec3 rgb = fogMixLit(lit, distCam);
+        rgb = ditherQuantize(rgb, 5.0, 20.0, 1.0);
+        outColor = vec4(applyStoreLightMul(rgb), 1.0);
+        return;
+    }
+
+    if (isShelfBoxCutter) {
+        vec2 uvg = vec2(fragTexCoord.x, 1.0 - fragTexCoord.y);
+        vec3 base = texture(boxCutterTex, uvg).rgb;
+        vec3 Lk = normalize(vec3(0.32, 0.88, 0.28));
+        vec3 Lfill = normalize(vec3(0.5, 0.35, 0.45));
+        float ndk = max(dot(N, Lk), 0.0);
+        float ndf = max(dot(N, Lfill), 0.0) * 0.48;
+        float shade = pow(ndk * 0.5 + 0.5, 1.06);
+        float amb = 0.20 + 0.075 * max(N.y, 0.0);
+        float spec = pow(max(dot(reflect(-Lk, N), V), 0.0), 22.0) * 0.10;
+        vec3 lit = base * amb + base * (0.44 * shade + ndf) + vec3(spec);
+        vec3 rgb = fogMixLit(lit * 1.20 + vec3(0.02), distCam);
+        rgb = ditherQuantize(rgb, 5.0, 20.0, 1.0);
+        outColor = vec4(applyStoreLightMul(rgb), 1.0);
+        return;
+    }
+
+    if (isShelfRustyPipe) {
+        vec2 uvg = vec2(fragTexCoord.x, 1.0 - fragTexCoord.y);
+        vec3 base = texture(rustyPipeTex, uvg).rgb;
+        vec3 Lk = normalize(vec3(0.30, 0.86, 0.26));
+        vec3 Lfill = normalize(vec3(0.5, 0.35, 0.45));
+        float ndk = max(dot(N, Lk), 0.0);
+        float ndf = max(dot(N, Lfill), 0.0) * 0.48;
+        float shade = pow(ndk * 0.5 + 0.5, 1.05);
+        float amb = 0.19 + 0.072 * max(N.y, 0.0);
+        float spec = pow(max(dot(reflect(-Lk, N), V), 0.0), 18.0) * 0.085;
+        vec3 lit = base * amb + base * (0.43 * shade + ndf) + vec3(spec);
+        vec3 rgb = fogMixLit(lit * 1.20 + vec3(0.02), distCam);
+        rgb = ditherQuantize(rgb, 5.0, 20.0, 1.0);
+        outColor = vec4(applyStoreLightMul(rgb), 1.0);
+        return;
+    }
+
+    if (isShelfPallet) {
+        vec3 wp = fragWorldPos;
+        vec3 an = abs(N);
+        vec3 blend = pow(max(an, vec3(0.001)), vec3(2.65));
+        blend /= (blend.x + blend.y + blend.z);
+        vec2 dimP = vec2(textureSize(palletTex, 0));
+        const float kP = 0.095;
+        vec3 sx = texture(palletTex, crunchyUvDims(wp.yz * kP, dimP)).rgb;
+        vec3 sy = texture(palletTex, crunchyUvDims(wp.xz * kP, dimP)).rgb;
+        vec3 sz = texture(palletTex, crunchyUvDims(wp.xy * kP, dimP)).rgb;
+        vec3 base = sx * blend.x + sy * blend.y + sz * blend.z;
+        vec3 Lk = normalize(vec3(0.32, 0.86, 0.28));
+        vec3 Lceil = normalize(vec3(0.1, 0.92, 0.12));
+        float ndk = max(dot(N, Lk), 0.0);
+        float ndc = max(dot(N, Lceil), 0.0) * 0.46;
+        float shade = pow(ndk * 0.5 + 0.5, 1.05);
+        float amb = 0.198 + 0.085 * max(N.y, 0.0);
+        float spec = pow(max(dot(reflect(-Lk, N), V), 0.0), 22.0) * 0.065;
+        vec3 lit = base * amb + base * (0.46 * shade + ndc) + vec3(spec);
+        lit = applyPlayerShadow(lit, N, fragWorldPos);
+        vec3 rgb = fogMixLit(lit, distCam);
+        rgb = ditherQuantize(rgb, 5.0, 20.0, 1.0);
         outColor = vec4(applyStoreLightMul(rgb), 1.0);
         return;
     }
 
     if (isShelfCrate) {
-        vec3 wp = retroWorldSamplePos(fragWorldPos);
+        vec3 wp = fragWorldPos;
         vec3 an = abs(N);
         vec3 blend = pow(max(an, vec3(0.001)), vec3(2.7));
         blend /= (blend.x + blend.y + blend.z);
@@ -672,13 +998,13 @@ void main() {
         vec3 lit = base * amb + base * (0.44 * shade + ndc) + vec3(spec);
         lit = applyPlayerShadow(lit, N, fragWorldPos);
         vec3 rgb = fogMixLit(lit, distCam);
-        rgb = ditherQuantize(rgb, 4.0, 32.0, 0.45);
+        rgb = ditherQuantize(rgb, 5.0, 20.0, 1.0);
         outColor = vec4(applyStoreLightMul(rgb), 1.0);
         return;
     }
 
     if (isShelfWood) {
-        vec3 wp = retroWorldSamplePos(fragWorldPos);
+        vec3 wp = fragWorldPos;
         vec3 an = abs(N);
         vec3 blend = pow(max(an, vec3(0.001)), vec3(2.8));
         blend /= (blend.x + blend.y + blend.z);
@@ -700,7 +1026,7 @@ void main() {
         vec3 lit = base * amb + base * (0.44 * shade + ndc);
         lit = applyPlayerShadow(lit, N, fragWorldPos);
         vec3 rgb = fogMixLit(lit, distCam);
-        rgb = ditherQuantize(rgb, 4.0, 32.0, 0.45);
+        rgb = ditherQuantize(rgb, 5.0, 20.0, 1.0);
         outColor = vec4(applyStoreLightMul(rgb), 1.0);
         return;
     }
@@ -717,7 +1043,8 @@ void main() {
         return;
     }
 
-    if (tag.b > 0.95) {
+    bool isHangingSignMarker = tag.b > 0.95 && tag.r < 0.05 && tag.g < 0.05;
+    if (isHangingSignMarker) {
         vec2 uv = vec2(fragLocalPos.x * 0.5 + 0.5, 1.0 - (fragLocalPos.y * 0.5 + 0.5));
         if (dot(N, V) < 0.0)
             uv.x = 1.0 - uv.x;
@@ -745,6 +1072,77 @@ void main() {
         vec3 fogCol = atmosphereFogColor();
         float fogMix = ubo.fogParams.w > 0.5 ? 0.30 : 0.34;
         vec3 rgb = mix(em, fogCol, fogAmt * fogMix);
+        rgb = ditherQuantize(rgb, 5.0, 20.0, 1.0);
+        outColor = vec4(applyStoreLightMul(rgb), 1.0);
+        return;
+    }
+
+    if (isDeliPizza) {
+        vec3 base = deliPizzaProceduralBase(N, fragWorldPos);
+        vec3 L = normalize(vec3(0.35, 0.88, 0.32));
+        float ndl = max(dot(N, L), 0.0);
+        float shade = pow(ndl * 0.5 + 0.5, 1.2);
+        vec3 lit = base * (0.50 + 0.50 * shade);
+        lit = applyPlayerShadow(lit, N, fragWorldPos);
+        vec3 rgb = fogMixLit(lit, distCam);
+        rgb = ditherQuantize(rgb, 5.0, 20.0, 1.0);
+        outColor = vec4(applyStoreLightMul(rgb), 1.0);
+        return;
+    }
+    if (isDeliMeatball) {
+        float grain = fract(sin(dot(fragWorldPos.xz, vec2(12.9898, 78.233))) * 43758.5453);
+        vec3 base = mix(vec3(0.28, 0.12, 0.06), vec3(0.42, 0.20, 0.10), grain);
+        vec3 L = normalize(vec3(0.35, 0.88, 0.32));
+        float ndl = max(dot(N, L), 0.0);
+        float shade = pow(ndl * 0.5 + 0.5, 1.2);
+        vec3 lit = base * (0.50 + 0.50 * shade);
+        lit = applyPlayerShadow(lit, N, fragWorldPos);
+        vec3 rgb = fogMixLit(lit, distCam);
+        rgb = ditherQuantize(rgb, 5.0, 20.0, 1.0);
+        outColor = vec4(applyStoreLightMul(rgb), 1.0);
+        return;
+    }
+
+    if (isDeliFloor) {
+        vec3 samplePos = retroWorldSamplePos(fragWorldPos);
+        vec3 base = triplanarTexture(samplePos, N);
+        base *= 0.58;
+        vec3 L = normalize(vec3(0.35, 0.88, 0.32));
+        float ndl = max(dot(N, L), 0.0);
+        float shade = pow(ndl * 0.5 + 0.5, 1.2);
+        vec3 lit = base * (0.50 + 0.50 * shade);
+        lit = applyPlayerShadow(lit, N, fragWorldPos);
+        vec3 rgb = fogMixLit(lit, distCam);
+        rgb = ditherQuantize(rgb, 5.0, 20.0, 1.0);
+        outColor = vec4(applyStoreLightMul(rgb), 1.0);
+        return;
+    }
+
+    if (isDeliCounter || isDeliFrame) {
+        vec3 wp = fragWorldPos;
+        vec3 an = abs(N);
+        vec3 blend = max(an, vec3(0.0001));
+        blend /= (blend.x + blend.y + blend.z);
+        vec3 base;
+        if (isDeliFrame) {
+            const float kD = 0.18;
+            vec3 sx = texture(deliMetalTex, fract(wp.yz * kD)).rgb;
+            vec3 sy = texture(deliMetalTex, fract(wp.xz * kD)).rgb;
+            vec3 sz = texture(deliMetalTex, fract(wp.xy * kD)).rgb;
+            base = sx * blend.x + sy * blend.y + sz * blend.z;
+        } else {
+            const float kB = 0.14;
+            vec3 sx = texture(deliBaseTex, fract(wp.yz * kB)).rgb;
+            vec3 sy = texture(deliBaseTex, fract(wp.xz * kB)).rgb;
+            vec3 sz = texture(deliBaseTex, fract(wp.xy * kB)).rgb;
+            base = sx * blend.x + sy * blend.y + sz * blend.z;
+        }
+        vec3 L = normalize(vec3(0.35, 0.88, 0.32));
+        float ndl = max(dot(N, L), 0.0);
+        float shade = pow(ndl * 0.5 + 0.5, 1.2);
+        vec3 lit = base * (0.55 + 0.45 * shade);
+        lit = applyPlayerShadow(lit, N, fragWorldPos);
+        vec3 rgb = fogMixLit(lit, distCam);
         rgb = ditherQuantize(rgb, 5.0, 20.0, 1.0);
         outColor = vec4(applyStoreLightMul(rgb), 1.0);
         return;
