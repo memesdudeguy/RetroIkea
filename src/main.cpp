@@ -1,6 +1,6 @@
 // Vulkan 3D mini-game: flat infinite ground (SDL2 + GLM)
 #ifndef VULKAN_GAME_VERSION_STRING
-#define VULKAN_GAME_VERSION_STRING "1.1.0"
+#define VULKAN_GAME_VERSION_STRING "Beta"
 #endif
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_filesystem.h>
@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -32,12 +33,14 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "audio.hpp"
 #include "employee_mesh.hpp"
 #include "staff_skin.hpp"
-
+#include "staff_rp3d_ragdoll.hpp"
+#include "net_p2p.hpp"
 // MinGW may define isfinite as a macro, which breaks qualified std::isfinite calls.
 #ifdef isfinite
 #undef isfinite
@@ -98,6 +101,65 @@ static bool inputStrafeLeft(DownFn down) {
 template <typename DownFn>
 static bool inputStrafeRight(DownFn down) {
   return down(SDL_SCANCODE_D) || down(SDL_SCANCODE_RIGHT);
+}
+
+// Sprint disabled while moving clearly backward vs camera — pure sideways (or strafe-dominant diagonals) can still sprint.
+constexpr float kSprintBackVelRefSpeed = 0.08f;
+template <typename DownFn>
+static bool playerSprintBackwardBlocked(DownFn down, float yaw, const glm::vec2& horizVel) {
+  const glm::vec2 f(std::cos(yaw), std::sin(yaw));
+  const glm::vec2 r(std::cos(yaw + glm::half_pi<float>()), std::sin(yaw + glm::half_pi<float>()));
+  glm::vec2 wish(0.f);
+  if (inputForward(down)) wish += f;
+  if (inputBack(down)) wish -= f;
+  if (inputStrafeLeft(down)) wish -= r;
+  if (inputStrafeRight(down)) wish += r;
+  if (glm::length(wish) > 1e-4f) {
+    wish = glm::normalize(wish);
+    const float wishFwd = glm::dot(wish, f);
+    if (wishFwd >= 0.f)
+      return false;
+    const float wishLat = std::abs(glm::dot(wish, r));
+    if (wishLat >= std::abs(wishFwd))
+      return false; // strafe-equal or strafe-strong diagonals: allow sprint (S+D, S+A, etc.).
+    return true;
+  }
+  const float spd = glm::length(horizVel);
+  if (spd > kSprintBackVelRefSpeed) {
+    const glm::vec2 hv = horizVel * (1.f / spd);
+    const float velFwd = glm::dot(hv, f);
+    if (velFwd >= 0.f)
+      return false;
+    const float velLat = std::abs(glm::dot(hv, r));
+    if (velLat >= std::abs(velFwd))
+      return false;
+    return true;
+  }
+  return false;
+}
+
+// CMake often embeds portable paths like "assets/models/...". Assimp opens paths literally; on Windows,
+// shortcuts leave cwd in System32 or elsewhere — resolve relative paths against SDL_GetBasePath() first.
+static std::string resolvePortableDataFile(const char* path) {
+  if (!path || !path[0])
+    return {};
+#ifdef _WIN32
+  const bool absolute = (path[0] != '\0' && path[1] == ':') ||
+                        (path[0] == '\\' && path[1] == '\\');
+#else
+  const bool absolute = path[0] == '/';
+#endif
+  if (absolute)
+    return std::string(path);
+  if (char* bp = SDL_GetBasePath()) {
+    std::filesystem::path base(bp);
+    SDL_free(bp);
+    const std::filesystem::path combined = (base / path).lexically_normal();
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(combined, ec))
+      return combined.string();
+  }
+  return std::string(path);
 }
 
 // SDL surfaces may pad rows (pitch > width*4); a single memcpy corrupts GPU uploads.
@@ -638,12 +700,19 @@ static_assert(sizeof(emp_mesh::LoadedVertex) == sizeof(Vertex));
 // Staff mesh is instanced; without a tight draw radius, hundreds of FBX figures land in one
 // view (see screencast) and tank the GPU. Shelves already cull by distance — match that idea.
 constexpr uint32_t kMaxEmployees = 18;
-// Skinned staff SSBO / instance buffer: staff + player avatar + optional Shrek easter egg (own VBO, extra slot).
+// Skinned staff SSBO / instance buffer: staff, local avatar, optional Shrek egg, remote peer avatar.
 constexpr uint32_t kShrekEggStaffSlotIndex = kMaxEmployees + 1u;
-constexpr uint32_t kStaffSkinnedInstanceSlots = kMaxEmployees + 2u;
+constexpr uint32_t kRemotePlayerStaffSlotIndex = kMaxEmployees + 2u;
+constexpr uint32_t kStaffSkinnedInstanceSlots = kMaxEmployees + 3u;
+static_assert(kRemotePlayerStaffSlotIndex + 1u == kStaffSkinnedInstanceSlots, "skinning instance layout");
 // Eligible shelf cells: staff spawns when (hash % modulus) == 0. Larger modulus → fewer NPCs.
 constexpr uint32_t kShelfEmpSpawnModulus = 83u;
-constexpr float kEmployeeVisualHeight = 1.72f;
+// Authoring target for staff + player Meshy rigs (meters). Slightly below real 1.72 m so shelf aisles read
+// at a believable scale next to kShelfGapBetweenLevels / rack props.
+constexpr float kEmployeeVisualHeight = 1.58f;
+// Walk/idle skinning often ends slightly below bind “feet at y=0”; lift draw only so soles don’t bury in the
+// deck (logic feetWorldY / hitbox unchanged — a few cm visual-only).
+constexpr float kStaffSkinnedAliveFeetVisualLiftY = 0.048f;
 // Horizontal XZ: shader fades alpha between inner (opaque) and outer (gone); CPU lists through outer.
 // Horizontal XZ distance (m): shader smooth-fades; keep CPU list radius larger than outer to avoid hard pop.
 constexpr float kEmployeeFadeInnerH = 58.f;
@@ -660,163 +729,7 @@ constexpr float kStaffHitHalfD = 0.28f;
 // cannot overlap; pad covers sprint/chase closing speed per frame (tighter than a huge fixed radius).
 constexpr float kStaffPlayerCollisionPadM = 2.85f;
 constexpr uint32_t kStaffPaletteBoneCount = static_cast<uint32_t>(staff_skin::kMaxPaletteBones);
-// Lightweight “ragdoll”: euler extras + optional PBD world particles (no external physics lib).
-constexpr int kStaffRagdollSimMaxBones = 24;
 
-static int gStaffDeadRagdollSimBoneCount = 0;
-static int gStaffDeadRagdollSimBoneRigIdx[kStaffRagdollSimMaxBones];
-static int gStaffDeadRagdollSimParentIdx[kStaffRagdollSimMaxBones];
-static float gStaffDeadRagdollSimRestLen[kStaffRagdollSimMaxBones];
-// 0=default (knee, elbow, etc.), 1=neck, 2=hand/foot/wrist/ankle, 3=forearm/calf,
-// 4=spine/chest/pelvis/hips — tight limits; 5=upper arm/clavicle/shoulder; 6=thigh/upleg (long tip reach);
-// 8=head (RP3D capsule + euler/PBD clamps).
-static uint8_t gStaffDeadRagdollSimBoneKind[kStaffRagdollSimMaxBones];
-
-static int staffRigBoneDepth(const staff_skin::Rig& rig, int bi, int guard = 0) {
-  if (guard > 96 || bi < 0 || bi >= rig.boneCount)
-    return 999;
-  const std::string& nm = rig.boneNames[static_cast<size_t>(bi)];
-  auto it = rig.nodes.find(nm);
-  if (it == rig.nodes.end())
-    return 0;
-  const std::string& pnm = it->second.parent;
-  if (pnm.empty() || pnm == rig.rootName)
-    return 1;
-  auto pi = rig.boneNameToIndex.find(pnm);
-  if (pi == rig.boneNameToIndex.end())
-    return 1;
-  return 1 + staffRigBoneDepth(rig, pi->second, guard + 1);
-}
-
-static int staffRigFindParentSimIndex(const staff_skin::Rig& rig, int bi,
-                                      const std::unordered_map<int, int>& rigToSim) {
-  std::string cur = rig.boneNames[static_cast<size_t>(bi)];
-  for (int guard = 0; guard < 96; ++guard) {
-    auto it = rig.nodes.find(cur);
-    if (it == rig.nodes.end())
-      return -1;
-    const std::string& pnm = it->second.parent;
-    if (pnm.empty() || pnm == rig.rootName)
-      return -1;
-    auto pi = rig.boneNameToIndex.find(pnm);
-    if (pi == rig.boneNameToIndex.end())
-      return -1;
-    auto si = rigToSim.find(pi->second);
-    if (si != rigToSim.end())
-      return si->second;
-    cur = pnm;
-  }
-  return -1;
-}
-
-static void staffRebuildDeadRagdollSimBoneMap(const staff_skin::Rig& rig) {
-  gStaffDeadRagdollSimBoneCount = 0;
-  for (int j = 0; j < kStaffRagdollSimMaxBones; ++j) {
-    gStaffDeadRagdollSimBoneRigIdx[j] = 0;
-    gStaffDeadRagdollSimParentIdx[j] = -1;
-    gStaffDeadRagdollSimRestLen[j] = 0.f;
-    gStaffDeadRagdollSimBoneKind[j] = 0;
-  }
-  if (rig.boneCount <= 0)
-    return;
-  std::vector<int> candidates;
-  candidates.reserve(static_cast<size_t>(rig.boneCount));
-  for (int i = 0; i < rig.boneCount; ++i) {
-    const std::string& nm = rig.boneNames[static_cast<size_t>(i)];
-    if (nm == rig.rootName)
-      continue;
-    std::string lower = nm;
-    for (char& c : lower)
-      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    if (lower.find("thumb") != std::string::npos || lower.find("finger") != std::string::npos ||
-        lower.find("toe") != std::string::npos || lower.find("twist") != std::string::npos ||
-        lower.find("ik") != std::string::npos || lower.find("eye") != std::string::npos ||
-        lower.find("hair") != std::string::npos ||
-        lower.find("weapon") != std::string::npos || lower.find("prop") != std::string::npos ||
-        lower.find("jiggle") != std::string::npos || lower.find("breast") != std::string::npos ||
-        lower.find("boob") != std::string::npos)
-      continue;
-    const bool limb =
-        lower.find("upperarm") != std::string::npos || lower.find("lowerarm") != std::string::npos ||
-        lower.find("forearm") != std::string::npos || lower.find("elbow") != std::string::npos ||
-        lower.find("hand") != std::string::npos || lower.find("wrist") != std::string::npos ||
-        lower.find("thigh") != std::string::npos || lower.find("upleg") != std::string::npos ||
-        lower.find("calf") != std::string::npos || lower.find("shin") != std::string::npos ||
-        lower.find("knee") != std::string::npos || lower.find("foot") != std::string::npos ||
-        lower.find("ankle") != std::string::npos || lower.find("clavicle") != std::string::npos ||
-        lower.find("neck") != std::string::npos || lower.find("spine") != std::string::npos ||
-        lower.find("chest") != std::string::npos || lower.find("pelvis") != std::string::npos ||
-        lower.find("hips") != std::string::npos || lower.find("shoulder") != std::string::npos ||
-        (lower.find("head") != std::string::npos && lower.find("forehead") == std::string::npos);
-    if (!limb)
-      continue;
-    candidates.push_back(i);
-  }
-  std::sort(candidates.begin(), candidates.end(), [&](int a, int b) {
-    const int da = staffRigBoneDepth(rig, a);
-    const int db = staffRigBoneDepth(rig, b);
-    if (da != db)
-      return da < db;
-    return a < b;
-  });
-  const int nTake = std::min(static_cast<int>(candidates.size()), kStaffRagdollSimMaxBones);
-  std::unordered_map<int, int> rigToSim;
-  rigToSim.reserve(static_cast<size_t>(nTake) * 2u);
-  for (int t = 0; t < nTake; ++t) {
-    const int bi = candidates[static_cast<size_t>(t)];
-    gStaffDeadRagdollSimBoneRigIdx[t] = bi;
-    rigToSim[bi] = t;
-    gStaffDeadRagdollSimBoneCount = t + 1;
-  }
-  for (int j = 0; j < gStaffDeadRagdollSimBoneCount; ++j) {
-    const int bi = gStaffDeadRagdollSimBoneRigIdx[j];
-    gStaffDeadRagdollSimParentIdx[j] = staffRigFindParentSimIndex(rig, bi, rigToSim);
-    std::string lower = rig.boneNames[static_cast<size_t>(bi)];
-    for (char& c : lower)
-      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    uint8_t kind = 0;
-    if (lower.find("neck") != std::string::npos)
-      kind = 1;
-    else if (lower.find("head") != std::string::npos)
-      kind = 8;
-    else if (lower.find("spine") != std::string::npos || lower.find("chest") != std::string::npos ||
-             lower.find("pelvis") != std::string::npos || lower.find("hips") != std::string::npos)
-      kind = 4;
-    else if (lower.find("hand") != std::string::npos || lower.find("wrist") != std::string::npos ||
-             lower.find("foot") != std::string::npos || lower.find("ankle") != std::string::npos)
-      kind = 2;
-    else if (lower.find("forearm") != std::string::npos || lower.find("lowerarm") != std::string::npos ||
-             lower.find("calf") != std::string::npos || lower.find("shin") != std::string::npos)
-      kind = 3;
-    else if (lower.find("upperarm") != std::string::npos || lower.find("shoulder") != std::string::npos ||
-             lower.find("clavicle") != std::string::npos)
-      kind = 5;
-    else if (lower.find("thigh") != std::string::npos || lower.find("upleg") != std::string::npos)
-      kind = 6;
-    gStaffDeadRagdollSimBoneKind[j] = kind;
-  }
-  glm::mat4 gGlob[staff_skin::kMaxPaletteBones];
-  if (!rig.clips.empty())
-    staff_skin::sampleClipBoneGlobalMatrices(rig, 0, 0.0, true, nullptr, gGlob);
-  else
-    staff_skin::sampleBindBoneGlobalMatricesWithExtras(rig, nullptr, gGlob);
-  for (int j = 0; j < gStaffDeadRagdollSimBoneCount; ++j) {
-    const int bi = gStaffDeadRagdollSimBoneRigIdx[j];
-    const int pj = gStaffDeadRagdollSimParentIdx[j];
-    const glm::vec3 ppos =
-        glm::vec3(rig.meshNorm * gGlob[bi] * glm::vec4(0.f, 0.f, 0.f, 1.f));
-    if (pj >= 0) {
-      const int pbi = gStaffDeadRagdollSimBoneRigIdx[pj];
-      const glm::vec3 ppar =
-          glm::vec3(rig.meshNorm * gGlob[pbi] * glm::vec4(0.f, 0.f, 0.f, 1.f));
-      gStaffDeadRagdollSimRestLen[j] = glm::length(ppos - ppar);
-    } else
-      gStaffDeadRagdollSimRestLen[j] = 0.f;
-  }
-}
-
-// Single pooled struct per visible NPC: one vector growth pattern, contiguous fields (cache-friendly vs
-// eight parallel std::vectors). Cleared each frame; capacity reserved once at init — no heap allocs on steady state.
 struct StaffNpcDrawSlot {
   glm::mat4 model{};
   int clipIdx = 0;
@@ -826,12 +739,11 @@ struct StaffNpcDrawSlot {
   int meleeFromClip = 0;
   double meleeFromPhase = 0.0;
   uint8_t meleeFromLoop = 1u;
-  // Dead ragdoll: palette from static fall-clip frame (or loose bind if no fall clip).
-  uint8_t bindPoseOnly = 0u;
-  glm::vec3 ragdollAngVelForSkin{0.f};
-  uint32_t ragdollLooseSeed = 0u;
-  uint8_t deadRagdollJointCount = 0u;
-  glm::vec3 deadRagdollJointEuler[kStaffRagdollSimMaxBones]{};
+  // 0 = clip palette / clip lerp, 1 = bind pose + local bone extras (corpse ragdoll), 2 = clip + extras (hit flinch),
+  // 3 = ReactPhysics3D ragdoll (bone globals from simulation).
+  uint8_t paletteKind = 0u;
+  uint64_t paletteResidentKey = 0;
+  std::array<glm::vec3, staff_skin::kMaxPaletteBones> paletteLocalBoneExtra{};
 };
 
 struct UniformBufferObject {
@@ -1365,6 +1277,8 @@ constexpr float kPlayerHungerPizzaGain = 15.f;
 constexpr float kPlayerHungerAutoHealPerSec = 5.5f;
 constexpr float kPlayerHungerAutoHealThresholdFrac = 0.80f;
 constexpr float kPlayerHungerDrainPerSec = 0.25f;
+// At 0 hunger: lose HP until death or hunger is restored (pizza / deli).
+constexpr float kPlayerHungerStarveDamagePerSec = 12.f;
 constexpr float kDeliPizzaReplenishSec = 300.f;
 constexpr float kDeliFoodPickupRadius = 1.0f;
 constexpr float kPlayerScreenDamagePulseRefDmg = 50.f;
@@ -1863,17 +1777,9 @@ constexpr float kStaffMeleeBlendSec = 0.22f;
 constexpr float kStaffMeleeFallFeetSinkMax = 0.82f;
 constexpr float kStaffMeleeFallFeetSinkEnd = 0.30f;
 constexpr float kStaffMeleeFallFeetSinkWorldBias = 0.11f;
-// Dead staff: tiny nudge vs z-fight only — large values float the corpse above support (see feet sink).
-constexpr float kStaffRagdollBindVisualLiftY = 0.038f;
-// Dead ragdoll uses bind pose + sim (no fall clip): light sink — mesh feet sit near bind origin.
-constexpr float kStaffDeadRagdollBindFeetSink = 0.085f;
-// Multi-point corpse vs terrain: lift feet so probed skin shell clears deck (meters, scales with bodyScale).
-constexpr float kDeadCorpseGroundProbeSkinPad = 0.058f;
-// Neck-only joint extras stay tight so PBD doesn’t corkscrew the head off the torso.
-constexpr float kDeadRagdollNeckEulerClamp = 0.34f;
-constexpr float kDeadRagdollHeadEulerClamp = 0.48f;
-// Spine / pelvis: tiny euler band — large offsets read as impossible folds or “spikes” through the floor.
-constexpr float kDeadRagdollCoreEulerClamp = 0.36f;
+// Dead staff draw: small Y nudge vs z-fight; feet sink matches prone sole height.
+constexpr float kStaffDeadCorpseVisualLiftY = 0.038f;
+constexpr float kStaffDeadCorpseBindFeetSink = 0.085f;
 constexpr float kStaffMeleeHairFeetSink = 0.30f;
 constexpr float kStaffMeleeHairFeetSinkWorldBias = 0.06f;
 constexpr float kStaffMeleeStandFeetSinkStart = 0.30f;  // match kStaffMeleeFallFeetSinkEnd at fall→stand
@@ -1938,22 +1844,12 @@ struct ShelfEmployeeNpc {
   float staffHp = 0.f;
   float staffHpMax = 0.f;
   bool staffDead = false;
-  // Dead-only secondary body tilt (pseudo-ragdoll): damped pitch/roll from impacts while corpse slides.
-  float deadRagdollPitch = 0.f;
-  float deadRagdollRoll = 0.f;
-  float deadRagdollPitchVel = 0.f;
-  float deadRagdollRollVel = 0.f;
-  float deadRagdollYaw = 0.f;
-  float deadRagdollYawVel = 0.f;
-  // Simple joint “physics”: euler offsets (rad) on a subset of bones, layered on fall-clip skin.
-  bool deadRagdollJointSimInited = false;
-  uint8_t deadRagdollJointSimCount = 0u;
-  glm::vec3 deadRagdollJointEuler[kStaffRagdollSimMaxBones]{};
-  glm::vec3 deadRagdollJointVel[kStaffRagdollSimMaxBones]{};
-  // World-space PBD particles (corpse-only): distance constraints + ground, feedback into joint eulers.
-  bool deadRagdollPbdInited = false;
-  glm::vec3 deadRagdollPbdPosW[kStaffRagdollSimMaxBones]{};
-  glm::vec3 deadRagdollPbdVelW[kStaffRagdollSimMaxBones]{};
+  // CPU ragdoll: local euler deltas on top of bind pose (death). Replaces fall-clip corpse pose.
+  std::array<glm::vec3, staff_skin::kMaxPaletteBones> staffRagdollEuler{};
+  // ReactPhysics3D multi-body ragdoll drives skinning when true (preferred over staffRagdollEuler).
+  bool staffRp3dCorpse = false;
+  // Brief torso hit-react (radians) applied on chest bone on top of locomotion clips.
+  glm::vec3 staffFlinchEuler{0.f};
   // Wall-clock target for shove hair = player step-push clip (sync knockdown to push).
   float shovePlayerPushDurSec = 0.f;
   glm::vec2 staffShoveKnockbackVelXZ{0.f};
@@ -1988,26 +1884,23 @@ struct ShelfEmployeeNpc {
   float staffAirLandRemain = 0.f;
   int staffAirLandClip = -1;
   bool staffGroundedPrev = true;
-  // Tall ledge fall: track max feet Y while airborne for landing ragdoll (melee fall clip).
+  // Tall ledge fall: track max feet Y while airborne for landing knockdown (melee fall clip).
   float staffFallPeakFeetY = kGroundY;
   uint8_t staffTallFallKnockdownPending = 0;
+  // Multiplayer client: draw from host snapshots instead of local AI.
+  bool mpNetDrawOverride = false;
+  int mpNetDrawClip = 0;
+  double mpNetDrawPhase = 0.;
+  bool mpNetDrawLoop = true;
+  bool mpNetDeadSkinnedFall = false;
 };
-
-static void shelfEmpResetDeadJointSim(ShelfEmployeeNpc& e) {
-  e.deadRagdollJointSimInited = false;
-  e.deadRagdollJointSimCount = 0;
-  e.deadRagdollPbdInited = false;
-  for (int j = 0; j < kStaffRagdollSimMaxBones; ++j) {
-    e.deadRagdollJointEuler[j] = glm::vec3(0.f);
-    e.deadRagdollJointVel[j] = glm::vec3(0.f);
-    e.deadRagdollPbdPosW[j] = glm::vec3(0.f);
-    e.deadRagdollPbdVelW[j] = glm::vec3(0.f);
-  }
-}
 
 // Patrol the open store: next waypoint is on a random ring around anchor (player), not the home bay.
 static constexpr float kShelfEmpWanderRingMinM = 6.f;
 static constexpr float kShelfEmpWanderRingMaxM = 920.f;
+// Alive staff on wander paths steer toward the nearest corpse (dead + collapsed) within this XZ radius.
+static constexpr float kStaffCorpseAttractRadiusM = 48.f;
+static constexpr float kStaffCorpseAttractStopM = 1.85f;
 
 // Tight patrol in the home shelf bay (aisle slot). Night calm wander uses store-wide ring like day.
 static void shelfEmpPickWanderLocalBay(ShelfEmployeeNpc& e, uint64_t key) {
@@ -3129,8 +3022,8 @@ static float staffNpcFootSupportY(const ShelfEmployeeNpc& e,
 }
 
 // Tall ledge: geometric drop from peak feet and/or hard impact before melee fall clip (skip low hops).
-static constexpr float kStaffTallFallRagdollMinDropM = 3.08f;
-static constexpr float kStaffTallFallRagdollMinVelY = -6.85f;
+static constexpr float kStaffTallFallKnockdownMinDropM = 3.08f;
+static constexpr float kStaffTallFallKnockdownMinVelY = -6.85f;
 // Treat drops ≤ this like a step-down: snap feet, no gravity arc, no jump-in-air / land clips.
 static constexpr float kStaffLowDropSnapM = kMaxStepHeight + 0.44f;
 // Landings shallower than this (from airborne peak) still cancel in-air loco if impact was soft.
@@ -3146,8 +3039,8 @@ static void staffNpcNotePossibleTallFallLanding(ShelfEmployeeNpc& e, float landS
     return;
   }
   const float drop = std::max(0.f, e.staffFallPeakFeetY - landSy);
-  const bool hardVy = vyBeforeZero <= kStaffTallFallRagdollMinVelY;
-  const bool highDrop = drop >= kStaffTallFallRagdollMinDropM;
+  const bool hardVy = vyBeforeZero <= kStaffTallFallKnockdownMinVelY;
+  const bool highDrop = drop >= kStaffTallFallKnockdownMinDropM;
   if (hardVy || highDrop)
     e.staffTallFallKnockdownPending = 1u;
   e.staffFallPeakFeetY = landSy;
@@ -3168,6 +3061,8 @@ static void staffNpcAfterLandSnap(ShelfEmployeeNpc& e, float landSy, float vyLan
 
 // Gravity + landing: player-parity — kFeetSnapDownSlop pull-down, glue band, vel thresholds like isGroundedUsingSupport.
 static void staffNpcIntegrateVerticalPhysics(ShelfEmployeeNpc& e, float dt, float playerFeetHint) {
+  if (e.staffRp3dCorpse)
+    return;
   if (e.chaseLedgeClimbRem > 0.f)
     return;
   const float sy = staffNpcFootSupportY(e, playerFeetHint);
@@ -4194,6 +4089,7 @@ static bool shelfSlotOccupied(int worldAisleI, int worldAlongI, int side) {
   return computeOcc();
 }
 
+
 static bool shelfCrateLocalLayout(int worldAisleI, int worldAlongI, int side, float& lx, float& lz,
                                   float& yDeckTop, float& hx, float& hy, float& hz) {
   if (!shelfSlotOccupied(worldAisleI, worldAlongI, side))
@@ -4702,6 +4598,7 @@ static constexpr float kPauseMenuOptionLineExtraMul = 1.45f;
 static stbtt_packedchar gHudUiFontPacked[kHudFontCharCount];
 static int gHudUiFontAtlasW = 1024;
 static int gHudUiFontAtlasH = 1024;
+// HUD/menu TrueType atlas (Linux desktop default: DejaVu, smooth sampling).
 static float gHudUiFontSizePx = 36.f;
 static float gHudUiFontLineSkipPx = 42.f;
 static bool gHudUiFontReady = false;
@@ -5072,13 +4969,52 @@ static std::vector<Vertex> buildDeathMenuOverlayVertices() {
   return mesh;
 }
 
-static std::vector<Vertex> buildPauseMenuOverlayVertices() {
+static std::string pauseMenuBuildSubString(const char* hostBtnLine, const char* ipLine) {
+  return std::string("RESUME\nEXIT\n") + hostBtnLine + "\nJOIN AT IP\nSTOP MULTIPLAYER\n" + ipLine +
+         "\n(press I to edit, Enter to join)";
+}
+
+static bool parseJoinTargetIpPort(const char* raw, char* outIp, size_t outIpCap, uint16_t& outPort) {
+  if (!raw || !outIp || outIpCap == 0)
+    return false;
+  const char* s = raw;
+  while (*s == ' ' || *s == '\t')
+    ++s;
+  size_t n = std::strlen(s);
+  while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t'))
+    --n;
+  if (n == 0)
+    return false;
+  std::string v(s, n);
+  outPort = kRetroMpDefaultPort;
+  const size_t colon = v.rfind(':');
+  if (colon != std::string::npos) {
+    if (colon + 1 >= v.size())
+      return false;
+    char* end = nullptr;
+    const unsigned long p = std::strtoul(v.c_str() + colon + 1, &end, 10);
+    if (!end || *end != '\0' || p == 0 || p > 65535u)
+      return false;
+    outPort = static_cast<uint16_t>(p);
+    v.resize(colon);
+  }
+  while (!v.empty() && (v.back() == ' ' || v.back() == '\t'))
+    v.pop_back();
+  if (v.empty() || v.size() + 1 > outIpCap)
+    return false;
+  std::memcpy(outIp, v.c_str(), v.size() + 1);
+  return true;
+}
+
+static std::vector<Vertex> buildPauseMenuOverlayVertices(const char* mpStatusLine, const char* hostBtnLine,
+                                                           const char* ipLine6) {
   const glm::vec3 n{0.0f, 0.0f, 1.0f};
   std::vector<Vertex> mesh;
-  mesh.reserve(800);
+  mesh.reserve(1200);
   static const char kTitle[] = "PAUSED";
   static const char kTagline[] = "THE STORE CAN WAIT";
-  static const char kSub[] = "RESUME\nEXIT";
+  const std::string kSubStr = pauseMenuBuildSubString(hostBtnLine, ipLine6);
+  const char* kSub = kSubStr.c_str();
   constexpr float kPauseTitlePx = 0.00095f;
   constexpr float kPauseTaglinePx = 0.00052f;
   constexpr float kPauseSubPx = 0.00056f;
@@ -5099,10 +5035,13 @@ static std::vector<Vertex> buildPauseMenuOverlayVertices() {
 
   float titleW = 0.f;
   float subW = 0.f;
+  float statusW = 0.f;
   if (gHudUiFontReady) {
     titleW = measureHudFontRunPx(kTitle, std::strlen(kTitle), kIkeaMenuFontTrackPx) * kPauseTitlePx;
     subW = std::max(subW,
                     measureHudFontRunPx(kTagline, std::strlen(kTagline), kIkeaMenuFontTrackPx) * kPauseTaglinePx);
+    if (mpStatusLine && mpStatusLine[0] != '\0')
+      statusW = measureHudFontRunPx(mpStatusLine, std::strlen(mpStatusLine), kIkeaMenuFontTrackPx) * kPauseTaglinePx;
     const char* sn = kSub;
     for (const char* p = kSub;; ++p) {
       if (*p == '\n' || *p == '\0') {
@@ -5113,6 +5052,7 @@ static std::vector<Vertex> buildPauseMenuOverlayVertices() {
         sn = p + 1;
       }
     }
+    subW = std::max(subW, statusW);
   } else {
     static char kTxtFb[] = "PAUSED\nRESUME\nEXIT";
     stb_easy_font_spacing(-0.5f);
@@ -5128,11 +5068,19 @@ static std::vector<Vertex> buildPauseMenuOverlayVertices() {
   const float panelHalfW = std::max(0.5f * std::max(titleW, subW) + panelPadX, 0.58f);
   constexpr float panelTopY = 0.12f;
   const float titleBlockH = gHudUiFontReady ? gHudUiFontLineSkipPx * kPauseTitlePx : 0.09f;
+  int subLineCount = 1;
+  for (const char* q = kSub; *q; ++q) {
+    if (*q == '\n')
+      ++subLineCount;
+  }
+  const float statusExtraH =
+      (gHudUiFontReady && mpStatusLine && mpStatusLine[0] != '\0') ? gHudUiFontLineSkipPx * kPauseTaglinePx * 0.9f : 0.f;
   const float taglineBlockH = gHudUiFontReady ? gHudUiFontLineSkipPx * kPauseTaglinePx : 0.f;
-  const float subBlockH = gHudUiFontReady
-                              ? (2.f * gHudUiFontLineSkipPx * kPauseSubPx * pauseLineMul + 0.02f)
-                              : 0.19f;
-  const float textStackH = titleBlockH + taglineBlockH + subBlockH + (gHudUiFontReady ? 0.13f : 0.04f);
+  const float subBlockH =
+      gHudUiFontReady ? (static_cast<float>(subLineCount) * gHudUiFontLineSkipPx * kPauseSubPx * pauseLineMul + 0.02f)
+                      : 0.34f;
+  const float textStackH =
+      titleBlockH + taglineBlockH + statusExtraH + subBlockH + (gHudUiFontReady ? 0.13f : 0.04f);
   const float panelBotY = panelTopY - textStackH - 2.f * panelPadY;
 
   const glm::vec3 pa{-panelHalfW, panelBotY, 0.f};
@@ -5144,7 +5092,8 @@ static std::vector<Vertex> buildPauseMenuOverlayVertices() {
 
   const float line1Y = panelTopY - panelPadY - titleBlockH * 0.2f;
   const float lineTagY = line1Y - titleBlockH - 0.025f;
-  const float line2Y = lineTagY - taglineBlockH - (gHudUiFontReady ? 0.045f : 0.03f);
+  const float lineStatY = lineTagY - taglineBlockH - (gHudUiFontReady && statusExtraH > 0.f ? 0.028f : 0.f);
+  const float line2Y = lineStatY - statusExtraH - (gHudUiFontReady ? 0.045f : 0.03f);
   if (gHudUiFontReady) {
     const float tw = measureHudFontRunPx(kTitle, std::strlen(kTitle), kIkeaMenuFontTrackPx) * kPauseTitlePx;
     appendHudFontRun(mesh, n, kUiIkeaFontAcc, kTitle, std::strlen(kTitle), -0.5f * tw, line1Y, kPauseTitlePx,
@@ -5153,6 +5102,12 @@ static std::vector<Vertex> buildPauseMenuOverlayVertices() {
         measureHudFontRunPx(kTagline, std::strlen(kTagline), kIkeaMenuFontTrackPx) * kPauseTaglinePx;
     appendHudFontRun(mesh, n, kUiIkeaFontPri, kTagline, std::strlen(kTagline), -0.5f * tgw, lineTagY,
                      kPauseTaglinePx, kIkeaMenuFontTrackPx);
+    if (mpStatusLine && mpStatusLine[0] != '\0') {
+      const float sw =
+          measureHudFontRunPx(mpStatusLine, std::strlen(mpStatusLine), kIkeaMenuFontTrackPx) * kPauseTaglinePx;
+      appendHudFontRun(mesh, n, kUiIkeaFontPri, mpStatusLine, std::strlen(mpStatusLine), -0.5f * sw, lineStatY,
+                       kPauseTaglinePx, kIkeaMenuFontTrackPx);
+    }
     appendOptionBtnQuads(mesh, n, kSub, line2Y, kPauseSubPx, pauseLineMul, panelHalfW - 0.02f);
     appendHudFontMultilineCentered(mesh, n, kUiIkeaFontOpt, kSub, 0.f, line2Y, kPauseSubPx,
                                    kIkeaMenuFontTrackPx, pauseLineMul);
@@ -5320,6 +5275,7 @@ struct UiMenuClickLayout {
   float panelHalfW = 0.f;
   float line2Y = 0.f;
   float lineSkipNdc = 0.052f;
+  float lineHeightNdc = 0.052f;
   int optionLines = 0;
 };
 
@@ -5361,8 +5317,9 @@ static UiMenuClickLayout computeTitleMenuMainClickLayout(bool showContinue) {
   const float panelBotY = panelTopY - textStackH - 2.f * panelPadY;
   (void)panelBotY;
   L.line2Y = panelTopY - panelPadY - (gHudUiFontReady ? 0.02f : 0.03f);
-  L.lineSkipNdc = (gHudUiFontReady ? gHudUiFontLineSkipPx * kSubPx : std::max(gHudUiFontLineSkipPx * kSubPx, 0.048f)) *
-                  kTitleMenuOptionLineSkipMul;
+  L.lineHeightNdc =
+      gHudUiFontReady ? gHudUiFontLineSkipPx * kSubPx : std::max(gHudUiFontLineSkipPx * kSubPx, 0.048f);
+  L.lineSkipNdc = L.lineHeightNdc * kTitleMenuOptionLineSkipMul;
   return L;
 }
 
@@ -5417,8 +5374,9 @@ static UiMenuClickLayout computeTitleMenuSlotPickerClickLayout(const std::array<
   const float line1Y = panelTopY - panelPadY - titleBlockH * 0.2f;
   const float line2Y = line1Y - titleBlockH - 0.03f;
   L.line2Y = line2Y;
-  L.lineSkipNdc = (gHudUiFontReady ? gHudUiFontLineSkipPx * kSubPx : std::max(gHudUiFontLineSkipPx * kSubPx, 0.048f)) *
-                  kIkeaMenuOptionLineSkipMul;
+  L.lineHeightNdc =
+      gHudUiFontReady ? gHudUiFontLineSkipPx * kSubPx : std::max(gHudUiFontLineSkipPx * kSubPx, 0.048f);
+  L.lineSkipNdc = L.lineHeightNdc * kIkeaMenuOptionLineSkipMul;
   L.optionLines = subLines;
   return L;
 }
@@ -5463,13 +5421,14 @@ static UiMenuClickLayout computeDeathMenuClickLayout() {
   (void)panelBotY;
   const float line1Y = panelTopY - panelPadY - titleBlockH * 0.2f;
   L.line2Y = line1Y - titleBlockH - (gHudUiFontReady ? 0.055f : 0.03f);
-  L.lineSkipNdc = (gHudUiFontReady ? gHudUiFontLineSkipPx * kDeathSubPx
-                                   : std::max(gHudUiFontLineSkipPx * kDeathSubPx, 0.048f)) *
-                  deathLineMul;
+  L.lineHeightNdc = gHudUiFontReady ? gHudUiFontLineSkipPx * kDeathSubPx
+                                    : std::max(gHudUiFontLineSkipPx * kDeathSubPx, 0.048f);
+  L.lineSkipNdc = L.lineHeightNdc * deathLineMul;
   return L;
 }
 
-static UiMenuClickLayout computePauseMenuClickLayout() {
+static UiMenuClickLayout computePauseMenuClickLayout(const char* mpStatusLine, const char* hostBtnLine,
+                                                     const char* ipLine6) {
   UiMenuClickLayout L{};
   static const char kTitle[] = "PAUSED";
   static const char kTagline[] = "THE STORE CAN WAIT";
@@ -5477,14 +5436,22 @@ static UiMenuClickLayout computePauseMenuClickLayout() {
   constexpr float kPauseTaglinePx = 0.00052f;
   constexpr float kPauseSubPx = 0.00056f;
   const float pauseLineMul = kIkeaMenuOptionLineSkipMul * kPauseMenuOptionLineExtraMul;
+  const std::string kSubStr = pauseMenuBuildSubString(hostBtnLine, ipLine6);
+  const char* kSub = kSubStr.c_str();
   float titleW = 0.f;
   float subW = 0.f;
-  int subLines = 2;
+  float statusW = 0.f;
+  int subLineCount = 1;
+  for (const char* q = kSub; *q; ++q) {
+    if (*q == '\n')
+      ++subLineCount;
+  }
   if (gHudUiFontReady) {
     titleW = measureHudFontRunPx(kTitle, std::strlen(kTitle), kIkeaMenuFontTrackPx) * kPauseTitlePx;
     subW = std::max(subW,
                     measureHudFontRunPx(kTagline, std::strlen(kTagline), kIkeaMenuFontTrackPx) * kPauseTaglinePx);
-    static const char kSub[] = "RESUME\nEXIT";
+    if (mpStatusLine && mpStatusLine[0] != '\0')
+      statusW = measureHudFontRunPx(mpStatusLine, std::strlen(mpStatusLine), kIkeaMenuFontTrackPx) * kPauseTaglinePx;
     const char* sn = kSub;
     for (const char* p = kSub;; ++p) {
       if (*p == '\n' || *p == '\0') {
@@ -5495,30 +5462,35 @@ static UiMenuClickLayout computePauseMenuClickLayout() {
         sn = p + 1;
       }
     }
+    subW = std::max(subW, statusW);
   } else {
     titleW = 0.5f;
     subW = 0.5f;
   }
-  L.optionLines = 2;
+  L.optionLines = subLineCount;
   constexpr float panelPadX = 0.22f;
   constexpr float panelPadY = 0.12f;
   L.panelHalfW = std::max(0.5f * std::max(titleW, subW) + panelPadX, 0.58f);
   constexpr float panelTopY = 0.12f;
   const float titleBlockH = gHudUiFontReady ? gHudUiFontLineSkipPx * kPauseTitlePx : 0.09f;
   const float taglineBlockH = gHudUiFontReady ? gHudUiFontLineSkipPx * kPauseTaglinePx : 0.f;
+  const float statusExtraH =
+      (gHudUiFontReady && mpStatusLine && mpStatusLine[0] != '\0') ? gHudUiFontLineSkipPx * kPauseTaglinePx * 0.9f : 0.f;
   const float subBlockH =
-      gHudUiFontReady ? (static_cast<float>(subLines) * gHudUiFontLineSkipPx * kPauseSubPx * pauseLineMul +
-                         0.02f)
-                      : 0.19f;
-  const float textStackH = titleBlockH + taglineBlockH + subBlockH + (gHudUiFontReady ? 0.09f : 0.04f);
+      gHudUiFontReady ? (static_cast<float>(subLineCount) * gHudUiFontLineSkipPx * kPauseSubPx * pauseLineMul + 0.02f)
+                      : 0.34f;
+  const float textStackH =
+      titleBlockH + taglineBlockH + statusExtraH + subBlockH + (gHudUiFontReady ? 0.13f : 0.04f);
   const float panelBotY = panelTopY - textStackH - 2.f * panelPadY;
   (void)panelBotY;
   const float line1Y = panelTopY - panelPadY - titleBlockH * 0.2f;
-  const float lineTagY = line1Y - titleBlockH - 0.014f;
-  L.line2Y = lineTagY - taglineBlockH - (gHudUiFontReady ? 0.028f : 0.03f);
-  L.lineSkipNdc = (gHudUiFontReady ? gHudUiFontLineSkipPx * kPauseSubPx
-                                   : std::max(gHudUiFontLineSkipPx * kPauseSubPx, 0.048f)) *
-                  pauseLineMul;
+  const float lineTagY = line1Y - titleBlockH - 0.025f;
+  const float lineStatY = lineTagY - taglineBlockH - (gHudUiFontReady && statusExtraH > 0.f ? 0.028f : 0.f);
+  const float line2Y = lineStatY - statusExtraH - (gHudUiFontReady ? 0.045f : 0.03f);
+  L.line2Y = line2Y;
+  L.lineHeightNdc = gHudUiFontReady ? gHudUiFontLineSkipPx * kPauseSubPx
+                                    : std::max(gHudUiFontLineSkipPx * kPauseSubPx, 0.048f);
+  L.lineSkipNdc = L.lineHeightNdc * pauseLineMul;
   return L;
 }
 
@@ -5819,7 +5791,9 @@ static float wrapAnglePi(float a) {
 }
 
 static void buildHealthHudOverlayVertices(float hp, float hpMax, float hunger, float hungerMax, float yawRad,
-                                          int dayCount, bool showInteractHint, std::vector<Vertex>& mesh) {
+                                          float selfX, float selfZ, bool hasRemotePlayer,
+                                          float remoteX, float remoteZ, int dayCount,
+                                          bool showInteractHint, std::vector<Vertex>& mesh) {
   const glm::vec3 n{0.0f, 0.0f, 1.0f};
   mesh.clear();
   mesh.reserve(2200);
@@ -5921,6 +5895,23 @@ static void buildHealthHudOverlayVertices(float hp, float hpMax, float hunger, f
     quad(glm::vec3(tx - tickW * 0.5f, compMidY, 0.f), glm::vec3(tx + tickW * 0.5f, compMidY, 0.f),
          glm::vec3(tx + tickW * 0.5f, compMidY + tickH, 0.f), glm::vec3(tx - tickW * 0.5f, compMidY + tickH, 0.f),
          major ? kUiPipHudLineBrightTag : kUiPipHudLineDimTag);
+  }
+  if (hasRemotePlayer) {
+    const glm::vec2 toRemote(remoteX - selfX, remoteZ - selfZ);
+    const float d2 = glm::dot(toRemote, toRemote);
+    if (d2 > 1e-6f) {
+      const float theta = std::atan2(toRemote.x, toRemote.y);
+      const float delta = wrapAnglePi(bearingRad - theta);
+      const float off = glm::clamp(delta * kNdcPerRad, -compassHalfW * 0.97f, compassHalfW * 0.97f);
+      const float tx = hudCx + off;
+      const float y0 = compMidY + 0.001f;
+      const float y1 = compMidY + 0.022f;
+      const float hw = 0.0048f;
+      // Remote player marker on compass strip.
+      mesh.push_back({glm::vec3(tx, y1, 0.f), n, kUiHealthFillCritTag, glm::vec2(0.f, 0.f)});
+      mesh.push_back({glm::vec3(tx + hw, y0, 0.f), n, kUiHealthFillCritTag, glm::vec2(1.f, 1.f)});
+      mesh.push_back({glm::vec3(tx - hw, y0, 0.f), n, kUiHealthFillCritTag, glm::vec2(0.f, 1.f)});
+    }
   }
 
   static const char* kCardLabels[4] = {"N", "E", "S", "W"};
@@ -6110,6 +6101,19 @@ static void writeCeilingChunkVerts(int gcx, int gcz, Vertex* dst) {
 }
 
 struct App {
+  RetroMpSession netMp;
+  float netSnapshotSendAccumSec = 0.f;
+  float netWorldSyncAccumSec = 0.f;
+  uint32_t mpLastAppliedWorldSeq = 0;
+  // MP client only: food grabbed into this session's inventory without mutating host-synced counters.
+  std::unordered_map<uint64_t, uint8_t> mpClientDeliLocalTakePizza;
+  std::unordered_map<uint64_t, uint8_t> mpClientDeliLocalTakeMeat;
+  uint32_t mpClientDeliPickupSeq = 0;
+  uint32_t mpClientStaffMeleeSeq = 0;
+  uint32_t mpHostLastClientDeliPickupSeq = 0;
+  uint32_t mpHostLastClientStaffMeleeSeq = 0;
+  bool mpClientDropKickNetHitSentForAir = false;
+
   SDL_Window* window = nullptr;
   int winW = kWidth;
   int winH = kHeight;
@@ -6287,6 +6291,11 @@ struct App {
   float healthHudCacheHunger = -1e25f;
   float healthHudCacheHungerMax = -1.f;
   float healthHudCacheYaw = 1e10f;
+  float healthHudCacheSelfX = 1e10f;
+  float healthHudCacheSelfZ = 1e10f;
+  bool healthHudCacheHasRemote = false;
+  float healthHudCacheRemoteX = 1e10f;
+  float healthHudCacheRemoteZ = 1e10f;
   int healthHudCacheDayCount = -1;
   bool healthHudCacheInteractHint = false;
   int uboCachedExtraBlend = 0;
@@ -6413,7 +6422,6 @@ struct App {
   int staffClipShrekProximityDance = -1;
   bool pendingStaffShoveLmb = false;
   bool pendingPlayerKick = false;
-  uint32_t debugRagdollSpawnSeq = 1u;
   float playerKickAnimRemain = 0.f;
   bool dropKickActive = false;
   float dropKickTimer = 0.f;
@@ -6471,6 +6479,9 @@ struct App {
   float thirdPersonCamDist = 3.35f;
   float lastDrawFrameDt = 1.f / 60.f;
   float fpAvatarYawSmooth = 0.f;
+  // Extra yaw added to FP body when backpedalling (normally 0 or π): keeps mesh facing motion, not camera.
+  float fpLocoAvatarYawFlip = 0.f;
+  bool fpLocoBackwardBodyFlip = false;
   float avatarHorizSpeedSmoothed = 0.f;
   // Distance-driven phase (seconds of clip timeline) for idle/walk/sprint/crouch — synced to horizDist.
   double avatarLocoPhaseSec = 0.0;
@@ -6510,6 +6521,12 @@ struct App {
   int fpNeckBoneIdx = -1;
   glm::vec3 fpNeckBindPos{0.f};
   std::vector<int> fpHeadTiltBoneIndices;
+  // Ragdoll / hit-react bone indices (Meshy-style humanoid names; optional arms for splay).
+  int staffRagdollPelvisBoneIdx = -1;
+  int staffRagdollChestBoneIdx = -1;
+  int staffRagdollNeckBoneIdx = -1;
+  int staffRagdollUpperArmLBoneIdx = -1;
+  int staffRagdollUpperArmRBoneIdx = -1;
   bool slideActive = false;
   float slideTimer = 0;
   float slideCooldownTimer = 0;
@@ -6544,6 +6561,10 @@ struct App {
   float playerDeathClipFracEnd = kPlayerDeathFallClipPortion;
   bool playerDeathShowMenu = false;
   bool showPauseMenu = false;
+  char pauseMenuJoinIpBuf[96] = "127.0.0.1";
+  bool pauseMenuMpIpFocused = false;
+  bool mpClientSpawnSynced = false;
+  double mpClientLastLinkMono = -1.0;
   bool showInventoryMenu = false;
   int inventoryScrollRow = 0;
   uint32_t inventoryRevision = 1;
@@ -6909,8 +6930,34 @@ struct App {
       toT = e.wanderTargetXZ - e.posXZ;
       dT = glm::length(toT);
     }
-    if (dT > 1e-5f) {
-      glm::vec2 steer = toT;
+    const float corpseRMaxSq = kStaffCorpseAttractRadiusM * kStaffCorpseAttractRadiusM;
+    const float corpseStopSq = kStaffCorpseAttractStopM * kStaffCorpseAttractStopM;
+    glm::vec2 steer(0.f);
+    bool steerFromCorpse = false;
+    if (!e.staffDead && e.meleeState < 2) {
+      float bestCorpseD2 = corpseRMaxSq + 1.f;
+      glm::vec2 bestToCorpse(0.f);
+      for (uint32_t sj : shelfEmpActiveSlots) {
+        const ShelfEmployeeNpc& c = shelfEmpPool[sj];
+        if (!c.inited || !c.staffDead || c.meleeState < 2)
+          continue;
+        if (c.residentKey == e.residentKey)
+          continue;
+        const glm::vec2 d = c.posXZ - e.posXZ;
+        const float d2 = glm::dot(d, d);
+        if (d2 > corpseStopSq && d2 <= corpseRMaxSq && d2 < bestCorpseD2) {
+          bestCorpseD2 = d2;
+          bestToCorpse = d;
+        }
+      }
+      if (bestCorpseD2 <= corpseRMaxSq && glm::dot(bestToCorpse, bestToCorpse) > 1e-10f) {
+        steer = bestToCorpse;
+        steerFromCorpse = true;
+      }
+    }
+    if (!steerFromCorpse && dT > 1e-5f)
+      steer = toT;
+    if (steerFromCorpse || dT > 1e-5f) {
       if (glm::dot(steer, steer) > 1e-8f)
         steer = staffNavAdjustedDesiredXZ(e, steer, distPlayer);
       const float sy = staffNpcFootSupportY(e, playerFeetHint);
@@ -7125,7 +7172,7 @@ struct App {
     const float sy = npc.bodyScale.y;
     // Match end-of-fall sole height; dead NPCs no longer advance meleePhaseSec with the clip.
     if (npc.staffDead)
-      return kStaffDeadRagdollBindFeetSink * sy + kStaffMeleeFallFeetSinkWorldBias * 0.62f;
+      return kStaffDeadCorpseBindFeetSink * sy + kStaffMeleeFallFeetSinkWorldBias * 0.62f;
     if (npc.meleeState == 4 && staffClipShoveHair >= 0)
       return kStaffMeleeHairFeetSink * sy + kStaffMeleeHairFeetSinkWorldBias;
     if (npc.meleeState == 2 && staffClipMeleeFall >= 0) {
@@ -7527,79 +7574,6 @@ struct App {
   }
 #endif
 
-  void spawnDeadRagdollStaffNearPlayer() {
-    if (!staffSkinnedActive || employeeVertexCount == 0u) {
-      std::fprintf(stderr, "[debug] staff ragdoll spawn: staff mesh/rig not active.\n");
-      return;
-    }
-    glm::vec3 ro, fwd, right, up;
-    getFirstPersonViewBasis(ro, fwd, right, up);
-    glm::vec2 f2(fwd.x, fwd.z);
-    float fl = glm::length(f2);
-    if (fl < 1e-4f)
-      f2 = glm::vec2(std::cos(yaw), std::sin(yaw));
-    else
-      f2 *= 1.f / fl;
-    const glm::vec2 side(-f2.y, f2.x);
-    const float aheadM = kPlayerHalfXZ + 0.82f;
-    const float sideJitter = (((debugRagdollSpawnSeq & 1u) == 0u) ? -1.f : 1.f) * 0.22f;
-    const glm::vec2 pXZ = glm::vec2(camPos.x, camPos.z) + f2 * aheadM + side * sideJitter;
-    const float playerFeetProbe = camPos.y - eyeHeight;
-    float feetY = playerTerrainSupportY(pXZ.x, pXZ.y, playerFeetProbe);
-    if (!std::isfinite(feetY))
-      feetY = std::clamp(playerFeetProbe, kGroundY, kCeilingY - 2.5f);
-
-    const uint32_t seq = debugRagdollSpawnSeq++;
-    const uint32_t hi = 0x7F000000u | ((seq >> 8) & 0x00FFFFFFu);
-    const uint32_t lo = seq ^ 0x5A11C0DEu;
-    const uint64_t key = (static_cast<uint64_t>(hi) << 32) | static_cast<uint64_t>(lo);
-    ShelfEmployeeNpc& npc = shelfEmpAcquire(key);
-    npc.inited = true;
-    npc.posXZ = pXZ;
-    npc.feetWorldY = feetY;
-    npc.yaw = std::atan2(-f2.x, -f2.y);
-    npc.aisleCenterX = pXZ.x;
-    npc.aisleCenterZ = pXZ.y;
-    npc.roamHalfX = 0.8f;
-    npc.roamHalfZ = 0.8f;
-    npc.wanderTargetXZ = pXZ;
-    npc.velXZ = glm::vec2(0.f);
-    npc.staffVelY = 0.f;
-    npc.bodyScale = staffBodyScaleFromKey(key);
-    npc.staffClassArchetype = staffClassArchetypeFromKey(key);
-    npc.staffHpMax = staffClassMaxHp(npc.staffClassArchetype);
-    npc.staffHp = 0.f;
-    npc.staffDead = true;
-    npc.meleeState = 2;
-    const double dFall = staffClipMeleeFall >= 0 ? staff_skin::clipDuration(staffRig, staffClipMeleeFall) : 0.0;
-    npc.meleePhaseSec = dFall > 1e-6 ? dFall * 0.62 : 0.0;
-    npc.deadRagdollPitch = 0.16f;
-    npc.deadRagdollRoll = (((seq >> 1) & 1u) != 0u) ? -0.42f : 0.42f;
-    npc.deadRagdollPitchVel = 1.35f;
-    npc.deadRagdollRollVel = (((seq >> 1) & 1u) != 0u) ? -1.2f : 1.2f;
-    npc.deadRagdollYaw = npc.yaw;
-    npc.deadRagdollYawVel = (((seq >> 1) & 1u) != 0u) ? -2.4f : 2.4f;
-    npc.staffShoveKnockbackVelXZ = f2 * 0.75f;
-    npc.staffPushAggro = false;
-    npc.staffPushAggroCalmRemain = 0.f;
-    npc.staffNightShoveChase = false;
-    npc.staffNightShoveRevealRemain = 0.f;
-    npc.nightPhase = 0;
-    npc.nightSpotTimer = 0.f;
-    npc.nightInvestigateTimer = 0.f;
-    npc.chaseLedgeClimbRem = -1.f;
-    npc.chaseLedgeClimbTotalDur = 0.f;
-    npc.staffMantelAnimPhaseSpanSec = 0.f;
-    npc.staffMantelRunnerChase = 0;
-    npc.staffAirLocoRemain = 0.f;
-    npc.staffAirFallClip = -1;
-    npc.staffAirLandRemain = 0.f;
-    npc.staffAirLandClip = -1;
-    npc.staffFallPeakFeetY = feetY;
-    npc.staffTallFallKnockdownPending = 0u;
-    std::fprintf(stderr, "[debug] spawned dead ragdoll staff (\\).\n");
-  }
-
   ShelfEmployeeNpc* shelfEmpFind(uint64_t key) {
     const auto it = shelfEmpKeyToSlot.find(key);
     if (it == shelfEmpKeyToSlot.end())
@@ -7625,8 +7599,557 @@ struct App {
     return e;
   }
 
-  void updateShelfEmployees(float dt) {
+  void tickNetClientStaffVersusPlayer(float dt) {
+    if (!netMp.active || netMp.isHost || !std::isfinite(dt))
+      return;
     const glm::vec2 pXZ(camPos.x, camPos.z);
+#if defined(VULKAN_GAME_SHREK_EGG_GLB)
+    const glm::vec2 dEgg = pXZ - glm::vec2(shrekEggPos.x, shrekEggPos.z);
+    const float shrekProxR2 = kStaffShrekProximityDanceRadiusM * kStaffShrekProximityDanceRadiusM;
+    const bool staffSuppressMeleeNearShrekThisFrame =
+        shrekEggAssetLoaded && shrekEggActive && glm::dot(dEgg, dEgg) <= shrekProxR2;
+#else
+    const bool staffSuppressMeleeNearShrekThisFrame = false;
+#endif
+    if (playerStaffMeleeInvulnRem > 0.f)
+      playerStaffMeleeInvulnRem = std::max(0.f, playerStaffMeleeInvulnRem - dt);
+    const bool day = audioAreStoreFluorescentsOn();
+    if (staffSkinnedActive && playerHealth > 0.f && !staffSuppressMeleeNearShrekThisFrame) {
+      auto applyStaffHitToPlayer = [&](float dmg) {
+        if (playerStaffMeleeInvulnRem > 0.f || playerHealth <= 0.f)
+          return;
+        playerHealth = std::max(0.f, playerHealth - dmg);
+        playerStaffMeleeInvulnRem = kStaffMeleePlayerInvulnSec;
+        playerScreenDamagePulse =
+            std::max(playerScreenDamagePulse,
+                     glm::clamp(dmg / std::max(1e-4f, kPlayerScreenDamagePulseRefDmg), 0.14f, 1.f));
+        refreshWindowTitleWithHealth();
+        audioPlayStaffMeleeImpact();
+        if (playerHealth <= 0.f && !playerDeathActive)
+          beginPlayerDeath();
+      };
+      const AABB pBox = playerCollisionBox();
+      if ((staffClipMeleePunch >= 0 || staffClipMeleeKick >= 0) && playerStaffMeleeInvulnRem <= 0.f) {
+        for (uint32_t siW : shelfEmpActiveSlots) {
+          ShelfEmployeeNpc& e = shelfEmpPool[siW];
+          if (playerStaffMeleeInvulnRem > 0.f)
+            break;
+          if (!e.inited || e.meleeState != 1)
+            continue;
+          const int atkClip = (e.meleeAttackPick == 1 && staffClipMeleeKick >= 0) ? staffClipMeleeKick
+                                                                                   : staffClipMeleePunch;
+          if (atkClip < 0)
+            continue;
+          const double dP = staff_skin::clipDuration(staffRig, atkClip);
+          if (dP <= 1e-6)
+            continue;
+          const double ph = std::fmod(e.meleePhaseSec, dP);
+          const double u = ph / dP;
+          if (u < kStaffMeleeDamagePhaseU0 || u > kStaffMeleeDamagePhaseU1)
+            continue;
+          if (!aabbOverlap(pBox, staffNpcMeleeDamageHitbox(e)))
+            continue;
+          applyStaffHitToPlayer(kStaffMeleePlayerDamage);
+          break;
+        }
+      }
+      if (playerStaffMeleeInvulnRem <= 0.f && playerHealth > 0.f) {
+        for (uint32_t siW : shelfEmpActiveSlots) {
+          ShelfEmployeeNpc& e = shelfEmpPool[siW];
+          if (playerStaffMeleeInvulnRem > 0.f)
+            break;
+          if (!e.inited || e.meleeState >= 2)
+            continue;
+          const bool hostile = (!day && e.nightPhase == 2) || (day && e.staffPushAggro);
+          if (!hostile)
+            continue;
+          const float distHit = glm::length(pXZ - e.posXZ);
+          const bool impactLike =
+              e.meleeState == 1 || e.lastHorizSpeed >= kStaffContactHitMinHorizSpeed ||
+              distHit <= kStaffMeleePunchHoldRange + 0.45f;
+          if (!impactLike)
+            continue;
+          if (!aabbOverlap(pBox, staffNpcMeleeDamageHitbox(e)))
+            continue;
+          applyStaffHitToPlayer(kStaffContactPlayerDamage);
+          break;
+        }
+      }
+    }
+  }
+
+  void buildAndSendMpWorldSync() {
+    if (!netMp.active || !netMp.isHost || netMp.peerHostUtf8[0] == '\0')
+      return;
+    glm::vec2 sortC(camPos.x, camPos.z);
+    if (netMp.remoteValid(3.f))
+      sortC = 0.5f * (sortC + glm::vec2(netMp.lastRemote.camX, netMp.lastRemote.camZ));
+
+    struct StaffSortItem {
+      uint64_t key;
+      float d2;
+    };
+    std::vector<StaffSortItem> staffOrd;
+    staffOrd.reserve(shelfEmpActiveSlots.size());
+    for (uint32_t si : shelfEmpActiveSlots) {
+      const ShelfEmployeeNpc& e = shelfEmpPool[si];
+      if (!e.inited)
+        continue;
+      const glm::vec2 d = e.posXZ - sortC;
+      staffOrd.push_back({e.residentKey, glm::dot(d, d)});
+    }
+    std::sort(staffOrd.begin(), staffOrd.end(),
+              [](const StaffSortItem& a, const StaffSortItem& b) { return a.d2 < b.d2; });
+    const int nStaff = std::min(static_cast<int>(staffOrd.size()), kRetroMpWorldMaxStaff);
+
+    std::vector<uint64_t> deliKeys;
+    deliKeys.reserve(deliPizzaSlicesBySlot.size() + deliPizzaReplenishTimerBySlot.size() +
+                     deliMeatballsBySlot.size() + deliMeatballReplenishTimerBySlot.size());
+    auto collectDeliKeys = [&deliKeys](const auto& m) {
+      for (const auto& pr : m)
+        deliKeys.push_back(pr.first);
+    };
+    collectDeliKeys(deliPizzaSlicesBySlot);
+    collectDeliKeys(deliPizzaReplenishTimerBySlot);
+    collectDeliKeys(deliMeatballsBySlot);
+    collectDeliKeys(deliMeatballReplenishTimerBySlot);
+    std::sort(deliKeys.begin(), deliKeys.end());
+    deliKeys.erase(std::unique(deliKeys.begin(), deliKeys.end()), deliKeys.end());
+    struct DeliSortItem {
+      uint64_t key;
+      float d2;
+    };
+    std::vector<DeliSortItem> deliOrd;
+    deliOrd.reserve(deliKeys.size());
+    for (uint64_t dk : deliKeys) {
+      const int wa = static_cast<int>(static_cast<uint32_t>(dk >> 32));
+      const int wl = static_cast<int>(static_cast<uint32_t>(dk & 0xffffffffull));
+      const float cx = (static_cast<float>(wa) + 0.5f) * kShelfAisleModulePitch;
+      const float cz = (static_cast<float>(wl) + 0.5f) * kShelfAlongAislePitch;
+      const glm::vec2 d(cx - sortC.x, cz - sortC.y);
+      deliOrd.push_back({dk, glm::dot(d, d)});
+    }
+    std::sort(deliOrd.begin(), deliOrd.end(),
+              [](const DeliSortItem& a, const DeliSortItem& b) { return a.d2 < b.d2; });
+    const int nDeli = std::min(static_cast<int>(deliOrd.size()), kRetroMpWorldMaxDeli);
+
+    const size_t packetSize =
+        sizeof(RetroMpWorldHeader) + static_cast<size_t>(nStaff) * sizeof(RetroMpStaffWire) +
+        static_cast<size_t>(nDeli) * sizeof(RetroMpDeliWire);
+    std::vector<uint8_t> buf(packetSize);
+    auto* hdr = reinterpret_cast<RetroMpWorldHeader*>(buf.data());
+    hdr->magic = kRetroMpWorldMagic;
+    hdr->seq = ++netMp.worldSendSeq;
+    hdr->staffCount = static_cast<uint8_t>(nStaff);
+    hdr->deliCount = static_cast<uint8_t>(nDeli);
+    hdr->reserved[0] = 0;
+    hdr->reserved[1] = 0;
+    auto* wSt = reinterpret_cast<RetroMpStaffWire*>(buf.data() + sizeof(RetroMpWorldHeader));
+    for (int i = 0; i < nStaff; ++i) {
+      RetroMpStaffWire& w = wSt[i];
+      ShelfEmployeeNpc* pn = shelfEmpFind(staffOrd[static_cast<size_t>(i)].key);
+      if (!pn) {
+        w = {};
+        continue;
+      }
+      ShelfEmployeeNpc& npc = *pn;
+      uint8_t f = static_cast<uint8_t>(npc.nightPhase & 3u);
+      f |= static_cast<uint8_t>((npc.meleeState & 7u) << 2);
+      if (npc.staffDead)
+        f |= 1u << 5;
+      if (npc.staffRp3dCorpse)
+        f |= 1u << 6;
+      if (npc.meleeState == 1 && npc.meleeAttackPick != 0)
+        f |= 1u << 7;
+      int clipIdx = 0;
+      double ph = 0.;
+      bool loop = true;
+      if (npc.staffDead && staffClipMeleeFall >= 0) {
+        clipIdx = staffClipMeleeFall;
+        ph = staff_skin::clipDuration(staffRig, staffClipMeleeFall);
+        loop = false;
+      } else if (!npc.staffDead) {
+        staffNpcResolveDrawAnim(npc, npc.residentKey, audioAreStoreFluorescentsOn(), clipIdx, ph, loop);
+      } else {
+        clipIdx = 0;
+        ph = 0.0;
+        loop = false;
+      }
+      int meleeClip = -1;
+      switch (npc.meleeState) {
+      case 1:
+        meleeClip =
+            (npc.meleeAttackPick == 1 && staffClipMeleeKick >= 0) ? staffClipMeleeKick : staffClipMeleePunch;
+        break;
+      case 2:
+        meleeClip = staffClipMeleeFall;
+        break;
+      case 3:
+        meleeClip = staffClipMeleeStand;
+        break;
+      case 4:
+        meleeClip = staffClipShoveHair;
+        break;
+      default:
+        meleeClip = staffClipMeleeFall;
+        break;
+      }
+      uint16_t mNorm = 0;
+      if (meleeClip >= 0 && static_cast<size_t>(meleeClip) < staffRig.clips.size()) {
+        const double mdur = staff_skin::clipDuration(staffRig, meleeClip);
+        if (mdur > 1e-6)
+          mNorm = static_cast<uint16_t>(
+              glm::clamp(npc.meleePhaseSec / mdur, 0.0, 1.0) * 65535.0);
+      }
+      w.key = npc.residentKey;
+      w.meleePhaseNorm = mNorm;
+      w.posX = npc.posXZ.x;
+      w.posZ = npc.posXZ.y;
+      w.feetY = npc.feetWorldY;
+      w.yaw = npc.yaw;
+      w.flags = f;
+      w.reserved = 0;
+      if (npc.staffPushAggro)
+        w.reserved |= 1u;
+      if (npc.lastHorizSpeed >= kStaffContactHitMinHorizSpeed)
+        w.reserved |= 2u;
+      w.drawClip = static_cast<int16_t>(clipIdx);
+      w.drawPhase = static_cast<float>(ph);
+      w.drawLoop = loop ? uint8_t(1) : uint8_t(0);
+      w.pad = 0;
+    }
+    auto* wDl = reinterpret_cast<RetroMpDeliWire*>(
+        reinterpret_cast<uint8_t*>(wSt) + static_cast<size_t>(nStaff) * sizeof(RetroMpStaffWire));
+    for (int i = 0; i < nDeli; ++i) {
+      const uint64_t k = deliOrd[static_cast<size_t>(i)].key;
+      const int wa = static_cast<int>(static_cast<uint32_t>(k >> 32));
+      const int wl = static_cast<int>(static_cast<uint32_t>(k & 0xffffffffull));
+      RetroMpDeliWire& d = wDl[i];
+      d.key = k;
+      d.pizzaReplenishCs = 0;
+      d.meatReplenishCs = 0;
+      if (deliCounterUsesMeatballs(wa, wl)) {
+        d.pizzaCount = 0;
+        auto itM = deliMeatballsBySlot.find(k);
+        d.meatCount = itM != deliMeatballsBySlot.end() ? itM->second : uint8_t(0);
+        auto itMr = deliMeatballReplenishTimerBySlot.find(k);
+        if (itMr != deliMeatballReplenishTimerBySlot.end() && itMr->second > 0.f)
+          d.meatReplenishCs =
+              static_cast<uint16_t>(std::min(itMr->second * 100.f, 65535.f));
+      } else {
+        d.meatCount = 0;
+        auto itP = deliPizzaSlicesBySlot.find(k);
+        d.pizzaCount = itP != deliPizzaSlicesBySlot.end() ? itP->second : uint8_t(0);
+        auto itPr = deliPizzaReplenishTimerBySlot.find(k);
+        if (itPr != deliPizzaReplenishTimerBySlot.end() && itPr->second > 0.f)
+          d.pizzaReplenishCs =
+              static_cast<uint16_t>(std::min(itPr->second * 100.f, 65535.f));
+      }
+    }
+    netMp.sendWorldSync(buf.data(), buf.size());
+  }
+
+  void applyMpWorldSyncFromNet() {
+    if (!netMp.active || netMp.isHost)
+      return;
+    const std::vector<uint8_t>& pkt = netMp.lastWorldPacket;
+    if (pkt.size() < sizeof(RetroMpWorldHeader))
+      return;
+    const auto* hdr = reinterpret_cast<const RetroMpWorldHeader*>(pkt.data());
+    if (hdr->magic != kRetroMpWorldMagic)
+      return;
+    if (hdr->staffCount > kRetroMpWorldMaxStaff || hdr->deliCount > kRetroMpWorldMaxDeli)
+      return;
+    const size_t expectSize = sizeof(RetroMpWorldHeader) +
+                              static_cast<size_t>(hdr->staffCount) * sizeof(RetroMpStaffWire) +
+                              static_cast<size_t>(hdr->deliCount) * sizeof(RetroMpDeliWire);
+    if (pkt.size() != expectSize)
+      return;
+    if (hdr->seq == mpLastAppliedWorldSeq)
+      return;
+    mpLastAppliedWorldSeq = hdr->seq;
+
+    const RetroMpStaffWire* wSt =
+        reinterpret_cast<const RetroMpStaffWire*>(pkt.data() + sizeof(RetroMpWorldHeader));
+    std::unordered_set<uint64_t> staffAlive;
+    staffAlive.reserve(static_cast<size_t>(hdr->staffCount) * 2u + 8u);
+    for (uint32_t i = 0; i < hdr->staffCount; ++i) {
+      const RetroMpStaffWire& w = wSt[i];
+      if (w.key == 0)
+        continue;
+      staffAlive.insert(w.key);
+      ShelfEmployeeNpc& e = shelfEmpAcquire(w.key);
+      if (!e.inited) {
+        const int wa = static_cast<int>(static_cast<uint32_t>(w.key >> 32));
+        const int wl = static_cast<int>(static_cast<uint32_t>(w.key & 0xffffffffull));
+        e.aisleCenterX = (static_cast<float>(wa) + 0.5f) * kShelfAisleModulePitch;
+        e.aisleCenterZ = (static_cast<float>(wl) + 0.5f) * kShelfAlongAislePitch;
+        e.roamHalfX = kShelfAisleModulePitch * 0.48f;
+        e.roamHalfZ = 2.45f;
+        e.stuckRefXZ = glm::vec2(w.posX, w.posZ);
+        e.stuckTimer = 0.f;
+        e.velXZ = glm::vec2(0.f);
+        e.staffVelY = 0.f;
+        e.bodyScale = staffBodyScaleFromKey(w.key);
+        e.staffClassArchetype = staffClassArchetypeFromKey(w.key);
+        e.staffHpMax = staffClassMaxHp(e.staffClassArchetype);
+        e.staffFlinchEuler = glm::vec3(0.f);
+        for (auto& re : e.staffRagdollEuler)
+          re = glm::vec3(0.f);
+        e.inited = true;
+      }
+      e.posXZ = glm::vec2(w.posX, w.posZ);
+      e.feetWorldY = w.feetY;
+      e.yaw = w.yaw;
+      e.nightPhase = static_cast<uint8_t>(w.flags & 3u);
+      e.meleeState = static_cast<uint8_t>((w.flags >> 2) & 7u);
+      e.staffDead = (w.flags & (1u << 5)) != 0;
+      e.staffRp3dCorpse = false;
+      e.mpNetDeadSkinnedFall = e.staffDead;
+      e.meleeAttackPick = ((w.flags >> 7) & 1) != 0 ? uint8_t(1) : uint8_t(0);
+      e.staffPushAggro = (w.reserved & 1u) != 0;
+      e.lastHorizSpeed = (w.reserved & 2u) != 0 ? kStaffContactHitMinHorizSpeed : 0.f;
+      e.staffHp = e.staffDead ? 0.f : e.staffHpMax;
+      e.mpNetDrawOverride = true;
+      e.mpNetDrawClip = static_cast<int>(w.drawClip);
+      e.mpNetDrawPhase = static_cast<double>(w.drawPhase);
+      e.mpNetDrawLoop = w.drawLoop != 0;
+      e.meleeAnimBlend = 1.f;
+      e.meleeAnimFromClip = 0;
+      e.meleeAnimFromPhase = 0.;
+      e.meleeAnimFromLoop = 1;
+      int meleeClip = -1;
+      switch (e.meleeState) {
+      case 1:
+        meleeClip =
+            (e.meleeAttackPick == 1 && staffClipMeleeKick >= 0) ? staffClipMeleeKick : staffClipMeleePunch;
+        break;
+      case 2:
+        meleeClip = staffClipMeleeFall;
+        break;
+      case 3:
+        meleeClip = staffClipMeleeStand;
+        break;
+      case 4:
+        meleeClip = staffClipShoveHair;
+        break;
+      default:
+        meleeClip = staffClipMeleeFall;
+        break;
+      }
+      const double mdur = (meleeClip >= 0 && static_cast<size_t>(meleeClip) < staffRig.clips.size())
+                              ? staff_skin::clipDuration(staffRig, meleeClip)
+                              : 1.0;
+      e.meleePhaseSec =
+          (mdur > 1e-6) ? (static_cast<double>(w.meleePhaseNorm) / 65535.0) * mdur : 0.0;
+    }
+
+    for (size_t ai = 0; ai < shelfEmpActiveSlots.size();) {
+      const uint32_t si = shelfEmpActiveSlots[ai];
+      ShelfEmployeeNpc& ex = shelfEmpPool[si];
+      if (!ex.inited) {
+        ++ai;
+        continue;
+      }
+      if (staffAlive.find(ex.residentKey) != staffAlive.end()) {
+        ++ai;
+        continue;
+      }
+      staff_rp3d::destroyCorpse(ex.residentKey);
+      shelfEmpKeyToSlot.erase(ex.residentKey);
+      shelfEmpActiveSlots[ai] = shelfEmpActiveSlots.back();
+      shelfEmpActiveSlots.pop_back();
+      shelfEmpPool[si] = ShelfEmployeeNpc{};
+      shelfEmpFreeSlots.push_back(si);
+    }
+
+    const RetroMpDeliWire* wDl = reinterpret_cast<const RetroMpDeliWire*>(
+        reinterpret_cast<const uint8_t*>(wSt) +
+        static_cast<size_t>(hdr->staffCount) * sizeof(RetroMpStaffWire));
+    for (uint32_t i = 0; i < hdr->deliCount; ++i) {
+      const RetroMpDeliWire& d = wDl[i];
+      const int wa = static_cast<int>(static_cast<uint32_t>(d.key >> 32));
+      const int wl = static_cast<int>(static_cast<uint32_t>(d.key & 0xffffffffull));
+      if (deliCounterUsesMeatballs(wa, wl)) {
+        deliMeatballsBySlot[d.key] = d.meatCount;
+        if (d.meatReplenishCs > 0)
+          deliMeatballReplenishTimerBySlot[d.key] =
+              static_cast<float>(d.meatReplenishCs) * 0.01f;
+        else
+          deliMeatballReplenishTimerBySlot.erase(d.key);
+        deliPizzaSlicesBySlot.erase(d.key);
+        deliPizzaReplenishTimerBySlot.erase(d.key);
+      } else {
+        deliPizzaSlicesBySlot[d.key] = d.pizzaCount;
+        if (d.pizzaReplenishCs > 0)
+          deliPizzaReplenishTimerBySlot[d.key] =
+              static_cast<float>(d.pizzaReplenishCs) * 0.01f;
+        else
+          deliPizzaReplenishTimerBySlot.erase(d.key);
+        deliMeatballsBySlot.erase(d.key);
+        deliMeatballReplenishTimerBySlot.erase(d.key);
+      }
+    }
+    clampMpClientDeliLocalTakesAfterWorldSync();
+  }
+
+  bool hostApplyClientDeliPickup(const RetroMpDeliPickupPacket& pkt) {
+    const int wa = static_cast<int>(static_cast<uint32_t>(pkt.deliSlotKey >> 32));
+    const int wl = static_cast<int>(static_cast<uint32_t>(pkt.deliSlotKey & 0xffffffffull));
+    if (!deliBarSlotOccupied(wa, wl))
+      return false;
+    constexpr float kPickupSlack = 0.55f;
+    const glm::vec2 pc(pkt.camX, pkt.camZ);
+    const float cx = (static_cast<float>(wa) + 0.5f) * kShelfAisleModulePitch;
+    const float cz = (static_cast<float>(wl) + 0.5f) * kShelfAlongAislePitch;
+    const float d = glm::length(pc - glm::vec2(cx, cz));
+    if (d > kDeliFoodPickupRadius + kPickupSlack)
+      return false;
+
+    const uint64_t k = deliPizzaSlotKey(wa, wl);
+    if (k != pkt.deliSlotKey)
+      return false;
+
+    const bool meatballCounter = deliCounterUsesMeatballs(wa, wl);
+    if (meatballCounter) {
+      if (pkt.foodKind != kRetroMpDeliPickupMeat || !gDeliMeatballMeshLoaded)
+        return false;
+      if (deliMeatballsRemaining(wa, wl) <= 0)
+        return false;
+      deliMeatballsRemaining(wa, wl);
+      auto itMb = deliMeatballsBySlot.find(k);
+      if (itMb == deliMeatballsBySlot.end() || itMb->second == 0)
+        return false;
+      --itMb->second;
+      deliMeatballReplenishTimerBySlot[k] = kDeliPizzaReplenishSec;
+    } else {
+      if (pkt.foodKind != kRetroMpDeliPickupPizza)
+        return false;
+      if (deliPizzaSlicesRemaining(wa, wl) <= 0)
+        return false;
+      deliPizzaSlicesRemaining(wa, wl);
+      auto itPz = deliPizzaSlicesBySlot.find(k);
+      if (itPz == deliPizzaSlicesBySlot.end() || itPz->second == 0)
+        return false;
+      --itPz->second;
+      deliPizzaReplenishTimerBySlot[k] = kDeliPizzaReplenishSec;
+    }
+    return true;
+  }
+
+  bool hostApplyClientStaffMeleeRpc(const RetroMpStaffMeleePacket& pkt) {
+    ShelfEmployeeNpc* ep = shelfEmpFind(pkt.staffNpcKey);
+    if (ep == nullptr || !ep->inited || !staffSkinnedActive)
+      return false;
+    ShelfEmployeeNpc& e = *ep;
+    glm::vec2 pXZ(pkt.camX, pkt.camZ);
+    const glm::vec2 toStaff = e.posXZ - pXZ;
+    const float distP = glm::length(toStaff);
+    const float reach =
+        pkt.meleeKind == kRetroMpStaffMeleeDropKick ? (kDropKickMaxDist + 0.65f) : (kStaffShoveMaxDist + 0.35f);
+    if (distP > reach || distP < 1e-4f)
+      return false;
+    glm::vec2 f(pkt.fwdX, pkt.fwdZ);
+    const float fl = glm::length(f);
+    if (fl < 1e-4f)
+      return false;
+    f *= 1.f / fl;
+    const glm::vec2 toEN = toStaff * (1.f / distP);
+    const float cosThr =
+        pkt.meleeKind == kRetroMpStaffMeleeDropKick ? kDropKickCosCone : kStaffShoveCosCone;
+    if (glm::dot(f, toEN) < cosThr)
+      return false;
+
+    const uint64_t key = pkt.staffNpcKey;
+    if (pkt.meleeKind == kRetroMpStaffMeleeShove) {
+      if (staffClipMeleeFall < 0 && staffClipShoveHair < 0)
+        return false;
+      if (e.meleeState == 2 || e.meleeState == 3 || e.meleeState == 4)
+        return false;
+      applyStaffShoveKnockdown(key, e, toEN);
+      return true;
+    }
+    if (pkt.meleeKind == kRetroMpStaffMeleeKick) {
+      if (staffClipMeleeFall < 0 && staffClipShoveHair < 0)
+        return false;
+      if (e.meleeState == 2 || e.meleeState == 3 || e.meleeState == 4) {
+        applyStaffDamageFromPlayerHit(key, e, kStaffHitDamageKick);
+        e.meleeState = 2;
+        e.meleePhaseSec = 0.0;
+        e.meleeKnockdownFeetAnchorY = e.feetWorldY;
+        e.staffVelY = 0.f;
+        e.velXZ = glm::vec2(0.f);
+        e.staffShoveKnockbackVelXZ = toEN * (kStaffShoveKnockbackSpeed * 0.55f);
+        audioPlayStaffMeleeImpact();
+        return true;
+      }
+      if (applyStaffDamageFromPlayerHit(key, e, kStaffHitDamageKick))
+        applyStaffShoveKnockdown(key, e, toEN);
+      else {
+        e.staffShoveKnockbackVelXZ = toEN * (kStaffShoveKnockbackSpeed * 0.48f);
+        audioPlayStaffMeleeImpact();
+      }
+      return true;
+    }
+    if (pkt.meleeKind == kRetroMpStaffMeleeDropKick) {
+      if (staffClipMeleeFall < 0 && staffClipShoveHair < 0)
+        return false;
+      if (e.meleeState == 2 || e.meleeState == 3 || e.meleeState == 4)
+        return false;
+      const bool dropKickLethal = applyStaffDamageFromPlayerHit(e.residentKey, e, kStaffHitDamageDropKick);
+      if (dropKickLethal) {
+        e.staffShoveKnockbackVelXZ = f * kDropKickKnockbackSpeed;
+        e.meleeState = 2;
+        e.meleePhaseSec = 0.0;
+        e.staffVelY = std::max(e.staffVelY, kDropKickNpcVerticalPop);
+        e.velXZ = glm::vec2(0.f);
+      } else {
+        applyStaffShoveKnockdown(e.residentKey, e, toEN);
+        e.staffShoveKnockbackVelXZ = f * (kDropKickKnockbackSpeed * 0.62f);
+        audioPlayStaffMeleeImpact();
+      }
+      return true;
+    }
+    return false;
+  }
+
+  void tickMpHostClientRpcQueues() {
+    if (!netMp.active || !netMp.isHost || netMp.peerHostUtf8[0] == '\0')
+      return;
+    bool flushed = false;
+    while (!netMp.hostDeliPickupQueue.empty()) {
+      RetroMpDeliPickupPacket p = netMp.hostDeliPickupQueue.front();
+      netMp.hostDeliPickupQueue.pop_front();
+      if (p.seq == 0 || p.seq <= mpHostLastClientDeliPickupSeq)
+        continue;
+      mpHostLastClientDeliPickupSeq = p.seq;
+      if (hostApplyClientDeliPickup(p))
+        flushed = true;
+    }
+    while (!netMp.hostStaffMeleeQueue.empty()) {
+      RetroMpStaffMeleePacket p = netMp.hostStaffMeleeQueue.front();
+      netMp.hostStaffMeleeQueue.pop_front();
+      if (p.seq == 0 || p.seq <= mpHostLastClientStaffMeleeSeq)
+        continue;
+      mpHostLastClientStaffMeleeSeq = p.seq;
+      if (hostApplyClientStaffMeleeRpc(p))
+        flushed = true;
+    }
+    if (flushed)
+      buildAndSendMpWorldSync();
+  }
+
+  void updateShelfEmployees(float dt) {
+    if (netMp.active && !netMp.isHost) {
+      return;
+    }
+    staff_rp3d::step(dt);
+    const glm::vec2 pXZ(camPos.x, camPos.z);
+    for (uint32_t siR3 : shelfEmpActiveSlots) {
+      ShelfEmployeeNpc& e3 = shelfEmpPool[siR3];
+      if (e3.inited && e3.staffDead && e3.staffRp3dCorpse)
+        staff_rp3d::syncNpcFromPhysics(e3.residentKey, e3.posXZ, e3.feetWorldY, e3.bodyScale);
+    }
 #if defined(VULKAN_GAME_SHREK_EGG_GLB)
     const glm::vec2 dEgg = pXZ - glm::vec2(shrekEggPos.x, shrekEggPos.z);
     const float shrekProxR2 = kStaffShrekProximityDanceRadiusM * kStaffShrekProximityDanceRadiusM;
@@ -7657,13 +8180,9 @@ struct App {
           e.staffHpMax = staffClassMaxHp(e.staffClassArchetype);
           e.staffHp = e.staffHpMax;
           e.staffDead = false;
-          e.deadRagdollPitch = 0.f;
-          e.deadRagdollRoll = 0.f;
-          e.deadRagdollPitchVel = 0.f;
-          e.deadRagdollRollVel = 0.f;
-          e.deadRagdollYaw = e.yaw;
-          e.deadRagdollYawVel = 0.f;
-          shelfEmpResetDeadJointSim(e);
+          if (e.staffRp3dCorpse)
+            staff_rp3d::destroyCorpse(e.residentKey);
+          e.staffRp3dCorpse = false;
         } else {
           if (e.staffDead)
             e.staffHp = 0.f;
@@ -7676,6 +8195,9 @@ struct App {
         }
         if (e.meleeAnimBlend < 1.f)
           e.meleeAnimBlend = std::min(1.f, e.meleeAnimBlend + dt * (1.f / kStaffMeleeBlendSec));
+        e.staffFlinchEuler *= std::exp(-13.f * dt);
+        if (glm::dot(e.staffFlinchEuler, e.staffFlinchEuler) < 1e-12f)
+          e.staffFlinchEuler = glm::vec3(0.f);
         e.staffChaseMantelCooldownRem = std::max(0.f, e.staffChaseMantelCooldownRem - dt);
         if (!day && e.staffNightShoveRevealRemain > 0.f)
           e.staffNightShoveRevealRemain = std::max(0.f, e.staffNightShoveRevealRemain - dt);
@@ -7692,8 +8214,10 @@ struct App {
       const float distP = glm::length(toPlayer);
       const float distPSq = distP * distP;
       // Stagger AI for distant wander-mode NPCs. Aggressive/melee NPCs always tick.
-      const bool npcIsAggressive = (e.meleeState != 0) || e.staffPushAggro || e.staffNightShoveChase ||
-                                   (e.nightPhase >= 2);
+      // Dead staff must tick every frame: distance stagger previously skipped corpse pose updates,
+      // leaving corpses in upright bind pose.
+      const bool npcIsAggressive = e.staffDead || (e.meleeState != 0) || e.staffPushAggro ||
+                                   e.staffNightShoveChase || (e.nightPhase >= 2);
       if (!npcIsAggressive && distPSq > kStaffAiMidDistSq) {
         const uint32_t slotHash = static_cast<uint32_t>(e.residentKey ^ (e.residentKey >> 32));
         if (distPSq > kStaffAiFarDistSq) {
@@ -7714,72 +8238,12 @@ struct App {
         }
       }
       if (e.meleeState == 2 || e.meleeState == 3 || e.meleeState == 4) {
+        if (e.staffRp3dCorpse) {
+          e.meleeState = 2;
+          continue;
+        }
         if (e.staffDead) {
           e.meleeState = 2;
-          const glm::vec2 kb = e.staffShoveKnockbackVelXZ;
-          const glm::vec2 fwd(std::sin(e.yaw), std::cos(e.yaw));
-          const glm::vec2 right(fwd.y, -fwd.x);
-          // Convert horizontal impact into a soft angular impulse.
-          e.deadRagdollRollVel += glm::dot(kb, right) * 1.55f;
-          e.deadRagdollPitchVel += -glm::dot(kb, fwd) * 1.15f;
-          e.deadRagdollYawVel += glm::dot(kb, right) * 0.95f + glm::dot(kb, fwd) * 0.35f;
-          // Damped spring keeps corpse wobble plausible instead of rigid.
-          e.deadRagdollPitchVel += (-e.deadRagdollPitch) * 4.4f * dt;
-          e.deadRagdollRollVel += (-e.deadRagdollRoll) * 3.9f * dt;
-          const float ragdollDamp = std::exp(-4.6f * dt);
-          e.deadRagdollPitchVel *= ragdollDamp;
-          e.deadRagdollRollVel *= ragdollDamp;
-          e.deadRagdollYawVel *= std::exp(-2.3f * dt);
-          e.deadRagdollYaw += e.deadRagdollYawVel * dt;
-          e.yaw = e.deadRagdollYaw;
-          e.deadRagdollPitch = glm::clamp(e.deadRagdollPitch + e.deadRagdollPitchVel * dt, -1.15f, 1.15f);
-          e.deadRagdollRoll = glm::clamp(e.deadRagdollRoll + e.deadRagdollRollVel * dt, -1.42f, 1.42f);
-          const float kbLen = glm::length(kb);
-          if (!e.deadRagdollJointSimInited && gStaffDeadRagdollSimBoneCount > 0) {
-            const int nJ = std::min(gStaffDeadRagdollSimBoneCount, kStaffRagdollSimMaxBones);
-            e.deadRagdollJointSimCount = static_cast<uint8_t>(nJ);
-            uint32_t jh = static_cast<uint32_t>(e.residentKey ^ (e.residentKey >> 32));
-            for (int j = 0; j < nJ; ++j) {
-              jh = jh * 1664525u + 1013904223u;
-              const uint8_t bkj = gStaffDeadRagdollSimBoneKind[j];
-              const bool tightInit = (bkj == 1u || bkj == 4u || bkj == 8u);
-              const float eAmp = tightInit ? (0.0045f / 127.5f) : (0.015f / 127.5f);
-              const float ezAmp = tightInit ? (0.005f / 127.5f) : (0.02f / 127.5f);
-              e.deadRagdollJointEuler[j] = glm::vec3(
-                  (static_cast<float>((jh >> 8) & 255u) - 127.5f) * eAmp,
-                  (static_cast<float>((jh >> 16) & 255u) - 127.5f) * eAmp,
-                  (static_cast<float>((jh >> 24) & 255u) - 127.5f) * ezAmp);
-              const float s =
-                  (0.002f + static_cast<float>(jh & 255u) * (0.28f / 255.f)) * (tightInit ? 0.35f : 1.f);
-              e.deadRagdollJointVel[j] =
-                  glm::vec3(glm::dot(kb, right) * s, kbLen * s * 0.4f, glm::dot(kb, fwd) * (-s * 0.85f));
-            }
-            e.deadRagdollJointSimInited = true;
-          }
-          constexpr float kJRSpring = 11.f;
-          constexpr float kJRKnockImpulse = 0.14f;
-          constexpr float kJRLinearDamp = 3.4f;
-          for (int j = 0; j < e.deadRagdollJointSimCount; ++j) {
-            e.deadRagdollJointVel[j] -= e.deadRagdollJointEuler[j] * kJRSpring * dt;
-            if (kbLen > 1e-5f) {
-              const glm::vec3 knock(glm::dot(kb, right) * kJRKnockImpulse, kbLen * kJRKnockImpulse * 0.28f,
-                                    glm::dot(kb, fwd) * (-kJRKnockImpulse * 0.72f));
-              e.deadRagdollJointVel[j] += knock * dt;
-            }
-            e.deadRagdollJointVel[j] *= std::exp(-kJRLinearDamp * dt);
-            e.deadRagdollJointEuler[j] += e.deadRagdollJointVel[j] * dt;
-            glm::vec3& eu = e.deadRagdollJointEuler[j];
-            eu = glm::clamp(eu, glm::vec3(-1.18f), glm::vec3(1.18f));
-            if (gStaffDeadRagdollSimBoneKind[j] == 1u)
-              eu = glm::clamp(eu, glm::vec3(-kDeadRagdollNeckEulerClamp),
-                              glm::vec3(kDeadRagdollNeckEulerClamp));
-            else if (gStaffDeadRagdollSimBoneKind[j] == 8u)
-              eu = glm::clamp(eu, glm::vec3(-kDeadRagdollHeadEulerClamp),
-                              glm::vec3(kDeadRagdollHeadEulerClamp));
-            else if (gStaffDeadRagdollSimBoneKind[j] == 4u)
-              eu = glm::clamp(eu, glm::vec3(-kDeadRagdollCoreEulerClamp),
-                              glm::vec3(kDeadRagdollCoreEulerClamp));
-          }
         }
         e.velXZ = glm::vec2(0.f);
         const float kbSq = glm::dot(e.staffShoveKnockbackVelXZ, e.staffShoveKnockbackVelXZ);
@@ -8092,264 +8556,6 @@ struct App {
         continue;
       staffNpcIntegrateVerticalPhysics(eW, dt, playerFeetForStaffSupport);
     }
-    if (staffSkinnedActive && gStaffDeadRagdollSimBoneCount > 0) {
-      constexpr float kDeadTiltMul = 0.42f;
-      constexpr int kPbdIters = 7;
-      constexpr float kPbdGravity = 9.2f;
-      constexpr float kPbdKinSpringRoot = 14.f;
-      constexpr float kPbdKinSpringChild = 5.1f;
-      constexpr float kPbdDampPerSec = 2.55f;
-      constexpr float kPbdEulerFb = 1.22f;
-      // Hard cap on bone chain stretch (prevents spaghetti limbs / skin spikes when constraints fight).
-      constexpr float kPbdMaxStretch = 1.11f;
-      constexpr float kPbdEulerDeltaCap = 0.062f;
-      constexpr float kPbdGroundPad = 0.048f;
-      constexpr float kPbdGroundPadDistal = 0.074f;
-      static thread_local std::vector<glm::vec3> corpseEulScratch;
-      static thread_local std::vector<glm::vec3> corpseKinW;
-      const float dts = glm::clamp(dt, 1e-4f, 0.05f);
-      for (uint32_t siW : shelfEmpActiveSlots) {
-        ShelfEmployeeNpc& e = shelfEmpPool[siW];
-        if (!e.inited || !e.staffDead || e.meleeState < 2)
-          continue;
-        const int nJ = std::min({gStaffDeadRagdollSimBoneCount, kStaffRagdollSimMaxBones,
-                                 static_cast<int>(e.deadRagdollJointSimCount)});
-        if (nJ <= 0)
-          continue;
-        const auto corpseM = [&](float feetY) {
-          const float feetSink = staffMeleeDrawFeetSinkY(e);
-          const float ragLiftY = kStaffRagdollBindVisualLiftY * e.bodyScale.y;
-          glm::mat4 rot = glm::rotate(glm::mat4(1.f), e.yaw, glm::vec3(0.f, 1.f, 0.f));
-          rot = rot * glm::rotate(glm::mat4(1.f), e.deadRagdollPitch * kDeadTiltMul,
-                                  glm::vec3(1.f, 0.f, 0.f)) *
-                glm::rotate(glm::mat4(1.f), e.deadRagdollRoll * kDeadTiltMul, glm::vec3(0.f, 0.f, 1.f));
-          return glm::translate(glm::mat4(1.f),
-                                glm::vec3(e.posXZ.x, feetY - feetSink + ragLiftY, e.posXZ.y)) *
-                 rot * glm::scale(glm::mat4(1.f), e.bodyScale);
-        };
-        glm::mat4 M = corpseM(e.feetWorldY);
-        static const glm::vec3 kGndProbeLocal[] = {
-            {0.f, 0.06f, 0.02f},    {0.1f, 0.05f, 0.04f},   {-0.1f, 0.05f, 0.04f},
-            {0.f, 0.38f, 0.05f},    {0.f, 0.72f, 0.08f},    {0.12f, 0.52f, -0.06f},
-            {-0.12f, 0.52f, -0.06f},
-            // Prone arms often reach sideways — extra hull samples reduce hands through the floor.
-            {0.36f, 0.2f, 0.14f},   {-0.36f, 0.2f, 0.14f}, {0.28f, 0.14f, -0.2f},
-            {-0.28f, 0.14f, -0.2f}, {0.22f, 0.55f, 0.1f},   {-0.22f, 0.55f, 0.1f},
-            // Low hip / upper leg when lying on side.
-            {0.2f, 0.12f, 0.02f},   {-0.2f, 0.12f, 0.02f}, {0.f, 0.18f, -0.14f}};
-        float maxPen = 0.f;
-        for (const glm::vec3& pl : kGndProbeLocal) {
-          const glm::vec3 ls(pl.x * e.bodyScale.x, pl.y * e.bodyScale.y, pl.z * e.bodyScale.z);
-          const glm::vec3 w = glm::vec3(M * glm::vec4(ls, 1.f));
-          const float ty = terrainSupportY(w.x, w.z, w.y + 4.f);
-          const float pen = ty + kDeadCorpseGroundProbeSkinPad - w.y;
-          maxPen = std::max(maxPen, pen);
-        }
-        // Avoid one-frame spikes (odd shelf samples / tilt) launching the corpse upward.
-        maxPen = std::min(maxPen, 0.56f);
-        if (maxPen > 0.f)
-          e.feetWorldY += maxPen;
-        M = corpseM(e.feetWorldY);
-        corpseEulScratch.assign(static_cast<size_t>(staffRig.boneCount), glm::vec3(0.f));
-        for (int j = 0; j < nJ; ++j)
-          corpseEulScratch[static_cast<size_t>(gStaffDeadRagdollSimBoneRigIdx[j])] = e.deadRagdollJointEuler[j];
-        glm::mat4 gAnim[staff_skin::kMaxPaletteBones];
-        staff_skin::sampleBindBoneGlobalMatricesWithExtras(staffRig, corpseEulScratch.data(), gAnim);
-        corpseKinW.resize(static_cast<size_t>(nJ));
-        for (int j = 0; j < nJ; ++j) {
-          const int bi = gStaffDeadRagdollSimBoneRigIdx[j];
-          const glm::vec3 mlocal =
-              glm::vec3(staffRig.meshNorm * gAnim[bi] * glm::vec4(0.f, 0.f, 0.f, 1.f));
-          corpseKinW[static_cast<size_t>(j)] = glm::vec3(M * glm::vec4(mlocal, 1.f));
-        }
-        if (!e.deadRagdollPbdInited) {
-          for (int j = 0; j < nJ; ++j) {
-            e.deadRagdollPbdPosW[j] = corpseKinW[static_cast<size_t>(j)];
-            e.deadRagdollPbdVelW[j] = glm::vec3(0.f);
-          }
-          e.deadRagdollPbdInited = true;
-        }
-        for (int j = 0; j < nJ; ++j) {
-          const int pj = gStaffDeadRagdollSimParentIdx[j];
-          const bool rootChain = (pj < 0);
-          glm::vec3& v = e.deadRagdollPbdVelW[j];
-          glm::vec3& p = e.deadRagdollPbdPosW[j];
-          const float spr = rootChain ? kPbdKinSpringRoot : kPbdKinSpringChild;
-          v += (corpseKinW[static_cast<size_t>(j)] - p) * spr * dts;
-          if (!rootChain)
-            v.y -= kPbdGravity * dts;
-          v *= std::exp(-kPbdDampPerSec * dts);
-        }
-        for (int j = 0; j < nJ; ++j)
-          e.deadRagdollPbdPosW[j] += e.deadRagdollPbdVelW[j] * dts;
-        for (int it = 0; it < kPbdIters; ++it) {
-          for (int j = 0; j < nJ; ++j) {
-            const int pj = gStaffDeadRagdollSimParentIdx[j];
-            if (pj < 0)
-              continue;
-            const float rest = gStaffDeadRagdollSimRestLen[j] * e.bodyScale.y;
-            glm::vec3& pa = e.deadRagdollPbdPosW[pj];
-            glm::vec3& pb = e.deadRagdollPbdPosW[j];
-            glm::vec3 d = pb - pa;
-            const float len = glm::length(d);
-            if (len < 1e-6f)
-              continue;
-            const float err = 0.5f * (len - rest) / len;
-            const glm::vec3 corr = d * err;
-            const bool parentIsSimRoot = (gStaffDeadRagdollSimParentIdx[pj] < 0);
-            const float wp = parentIsSimRoot ? 0.32f : 0.5f;
-            pa += corr * wp;
-            pb -= corr * (1.f - wp);
-          }
-          for (int j = 0; j < nJ; ++j) {
-            const int pj = gStaffDeadRagdollSimParentIdx[j];
-            if (pj < 0)
-              continue;
-            const float rest = gStaffDeadRagdollSimRestLen[j] * e.bodyScale.y;
-            const float maxLen = rest * kPbdMaxStretch;
-            glm::vec3& pa = e.deadRagdollPbdPosW[pj];
-            glm::vec3& pb = e.deadRagdollPbdPosW[j];
-            glm::vec3 d = pb - pa;
-            const float len = glm::length(d);
-            if (len > maxLen && len > 1e-6f) {
-              const float pull = 0.5f * (len - maxLen) / len;
-              const glm::vec3 c = d * pull;
-              const bool parentIsSimRoot = (gStaffDeadRagdollSimParentIdx[pj] < 0);
-              const float wp = parentIsSimRoot ? 0.32f : 0.5f;
-              pa += c * wp;
-              pb -= c * (1.f - wp);
-            }
-          }
-        }
-        for (int j = 0; j < nJ; ++j) {
-          glm::vec3& p = e.deadRagdollPbdPosW[j];
-          glm::vec3& v = e.deadRagdollPbdVelW[j];
-          const uint8_t bk = gStaffDeadRagdollSimBoneKind[j];
-          const float pad = (bk == 2u || bk == 3u || bk == 5u || bk == 6u) ? kPbdGroundPadDistal : kPbdGroundPad;
-          const float ty = terrainSupportY(p.x, p.z, p.y + 3.f);
-          if (p.y < ty + pad) {
-            p.y = ty + pad;
-            v.y = std::max(0.f, v.y);
-            v.x *= 0.92f;
-            v.z *= 0.92f;
-          }
-        }
-        // Bone pivots sit mid-segment; extrude toward the free end so mesh doesn’t tunnel (arms/thighs).
-        for (int j = 0; j < nJ; ++j) {
-          const uint8_t bk = gStaffDeadRagdollSimBoneKind[j];
-          if (bk == 1u || bk == 4u)
-            continue;
-          const int pj = gStaffDeadRagdollSimParentIdx[j];
-          if (pj < 0)
-            continue;
-          glm::vec3& p = e.deadRagdollPbdPosW[j];
-          glm::vec3& v = e.deadRagdollPbdVelW[j];
-          glm::vec3 d = p - e.deadRagdollPbdPosW[pj];
-          const float dl = glm::length(d);
-          if (dl < 1e-5f)
-            continue;
-          d *= 1.f / dl;
-          float extM = 0.26f;
-          if (bk == 8u)
-            extM = 0.30f;
-          else if (bk == 2u)
-            extM = 0.44f;
-          else if (bk == 3u)
-            extM = 0.30f;
-          else if (bk == 5u)
-            extM = 0.54f;
-          else if (bk == 6u)
-            extM = 0.42f;
-          else
-            extM = 0.22f;
-          const float ext = extM * e.bodyScale.y;
-          glm::vec3 tip = p + d * ext;
-          const float tyT = terrainSupportY(tip.x, tip.z, tip.y + 3.f);
-          const float tipPad = kPbdGroundPadDistal + 0.018f;
-          if (tip.y < tyT + tipPad) {
-            p.y += (tyT + tipPad) - tip.y;
-            v.y = std::max(0.f, v.y);
-          }
-        }
-        for (int it2 = 0; it2 < 2; ++it2) {
-          for (int j = 0; j < nJ; ++j) {
-            const int pj = gStaffDeadRagdollSimParentIdx[j];
-            if (pj < 0)
-              continue;
-            const float rest = gStaffDeadRagdollSimRestLen[j] * e.bodyScale.y;
-            glm::vec3& pa = e.deadRagdollPbdPosW[pj];
-            glm::vec3& pb = e.deadRagdollPbdPosW[j];
-            glm::vec3 d = pb - pa;
-            const float len = glm::length(d);
-            if (len < 1e-6f)
-              continue;
-            const float err = 0.5f * (len - rest) / len;
-            const glm::vec3 corr = d * err;
-            const bool parentIsSimRoot = (gStaffDeadRagdollSimParentIdx[pj] < 0);
-            const float wp = parentIsSimRoot ? 0.32f : 0.5f;
-            pa += corr * wp;
-            pb -= corr * (1.f - wp);
-          }
-          for (int j = 0; j < nJ; ++j) {
-            const int pj = gStaffDeadRagdollSimParentIdx[j];
-            if (pj < 0)
-              continue;
-            const float rest = gStaffDeadRagdollSimRestLen[j] * e.bodyScale.y;
-            const float maxLen = rest * kPbdMaxStretch;
-            glm::vec3& pa = e.deadRagdollPbdPosW[pj];
-            glm::vec3& pb = e.deadRagdollPbdPosW[j];
-            glm::vec3 d = pb - pa;
-            const float len = glm::length(d);
-            if (len > maxLen && len > 1e-6f) {
-              const float pull = 0.5f * (len - maxLen) / len;
-              const glm::vec3 c = d * pull;
-              const bool parentIsSimRoot = (gStaffDeadRagdollSimParentIdx[pj] < 0);
-              const float wp = parentIsSimRoot ? 0.32f : 0.5f;
-              pa += c * wp;
-              pb -= c * (1.f - wp);
-            }
-          }
-        }
-        const glm::mat4 invM = glm::inverse(M);
-        for (int j = 0; j < nJ; ++j) {
-          if (gStaffDeadRagdollSimParentIdx[j] < 0)
-            continue;
-          const uint8_t bk = gStaffDeadRagdollSimBoneKind[j];
-          float fb = kPbdEulerFb;
-          if (bk == 1u)
-            fb *= 0.22f;
-          else if (bk == 8u)
-            fb *= 0.26f;
-          else if (bk == 4u)
-            fb *= 0.12f;
-          else if (bk == 2u)
-            fb *= 0.48f;
-          else if (bk == 3u)
-            fb *= 0.62f;
-          else if (bk == 5u || bk == 6u)
-            fb *= 0.58f;
-          else
-            fb *= 0.55f;
-          const glm::vec3 mk =
-              glm::vec3(invM * glm::vec4(corpseKinW[static_cast<size_t>(j)], 1.f));
-          const glm::vec3 ms = glm::vec3(invM * glm::vec4(e.deadRagdollPbdPosW[j], 1.f));
-          glm::vec3 delta = ms - mk;
-          delta = glm::clamp(delta, glm::vec3(-kPbdEulerDeltaCap), glm::vec3(kPbdEulerDeltaCap));
-          e.deadRagdollJointEuler[j] += delta * fb * dts;
-          glm::vec3& eu = e.deadRagdollJointEuler[j];
-          eu = glm::clamp(eu, glm::vec3(-1.18f), glm::vec3(1.18f));
-          if (bk == 1u)
-            eu = glm::clamp(eu, glm::vec3(-kDeadRagdollNeckEulerClamp),
-                            glm::vec3(kDeadRagdollNeckEulerClamp));
-          else if (bk == 8u)
-            eu = glm::clamp(eu, glm::vec3(-kDeadRagdollHeadEulerClamp),
-                            glm::vec3(kDeadRagdollHeadEulerClamp));
-          else if (bk == 4u)
-            eu = glm::clamp(eu, glm::vec3(-kDeadRagdollCoreEulerClamp),
-                            glm::vec3(kDeadRagdollCoreEulerClamp));
-        }
-      }
-    }
     for (uint32_t siW : shelfEmpActiveSlots) {
       ShelfEmployeeNpc& e = shelfEmpPool[siW];
       if (!e.inited || !e.staffDead || e.meleeState < 2)
@@ -8369,7 +8575,7 @@ struct App {
         continue;
       if (eW.staffTallFallKnockdownPending) {
         eW.staffTallFallKnockdownPending = 0;
-        applyStaffTallFallRagdoll(eW.residentKey, eW);
+        applyStaffTallFallKnockdown(eW.residentKey, eW);
       }
     }
     for (uint32_t siW : shelfEmpActiveSlots) {
@@ -8828,6 +9034,7 @@ struct App {
       const glm::vec2 d = pXZ - ex.posXZ;
       if (glm::dot(d, d) > pruneSq) {
         const uint64_t rk = ex.residentKey;
+        staff_rp3d::destroyCorpse(rk);
         shelfEmpKeyToSlot.erase(rk);
         shelfEmpActiveSlots[ai] = shelfEmpActiveSlots.back();
         shelfEmpActiveSlots.pop_back();
@@ -9015,6 +9222,15 @@ struct App {
     SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0)
       throw std::runtime_error(std::string("SDL_Init: ") + SDL_GetError());
+    if (char* base = SDL_GetBasePath()) {
+      // Installed Windows launches often start outside the install dir; resolve relative assets/* from exe folder.
+      std::error_code ec;
+      std::filesystem::current_path(base, ec);
+      if (ec)
+        std::cerr << "[vulkan_game] could not chdir to executable folder (assets may still load via full paths): "
+                  << ec.message() << "\n";
+      SDL_free(base);
+    }
     constexpr int kImgWant = IMG_INIT_PNG | IMG_INIT_JPG;
     if ((IMG_Init(kImgWant) & kImgWant) != kImgWant)
       throw std::runtime_error(std::string("IMG_Init (PNG+JPG): ") + IMG_GetError());
@@ -9877,8 +10093,9 @@ struct App {
         throw std::runtime_error("read font");
       std::vector<unsigned char> bitmap(static_cast<size_t>(gHudUiFontAtlasW * gHudUiFontAtlasH));
       stbtt_pack_context pc{};
-      if (!stbtt_PackBegin(&pc, bitmap.data(), gHudUiFontAtlasW, gHudUiFontAtlasH, 0, 2, nullptr))
+      if (!stbtt_PackBegin(&pc, bitmap.data(), gHudUiFontAtlasW, gHudUiFontAtlasH, 0, 1, nullptr))
         throw std::runtime_error("PackBegin");
+      // Match shipped Linux-desktop look (smoother than 1×1 atlas sampling).
       stbtt_PackSetOversampling(&pc, 2, 2);
       if (!stbtt_PackFontRange(&pc, ttf.data(), 0, gHudUiFontSizePx, kHudFontFirstChar, kHudFontCharCount,
                                gHudUiFontPacked))
@@ -10738,24 +10955,7 @@ struct App {
     vkDestroyBuffer(device, deathMenuStaging, nullptr);
     vkFreeMemory(device, deathMenuStagingMem, nullptr);
 
-    auto pauseMenuVerts = buildPauseMenuOverlayVertices();
-    pauseMenuVertexCount = static_cast<uint32_t>(pauseMenuVerts.size());
-    const VkDeviceSize pauseMenuSize = sizeof(Vertex) * pauseMenuVerts.size();
-    VkBuffer pauseMenuStaging = VK_NULL_HANDLE;
-    VkDeviceMemory pauseMenuStagingMem = VK_NULL_HANDLE;
-    createBuffer(physicalDevice, device, pauseMenuSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                 pauseMenuStaging, pauseMenuStagingMem);
-    void* pauseMenuData = nullptr;
-    vkMapMemory(device, pauseMenuStagingMem, 0, pauseMenuSize, 0, &pauseMenuData);
-    std::memcpy(pauseMenuData, pauseMenuVerts.data(), static_cast<size_t>(pauseMenuSize));
-    vkUnmapMemory(device, pauseMenuStagingMem);
-    createBuffer(physicalDevice, device, pauseMenuSize,
-                 VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, pauseMenuVertexBuffer, pauseMenuVertexBufferMemory);
-    copyBuffer(device, commandPool, graphicsQueue, pauseMenuStaging, pauseMenuVertexBuffer, pauseMenuSize);
-    vkDestroyBuffer(device, pauseMenuStaging, nullptr);
-    vkFreeMemory(device, pauseMenuStagingMem, nullptr);
+    recreatePauseMenuGpuMesh();
 
     constexpr VkDeviceSize kInventoryMenuVbMaxBytes = sizeof(Vertex) * 8192u;
     inventoryMenuVertexBufferBytes = kInventoryMenuVbMaxBytes;
@@ -11212,8 +11412,6 @@ struct App {
 
     staffSkinnedActive = false;
     staffRigBoneCount = 0;
-    gStaffDeadRagdollSimBoneCount = 0;
-
     if (trySkinnedGlb &&
         staff_skin::loadSkinnedIdleGlb(VULKAN_GAME_EMPLOYEE_FBX, kEmployeeVisualHeight, skinLoad, staffRig,
                                        empErr, &staffDiffuseRgba, &staffDiffuseW, &staffDiffuseH)) {
@@ -11308,6 +11506,54 @@ struct App {
           std::fprintf(stderr, "[head tilt] %zu bones from '%s'\n",
                        fpHeadTiltBoneIndices.size(), startName.c_str());
         }
+      }
+      {
+        auto boneLower = [&](int bi) {
+          std::string lower = staffRig.boneNames[static_cast<size_t>(bi)];
+          for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+          return lower;
+        };
+        auto findBoneSubstr = [&](const char* sub) -> int {
+          for (int i = 0; i < staffRig.boneCount; ++i) {
+            const std::string lower = boneLower(i);
+            if (lower.find(sub) != std::string::npos)
+              return i;
+          }
+          return -1;
+        };
+        staffRagdollPelvisBoneIdx = findBoneSubstr("pelvis");
+        if (staffRagdollPelvisBoneIdx < 0)
+          staffRagdollPelvisBoneIdx = findBoneSubstr("hips");
+        staffRagdollChestBoneIdx = findBoneSubstr("chest");
+        if (staffRagdollChestBoneIdx < 0)
+          staffRagdollChestBoneIdx = findBoneSubstr("spine2");
+        if (staffRagdollChestBoneIdx < 0)
+          staffRagdollChestBoneIdx = findBoneSubstr("spine_02");
+        if (staffRagdollChestBoneIdx < 0)
+          staffRagdollChestBoneIdx = findBoneSubstr("spine1");
+        staffRagdollNeckBoneIdx = fpNeckBoneIdx >= 0 ? fpNeckBoneIdx : findBoneSubstr("neck");
+        staffRagdollUpperArmLBoneIdx = -1;
+        staffRagdollUpperArmRBoneIdx = -1;
+        for (int i = 0; i < staffRig.boneCount; ++i) {
+          const std::string lower = boneLower(i);
+          const bool hasArm = lower.find("arm") != std::string::npos;
+          if (!hasArm)
+            continue;
+          const bool left = lower.find("left") != std::string::npos ||
+                              lower.find(".l") != std::string::npos ||
+                              lower.find("_l") != std::string::npos;
+          const bool right = lower.find("right") != std::string::npos ||
+                               lower.find(".r") != std::string::npos ||
+                               lower.find("_r") != std::string::npos;
+          if (left && staffRagdollUpperArmLBoneIdx < 0)
+            staffRagdollUpperArmLBoneIdx = i;
+          if (right && staffRagdollUpperArmRBoneIdx < 0)
+            staffRagdollUpperArmRBoneIdx = i;
+        }
+        std::fprintf(stderr,
+                     "[staff ragdoll bones] pelvis=%d chest=%d neck=%d upperArmL=%d upperArmR=%d\n",
+                     staffRagdollPelvisBoneIdx, staffRagdollChestBoneIdx, staffRagdollNeckBoneIdx,
+                     staffRagdollUpperArmLBoneIdx, staffRagdollUpperArmRBoneIdx);
       }
       avClipIdle = 0;
       avClipWalk = staffRig.clips.size() > 1 ? 1 : -1;
@@ -11451,8 +11697,12 @@ struct App {
 #endif
 #if defined(VULKAN_GAME_STAFF_SHREK_PROXIMITY_DANCE_GLB) || defined(VULKAN_GAME_SHREK_EGG_GLB)
         {
+          constexpr const char kBundledProximityDanceRelative[] =
+              "assets/models/character/proximity_dance.glb";
           std::string shrekDanceErr;
+          std::string shrekDanceFallbackErr;
           int danceIdx = -1;
+          std::string danceUsedPath;
           const char* danceGlb = nullptr;
 #if defined(VULKAN_GAME_STAFF_SHREK_PROXIMITY_DANCE_GLB)
           danceGlb = std::getenv("VULKAN_GAME_STAFF_SHREK_DANCE_GLB");
@@ -11461,23 +11711,92 @@ struct App {
 #elif defined(VULKAN_GAME_SHREK_EGG_GLB)
           danceGlb = VULKAN_GAME_SHREK_EGG_GLB;
 #endif
-          if (danceGlb && staff_skin::appendLongestRetargetedClipFromGlb(danceGlb, staffRig, true, danceIdx,
-                                                                        shrekDanceErr)) {
+          std::string danceResolved = danceGlb ? resolvePortableDataFile(danceGlb) : std::string{};
+          bool danceOk =
+              !danceResolved.empty() &&
+              staff_skin::appendLongestRetargetedClipFromGlb(danceResolved.c_str(), staffRig, true, danceIdx,
+                                                            shrekDanceErr);
+          if (danceOk)
+            danceUsedPath = std::move(danceResolved);
+#if defined(VULKAN_GAME_STAFF_SHREK_PROXIMITY_DANCE_GLB)
+          if (!danceOk) {
+            std::string fb = resolvePortableDataFile(kBundledProximityDanceRelative);
+            if (!fb.empty() &&
+                staff_skin::appendLongestRetargetedClipFromGlb(fb.c_str(), staffRig, true, danceIdx,
+                                                                shrekDanceFallbackErr)) {
+              danceOk = true;
+              danceUsedPath = std::move(fb);
+              if (!shrekDanceErr.empty())
+                std::cerr << "[staff] Shrek proximity dance: primary path failed, using bundled next to exe — "
+                          << shrekDanceErr << "\n";
+            }
+          }
+#endif
+          if (danceOk && !danceUsedPath.empty()) {
             staffClipShrekProximityDance = danceIdx;
             std::cout << "[staff] Shrek proximity dance clip index " << staffClipShrekProximityDance << " ("
-                      << danceGlb << ")\n";
+                      << danceUsedPath << ")\n";
           } else {
             staffClipShrekProximityDance = -1;
             if (!shrekDanceErr.empty())
               std::cerr << "[staff] Shrek proximity dance clip: " << shrekDanceErr << "\n";
+            if (!shrekDanceFallbackErr.empty())
+              std::cerr << "[staff] Shrek proximity dance bundled fallback: " << shrekDanceFallbackErr << "\n";
           }
         }
 #endif
+        // When CMake skips VULK_* dance defines entirely, or the baked path/open fails at runtime,
+        // still probe portable layout (SDL_GetBasePath + cwd) so Windows installs/unzipped folders load H reliably.
+        if (staffClipShrekProximityDance < 0) {
+          constexpr const char kPortableDanceRel[] = "assets/models/character/proximity_dance.glb";
+          std::vector<std::string> danceFallPaths;
+          if (const char* ev = std::getenv("VULKAN_GAME_STAFF_SHREK_DANCE_GLB"))
+            if (ev[0])
+              danceFallPaths.emplace_back(ev);
+#if defined(VULKAN_GAME_STAFF_SHREK_PROXIMITY_DANCE_GLB)
+          danceFallPaths.emplace_back(VULKAN_GAME_STAFF_SHREK_PROXIMITY_DANCE_GLB);
+#endif
+#if defined(VULKAN_GAME_SHREK_EGG_GLB)
+          danceFallPaths.emplace_back(VULKAN_GAME_SHREK_EGG_GLB);
+#endif
+          if (char* bp = SDL_GetBasePath()) {
+            std::filesystem::path p(bp);
+            SDL_free(bp);
+            danceFallPaths.push_back((p / kPortableDanceRel).string());
+          }
+          danceFallPaths.emplace_back(kPortableDanceRel);
+
+          std::string aggErr;
+          for (const std::string& dp : danceFallPaths) {
+            int idxRt = -1;
+            clipErr.clear();
+            const std::string tryPath = resolvePortableDataFile(dp.c_str());
+            if (tryPath.empty())
+              continue;
+            if (staff_skin::appendLongestRetargetedClipFromGlb(tryPath.c_str(), staffRig, true, idxRt,
+                                                              clipErr) &&
+                idxRt >= 0) {
+              staffClipShrekProximityDance = idxRt;
+              std::cout << "[staff] proximity dance (runtime probe) clip " << staffClipShrekProximityDance
+                        << " from \"" << tryPath << "\"\n";
+              break;
+            }
+            if (!clipErr.empty()) {
+              if (!aggErr.empty())
+                aggErr += " | ";
+              aggErr += tryPath;
+              aggErr += ": ";
+              aggErr += clipErr;
+            }
+          }
+          if (staffClipShrekProximityDance < 0 && !aggErr.empty())
+            std::cerr << "[staff] proximity dance runtime probe failed: " << aggErr << "\n";
+        }
       }
       staff_skin::optimizeRigClips(staffRig);
       staffSkinnedActive = true;
+      staff_rp3d::init(-kGravity);
       staffRigBoneCount = staffRig.boneCount;
-      staffRebuildDeadRagdollSimBoneMap(staffRig);
       employeeBounds = computeEmployeeBoundsFromSkinnedMesh(skinLoad);
       employeeVertexCount = static_cast<uint32_t>(skinLoad.size());
       const VkDeviceSize empVSize = sizeof(staff_skin::SkinnedVertex) * skinLoad.size();
@@ -12361,12 +12680,9 @@ struct App {
                 npc.staffHpMax = staffClassMaxHp(npc.staffClassArchetype);
                 npc.staffHp = npc.staffHpMax;
                 npc.staffDead = false;
-                npc.deadRagdollPitch = 0.f;
-                npc.deadRagdollRoll = 0.f;
-                npc.deadRagdollPitchVel = 0.f;
-                npc.deadRagdollRollVel = 0.f;
-                npc.deadRagdollYaw = npc.yaw;
-                npc.deadRagdollYawVel = 0.f;
+                npc.staffFlinchEuler = glm::vec3(0.f);
+                for (auto& re : npc.staffRagdollEuler)
+                  re = glm::vec3(0.f);
                 npc.inited = true;
               }
             }
@@ -12386,8 +12702,7 @@ struct App {
       const int wa = static_cast<int>(static_cast<uint32_t>(rk >> 32));
       const int wl = static_cast<int>(static_cast<uint32_t>(rk & 0xffffffffull));
       // Alive staff: match shelf spawn density (1/83 hash + skip central aisles). Dead staff must skip
-      // these — otherwise debug `\` corpses (~random keys) almost never enter staffNpcDrawBuild, so RP3D
-      // palettes never run and the mesh stays upright bind pose.
+      // the hash gate so corpses always get a draw slot (ragdoll palette uses bind + bone offsets).
       if (!npc.staffDead) {
         if (std::max(std::abs(wa), std::abs(wl)) <= 3)
           continue;
@@ -12407,37 +12722,47 @@ struct App {
       if (lodBehindCameraXZ(sceneFocusX, sceneFocusZ, wx, wz, lodHFwd, kLodBehindMarginStaff))
         continue;
       const float feetSink = staffMeleeDrawFeetSinkY(npc);
-      const float ragLiftY =
-          npc.staffDead ? kStaffRagdollBindVisualLiftY * npc.bodyScale.y : 0.f;
+      const float corpseLiftY =
+          npc.staffDead ? kStaffDeadCorpseVisualLiftY * npc.bodyScale.y : 0.f;
+      const float aliveSkLift =
+          (staffSkinnedActive && !npc.staffDead) ? kStaffSkinnedAliveFeetVisualLiftY * npc.bodyScale.y : 0.f;
       glm::mat4 rot = glm::rotate(glm::mat4(1.f), npc.yaw, glm::vec3(0.f, 1.f, 0.f));
-      if (npc.staffDead) {
-        // Bind + ragdoll extras are upright in model space; damp world tilt so instance pitch/roll doesn’t stack into a stiff “card”.
-        constexpr float kDeadCorpseWorldTiltMul = 0.42f;
-        rot = rot * glm::rotate(glm::mat4(1.f), npc.deadRagdollPitch * kDeadCorpseWorldTiltMul,
-                               glm::vec3(1.f, 0.f, 0.f)) *
-              glm::rotate(glm::mat4(1.f), npc.deadRagdollRoll * kDeadCorpseWorldTiltMul,
-                          glm::vec3(0.f, 0.f, 1.f));
-      }
       const glm::mat4 M =
-          glm::translate(glm::mat4(1.f), glm::vec3(wx, npc.feetWorldY - feetSink + ragLiftY, wz)) *
+          glm::translate(glm::mat4(1.f),
+                         glm::vec3(wx, npc.feetWorldY - feetSink + corpseLiftY + aliveSkLift, wz)) *
                           rot * glm::scale(glm::mat4(1.f), npc.bodyScale);
       StaffNpcDrawSlot slot{};
       slot.model = M;
       if (staffSkinnedActive) {
         if (npc.staffDead) {
-          slot.bindPoseOnly = 1u;
-          slot.ragdollAngVelForSkin =
-              glm::vec3(npc.deadRagdollPitchVel, npc.deadRagdollYawVel, npc.deadRagdollRollVel);
-          slot.ragdollLooseSeed =
-              static_cast<uint32_t>(npc.residentKey ^ (npc.residentKey >> 32));
-          slot.deadRagdollJointCount = npc.deadRagdollJointSimCount;
-          for (int j = 0; j < npc.deadRagdollJointSimCount && j < kStaffRagdollSimMaxBones; ++j)
-            slot.deadRagdollJointEuler[j] = npc.deadRagdollJointEuler[j];
+          if (npc.mpNetDeadSkinnedFall) {
+            slot.paletteKind = 0u;
+            slot.clipIdx = npc.mpNetDrawClip;
+            slot.phase = npc.mpNetDrawPhase;
+            slot.animLoop = npc.mpNetDrawLoop ? 1u : 0u;
+            slot.meleeBlend = npc.meleeAnimBlend;
+            slot.meleeFromClip = npc.meleeAnimFromClip;
+            slot.meleeFromPhase = npc.meleeAnimFromPhase;
+            slot.meleeFromLoop = npc.meleeAnimFromLoop;
+          } else if (npc.staffRp3dCorpse && staff_rp3d::active(npc.residentKey)) {
+            slot.paletteKind = 3u;
+            slot.paletteResidentKey = npc.residentKey;
+          } else {
+            slot.paletteKind = 1u;
+            slot.paletteLocalBoneExtra = npc.staffRagdollEuler;
+          }
         } else {
+          slot.paletteKind = 0u;
           int clipIdx = 0;
           double ph = 0.0;
           bool loopClip = true;
-          staffNpcResolveDrawAnim(npc, npc.residentKey, storeLitForStaffAnim, clipIdx, ph, loopClip);
+          if (npc.mpNetDrawOverride) {
+            clipIdx = npc.mpNetDrawClip;
+            ph = npc.mpNetDrawPhase;
+            loopClip = npc.mpNetDrawLoop;
+          } else {
+            staffNpcResolveDrawAnim(npc, npc.residentKey, storeLitForStaffAnim, clipIdx, ph, loopClip);
+          }
           slot.clipIdx = clipIdx;
           slot.phase = ph;
           slot.animLoop = loopClip ? 1u : 0u;
@@ -12445,6 +12770,12 @@ struct App {
           slot.meleeFromClip = npc.meleeAnimFromClip;
           slot.meleeFromPhase = npc.meleeAnimFromPhase;
           slot.meleeFromLoop = npc.meleeAnimFromLoop;
+          if (glm::dot(npc.staffFlinchEuler, npc.staffFlinchEuler) > 1e-14f &&
+              staffRagdollChestBoneIdx >= 0) {
+            slot.paletteKind = 2u;
+            slot.paletteLocalBoneExtra = {};
+            slot.paletteLocalBoneExtra[static_cast<size_t>(staffRagdollChestBoneIdx)] = npc.staffFlinchEuler;
+          }
         }
       }
       staffNpcDrawBuild.push_back(slot);
@@ -12565,8 +12896,7 @@ struct App {
                          VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushModel), &push);
       vkCmdDraw(cmd, deliMeatballVertexCount, static_cast<uint32_t>(deliMeatballInstanceScratch.size()), 0, 0);
     }
-    if (employeeVertexCount > 0 && staffSkinnedActive && staffBoneSsbMapped &&
-        !staffRig.clips.empty()) {
+    if (employeeVertexCount > 0 && staffSkinnedActive && staffBoneSsbMapped) {
       auto* palettes = reinterpret_cast<glm::mat4*>(staffBoneSsbMapped);
       const size_t nNpc = staffNpcDrawBuild.size();
       if (nNpc > 0) {
@@ -12585,27 +12915,32 @@ struct App {
         ++palFrameCount;
         for (size_t ii = 0; ii < nNpc; ++ii) {
           const StaffNpcDrawSlot& slEarly = staffNpcDrawBuild[ii];
-          if (slEarly.bindPoseOnly != 0u) {
-            // Dead: bind pose + joint sim only (no fall-clip sampling).
-            if (staffRig.boneCount > 0) {
-              if (slEarly.deadRagdollJointCount > 0u && gStaffDeadRagdollSimBoneCount > 0) {
-                static thread_local std::vector<glm::vec3> staffRagExtraScratch;
-                const int nb = staffRig.boneCount;
-                if (static_cast<int>(staffRagExtraScratch.size()) < nb)
-                  staffRagExtraScratch.resize(static_cast<size_t>(nb));
-                std::fill(staffRagExtraScratch.begin(), staffRagExtraScratch.begin() + nb, glm::vec3(0.f));
-                for (int j = 0; j < slEarly.deadRagdollJointCount && j < kStaffRagdollSimMaxBones; ++j)
-                  staffRagExtraScratch[static_cast<size_t>(gStaffDeadRagdollSimBoneRigIdx[j])] =
-                      slEarly.deadRagdollJointEuler[j];
-                staff_skin::computeBindPosePaletteWithRagdollExtras(staffRig, staffRagExtraScratch.data(),
-                                                                    palettes + ii * kStaffPaletteBoneCount);
-              } else {
-                staff_skin::computeBindPosePalette(staffRig, palettes + ii * kStaffPaletteBoneCount);
-              }
+          if (slEarly.paletteKind == 1u) {
+            if (staffRig.boneCount > 0)
+              staff_skin::computeBindPosePaletteWithExtras(staffRig, slEarly.paletteLocalBoneExtra.data(),
+                                                            palettes + ii * kStaffPaletteBoneCount);
+            else
+              staff_skin::computeBindPosePalette(staffRig, palettes + ii * kStaffPaletteBoneCount);
+            continue;
+          }
+          if (slEarly.paletteKind == 2u) {
+            if (staffRig.clips.empty()) {
+              staff_skin::computeBindPosePaletteWithExtras(staffRig, slEarly.paletteLocalBoneExtra.data(),
+                                                           palettes + ii * kStaffPaletteBoneCount);
             } else {
-              staff_skin::computeLooseBindPosePalette(staffRig, palettes + ii * kStaffPaletteBoneCount,
-                                                      slEarly.ragdollAngVelForSkin, staffSimTime,
-                                                      slEarly.ragdollLooseSeed);
+              const StaffNpcDrawSlot& sl = staffNpcDrawBuild[ii];
+              const double ph = ps1QuantizeClipPhase(sl.phase, kPs1NpcClipPhaseStrength);
+              staff_skin::computePaletteWithLocalExtras(staffRig, sl.clipIdx, ph, sl.animLoop != 0,
+                                                        sl.paletteLocalBoneExtra.data(),
+                                                        palettes + ii * kStaffPaletteBoneCount);
+            }
+            continue;
+          }
+          if (slEarly.paletteKind == 3u) {
+            const StaffNpcDrawSlot& sl = staffNpcDrawBuild[ii];
+            if (!staff_rp3d::fillBonePalette(sl.paletteResidentKey, staffRig, sl.model,
+                                             palettes + ii * kStaffPaletteBoneCount)) {
+              staff_skin::computeBindPosePalette(staffRig, palettes + ii * kStaffPaletteBoneCount);
             }
             continue;
           }
@@ -12623,7 +12958,9 @@ struct App {
           const float bl = sl.meleeBlend;
           const double ph = ps1QuantizeClipPhase(sl.phase, kPs1NpcClipPhaseStrength);
           const bool farStaff = staffDistSq > kStaffPaletteLodFarSq;
-          if (farStaff || bl >= 1.f - 1e-5f) {
+          if (staffRig.clips.empty()) {
+            staff_skin::computeBindPosePalette(staffRig, palettes + ii * kStaffPaletteBoneCount);
+          } else if (farStaff || bl >= 1.f - 1e-5f) {
             staff_skin::computePalette(staffRig, sl.clipIdx, ph, palettes + ii * kStaffPaletteBoneCount,
                                        sl.animLoop != 0);
           } else {
@@ -12712,28 +13049,12 @@ struct App {
           else
             feetY -= kAvatarLedgeHangFeetVisualDown;
         }
-        // Skinned staff mesh matches NPC convention: horizontal facing uses (sin φ, cos φ) in XZ, i.e.
-        // φ = atan2(vx, vz). Player camera uses (cos yaw, sin yaw) for forward — rotating the model by
-        // raw yaw misaligns run/walk clips; use velocity when moving, else camera look (atan2(cos,sin)).
-        const float spXZ = glm::length(horizVel);
-        constexpr float kAvatarYawVelEps = 0.07f;
+        // Skinned avatar uses atan2 vx,vz ≡ atan2(dx,dz) in XZ matching staff NPC convention.
+        // Locomotion: face camera yaw; backpedal (wish/vel backward vs view) rotates body π so footsteps
+        // line up — climb/ledge use geometry-facing (fpLocoAvatarYawFlip is cleared there).
         float avYaw;
-        const Uint8* keysAv = SDL_GetKeyboardState(nullptr);
-        const bool backKeyHeld =
-            (keysAv[SDL_SCANCODE_S] != 0) || scancodeDown[static_cast<size_t>(SDL_SCANCODE_S)] ||
-            (keysAv[SDL_SCANCODE_DOWN] != 0) || scancodeDown[static_cast<size_t>(SDL_SCANCODE_DOWN)];
-        const bool strafeLeftHeld =
-            (keysAv[SDL_SCANCODE_A] != 0) || scancodeDown[static_cast<size_t>(SDL_SCANCODE_A)] ||
-            (keysAv[SDL_SCANCODE_LEFT] != 0) || scancodeDown[static_cast<size_t>(SDL_SCANCODE_LEFT)];
-        const bool strafeRightHeld =
-            (keysAv[SDL_SCANCODE_D] != 0) || scancodeDown[static_cast<size_t>(SDL_SCANCODE_D)] ||
-            (keysAv[SDL_SCANCODE_RIGHT] != 0) || scancodeDown[static_cast<size_t>(SDL_SCANCODE_RIGHT)];
-        const bool strafeKeyHeld = strafeLeftHeld || strafeRightHeld;
-        // S / A / D (and arrows, Q): keep torso facing camera-forward; strafe clips move sideways on that heading.
         if (dropKickActive && glm::length(dropKickDir) > 1e-4f)
           avYaw = std::atan2(dropKickDir.x, dropKickDir.y);
-        else if (!thirdPersonTestMode && slideActive)
-          avYaw = std::atan2(std::cos(yaw), std::sin(yaw));
         else if (ledgeHangActive)
           avYaw = std::atan2(std::cos(ledgeHangTargetYaw), std::sin(ledgeHangTargetYaw));
         else if (ledgeClimbT >= 0.f && glm::length(ledgeClimbExitHoriz) > 1e-4f)
@@ -12742,12 +13063,8 @@ struct App {
           avYaw = std::atan2(ladderClimbExitHoriz.x, ladderClimbExitHoriz.y);
         else if (wallClimbActive && glm::length(glm::vec2(wallClimbNormal.x, wallClimbNormal.z)) > 1e-4f)
           avYaw = std::atan2(-wallClimbNormal.x, -wallClimbNormal.z);
-        else if (backKeyHeld || strafeKeyHeld)
-          avYaw = std::atan2(std::cos(yaw), std::sin(yaw));
-        else if (spXZ > kAvatarYawVelEps)
-          avYaw = std::atan2(horizVel.x, horizVel.y);
         else
-          avYaw = std::atan2(std::cos(yaw), std::sin(yaw));
+          avYaw = std::atan2(std::cos(yaw + fpLocoAvatarYawFlip), std::sin(yaw + fpLocoAvatarYawFlip));
         float avPitch = std::clamp(-pitch * kFpBodyPitchFollow, -kFpBodyPitchMaxTilt, kFpBodyPitchMaxTilt);
         if (ledgeHangActive || slideActive || dropKickActive)
           avPitch = 0.f;
@@ -12755,10 +13072,9 @@ struct App {
         if (thirdPersonTestMode)
           fpAvatarYawSmooth = avYaw;
         else {
-          const bool climbFaceLock =
-              ledgeHangActive || ledgeClimbT >= 0.f || ladderClimbActive || wallClimbActive;
-          // First-person: free-look yaw for normal locomotion; lock to climb/ledge face while climbing.
-          avYawDraw = climbFaceLock ? avYaw : std::atan2(std::cos(yaw), std::sin(yaw));
+          // Computed avYaw already includes fpLocoAvatarYawFlip for normal locomotion; climbing paths above
+          // use ledge normals / hang yaw (flip stays 0 outside main ground integration).
+          avYawDraw = avYaw;
           fpAvatarYawSmooth = avYawDraw;
         }
         const float avRoll = 0.f;
@@ -12852,11 +13168,226 @@ struct App {
           vkCmdDraw(cmd, employeeVertexCount, static_cast<uint32_t>(nNpc), 0, 0);
         }
         {
-          pushStaff.staffShade.x = 0.f;
+          // FP mesh clip discards fragments near the eye (shader.frag). Shimmy motion brings arms/torso
+          // much closer, which can discard most of the body — relax clipping like remote-player draws.
+          const auto clipIsShimmy = [&](int c) {
+            return (avClipShimmyLeft >= 0 && c == avClipShimmyLeft) ||
+                   (avClipShimmyRight >= 0 && c == avClipShimmyRight);
+          };
+          const bool fpBodyHangShimmyWideClip =
+              ledgeHangActive &&
+              (ledgeHangShimmyDir != 0 || clipIsShimmy(avClip) ||
+               (playerAvatarClipBlend < 1.f - 1e-4f && clipIsShimmy(blendFrom)));
+          pushStaff.staffShade.x = fpBodyHangShimmyWideClip ? 1.f : 0.f;
           pushStaff.staffShade.y = 0.f;
           pushStaff.staffShade.w = 1.f;
           vkCmdPushConstants(cmd, pipelineLayout, pushVF, 0, sizeof(PushModel), &pushStaff);
           vkCmdDraw(cmd, employeeVertexCount, 1, 0, static_cast<uint32_t>(avSlot));
+        }
+        if (netMp.active && netMp.remoteValid(3.f) &&
+            static_cast<size_t>(kRemotePlayerStaffSlotIndex) < static_cast<size_t>(kStaffSkinnedInstanceSlots)) {
+          const RetroMpWirePacket& R = netMp.lastRemote;
+          const double ageSecRaw = std::max(0.0, retroMpMonotonicSec() - netMp.lastRecvMono);
+          const float netAgeSec = static_cast<float>(glm::clamp(ageSecRaw, 0.0, 0.18));
+          // Keep remote body exactly on sender snapshots (no velocity extrapolation drift).
+          const glm::vec3 rcam(R.camX, R.camY, R.camZ);
+          const float feetYrRaw = rcam.y - R.eyeHeight;
+          float peerBodyYawFlip = 0.f;
+          if (!(R.emoteFlags & kRetroMpEmoteDeath)) {
+            const glm::vec2 peerFwd(std::cos(R.yaw), std::sin(R.yaw));
+            const glm::vec2 hv(R.horizVelX, R.horizVelZ);
+            const float hvs = glm::length(hv);
+            if (hvs > 0.08f) {
+              const glm::vec2 hvn = hv * (1.f / hvs);
+              if (glm::dot(hvn, peerFwd) < -0.32f)
+                peerBodyYawFlip = glm::pi<float>();
+            }
+          }
+          float avYawPeer =
+              std::atan2(std::cos(R.yaw + peerBodyYawFlip), std::sin(R.yaw + peerBodyYawFlip));
+          const float avPitchPeer =
+              std::clamp(-R.pitch * kFpBodyPitchFollow, -kFpBodyPitchMaxTilt, kFpBodyPitchMaxTilt);
+          const size_t peerSlot = static_cast<size_t>(kRemotePlayerStaffSlotIndex);
+          double phRaw = 0.;
+          std::memcpy(&phRaw, &R.locoPhaseBits, sizeof(double));
+          const bool remoteDeath = (R.emoteFlags & kRetroMpEmoteDeath) != 0u;
+          const uint8_t deathAux = R.emoteReserved0;
+          const uint8_t animTag = R.emoteReserved1;
+          const uint8_t animTagFrom = R.emoteReserved2;
+          double phToPeer = phRaw;
+          int cr = R.avatarClip;
+          int c0 = R.blendFromClip;
+          if (cr < 0 || static_cast<size_t>(cr) >= staffRig.clips.size())
+            cr = 0;
+          if (c0 < 0 || static_cast<size_t>(c0) >= staffRig.clips.size())
+            c0 = 0;
+          float clipBlendPeer = R.clipBlend;
+          bool loopFromPeer = true;
+          bool loopToPeer = true;
+          if (remoteDeath) {
+            const int clipKind = static_cast<int>(deathAux & kRetroMpDeathAuxClipMask);
+            float fracEnd = kPlayerDeathFallClipPortion;
+            int deathClip = -1;
+            if (clipKind == static_cast<int>(kRetroMpDeathAuxClipMeleeFall) && staffClipMeleeFall >= 0)
+              deathClip = staffClipMeleeFall;
+            else if (clipKind == static_cast<int>(kRetroMpDeathAuxClipLand) && avClipLand >= 0) {
+              deathClip = avClipLand;
+              fracEnd = kPlayerDeathLandClipPortion;
+            } else if (clipKind == static_cast<int>(kRetroMpDeathAuxClipNone))
+              deathClip = avClipIdle >= 0 ? avClipIdle : 0;
+            else if (staffClipMeleeFall >= 0)
+              deathClip = staffClipMeleeFall;
+            else if (avClipLand >= 0) {
+              deathClip = avClipLand;
+              fracEnd = kPlayerDeathLandClipPortion;
+            } else
+              deathClip = avClipIdle >= 0 ? avClipIdle : 0;
+            if (deathClip < 0 || static_cast<size_t>(deathClip) >= staffRig.clips.size())
+              deathClip = 0;
+            cr = deathClip;
+            c0 = cr;
+            clipBlendPeer = 1.f;
+            loopFromPeer = false;
+            loopToPeer = false;
+            const double dur = staff_skin::clipDuration(staffRig, cr);
+            const double endT = dur * static_cast<double>(fracEnd);
+            const double capEnd = std::max(1e-6, std::min(endT, dur - 1e-6));
+            phToPeer = std::clamp(phToPeer, 0.0, capEnd);
+          } else {
+            auto mapAnimTagToClip = [&](uint8_t tag) -> int {
+              if (tag == kRetroMpAnimTagJump) return avClipJump;
+              if (tag == kRetroMpAnimTagJumpRun) return avClipJumpRun;
+              if (tag == kRetroMpAnimTagLedgeClimb) return avClipLedgeClimb;
+              if (tag == kRetroMpAnimTagShimmyLeft) return avClipShimmyLeft;
+              if (tag == kRetroMpAnimTagShimmyRight) return avClipShimmyRight;
+              if (tag == kRetroMpAnimTagDanceProximity && staffClipShrekProximityDance >= 0)
+                return staffClipShrekProximityDance;
+              if (tag == kRetroMpAnimTagKick) return staffClipMeleeKick;
+              if (tag == kRetroMpAnimTagIdle) return avClipIdle;
+              if (tag == kRetroMpAnimTagWalk) return avClipWalk;
+              if (tag == kRetroMpAnimTagSprint) return avClipSprint;
+              if (tag == kRetroMpAnimTagCrouchFwd) return avClipCrouchFwd;
+              if (tag == kRetroMpAnimTagCrouchBack) return avClipCrouchBack;
+              if (tag == kRetroMpAnimTagCrouchLeft) return avClipCrouchLeft;
+              if (tag == kRetroMpAnimTagCrouchRight) return avClipCrouchRight;
+              if (tag == kRetroMpAnimTagCrouchIdle) return avClipCrouchIdleBow;
+              if (tag == kRetroMpAnimTagLand) return avClipLand;
+              if (tag == kRetroMpAnimTagLedgeGrab) return avClipLedgeGrab;
+              if (tag == kRetroMpAnimTagStepPush) return avClipStepPush;
+              if (tag == kRetroMpAnimTagSlideRight) return avClipSlideRight;
+              if (tag == kRetroMpAnimTagSlideLight) return avClipSlideLight;
+              return -1;
+            };
+            if ((R.emoteFlags & kRetroMpEmoteDance) != 0u) {
+              int dancePick = staffClipShrekProximityDance;
+              if (!(dancePick >= 0 && static_cast<size_t>(dancePick) < staffRig.clips.size()))
+                dancePick = -1;
+              if (dancePick < 0) {
+                const uint8_t tagTry =
+                    animTag != kRetroMpAnimTagNone ? animTag : kRetroMpAnimTagDanceProximity;
+                dancePick = mapAnimTagToClip(tagTry);
+              }
+              cr = dancePick >= 0 ? dancePick : (avClipIdle >= 0 ? avClipIdle : 0);
+              c0 = cr;
+              clipBlendPeer = 1.f;
+              loopFromPeer = peerAvatarClipLoopsDefault(c0);
+              loopToPeer = peerAvatarClipLoopsDefault(cr);
+            } else {
+              const int mapped = mapAnimTagToClip(animTag);
+              const int mappedFrom = mapAnimTagToClip(animTagFrom);
+              if (mapped >= 0 && static_cast<size_t>(mapped) < staffRig.clips.size()) {
+                cr = mapped;
+                if (mappedFrom >= 0 && static_cast<size_t>(mappedFrom) < staffRig.clips.size())
+                  c0 = mappedFrom;
+                else
+                  c0 = mapped;
+                loopFromPeer = peerAvatarClipLoopsDefault(c0);
+                loopToPeer = peerAvatarClipLoopsDefault(cr);
+                if (!loopToPeer || !loopFromPeer || c0 == cr)
+                  clipBlendPeer = 1.f;
+              } else {
+                loopFromPeer = peerAvatarClipLoopsDefault(c0);
+                loopToPeer = peerAvatarClipLoopsDefault(cr);
+              }
+            }
+            // Match single-player timing: extrapolate only looping states.
+            const bool remoteDance = (R.emoteFlags & kRetroMpEmoteDance) != 0u;
+            bool allowPhaseExtrapolation = false;
+            if (remoteDance)
+              allowPhaseExtrapolation = true;
+            else if (clipBlendPeer < 1.f - 1e-4f)
+              allowPhaseExtrapolation = loopFromPeer && loopToPeer;
+            else
+              allowPhaseExtrapolation = loopToPeer;
+            if (allowPhaseExtrapolation)
+              phToPeer += static_cast<double>(netAgeSec);
+          }
+          const float pqPeer =
+              glm::clamp(parkourPs1PresentMix * kPs1PlayerPhaseFromParkourMul, 0.f, 1.f);
+          double phToUse = phToPeer;
+          double phFromUse = phToPeer;
+          if (!remoteDeath && c0 != cr && clipBlendPeer < 1.f - 1e-4f && peerAvatarClipLoopsDefault(c0) &&
+              peerAvatarClipLoopsDefault(cr)) {
+            // Locomotion crossfade: same heuristic as local palette (from timeline half-scaled vs to).
+            phFromUse = phToPeer * 0.5;
+          }
+          const double phToQp = ps1QuantizeClipPhase(phToUse, pqPeer);
+          const double phFromQp = ps1QuantizeClipPhase(phFromUse, pqPeer);
+          const auto clipFeetSinkPeer = [&](int c) -> float {
+            if (c < 0)
+              return 0.f;
+            if ((avClipSlideRight >= 0 && c == avClipSlideRight) ||
+                (avClipSlideLight >= 0 && c == avClipSlideLight))
+              return kAvatarSlideFeetVisualDown;
+            if (avClipCrouchIdleBow >= 0 && c == avClipCrouchIdleBow)
+              return kAvatarCrouchIdleBowFeetVisualDown;
+            if ((avClipCrouchFwd >= 0 && c == avClipCrouchFwd) ||
+                (avClipCrouchBack >= 0 && c == avClipCrouchBack) ||
+                (avClipCrouchLeft >= 0 && c == avClipCrouchLeft) ||
+                (avClipCrouchRight >= 0 && c == avClipCrouchRight))
+              return kAvatarCrouchWalkFeetVisualDown;
+            if (avClipLedgeClimb >= 0 && c == avClipLedgeClimb)
+              return kAvatarLedgeClimbFeetVisualDown;
+            if ((avClipShimmyLeft >= 0 && c == avClipShimmyLeft) ||
+                (avClipShimmyRight >= 0 && c == avClipShimmyRight))
+              return kAvatarLedgeClimbFeetVisualDown;
+            return 0.f;
+          };
+          const float sinkPeer = glm::mix(clipFeetSinkPeer(c0), clipFeetSinkPeer(cr), clipBlendPeer);
+          const glm::mat4 avPeerM =
+              glm::translate(glm::mat4(1.f), glm::vec3(rcam.x, feetYrRaw - sinkPeer, rcam.z)) *
+              glm::rotate(glm::mat4(1.f), avYawPeer, glm::vec3(0.f, 1.f, 0.f));
+          *reinterpret_cast<glm::mat4*>(static_cast<char*>(employeeInstanceMapped) +
+                                        sizeof(glm::mat4) * peerSlot) = avPeerM;
+          if (clipBlendPeer < 1.f - 1e-4f) {
+            staff_skin::computePaletteLerp(staffRig, c0, phFromQp, loopFromPeer, cr, phToQp, loopToPeer,
+                                           clipBlendPeer, palettes + peerSlot * kStaffPaletteBoneCount);
+          } else {
+            staff_skin::computePalette(staffRig, cr, phToQp, palettes + peerSlot * kStaffPaletteBoneCount,
+                                       loopToPeer);
+          }
+          if (!fpHeadTiltBoneIndices.empty() && std::abs(avPitchPeer) > 1e-5f) {
+            const int pivotIdx = fpNeckBoneIdx >= 0 ? fpNeckBoneIdx : fpHeadBoneIdx;
+            const glm::vec3 pivotBind = (pivotIdx == fpNeckBoneIdx) ? fpNeckBindPos : fpHeadBindPos;
+            const glm::mat4& pivotPal =
+                palettes[peerSlot * kStaffPaletteBoneCount + static_cast<size_t>(pivotIdx)];
+            const glm::vec3 pivotPos = glm::vec3(pivotPal * glm::vec4(pivotBind, 1.f));
+            const glm::mat4 tiltM =
+                glm::translate(glm::mat4(1.f), pivotPos) *
+                glm::rotate(glm::mat4(1.f), avPitchPeer, glm::vec3(1.f, 0.f, 0.f)) *
+                glm::translate(glm::mat4(1.f), -pivotPos);
+            for (int idx : fpHeadTiltBoneIndices) {
+              auto& pal = palettes[peerSlot * kStaffPaletteBoneCount + static_cast<size_t>(idx)];
+              pal = tiltM * pal;
+            }
+          }
+          // Remote player: grey style, but never use local first-person body clipping.
+          pushStaff.staffShade.x = 1.f;
+          pushStaff.staffShade.y = 0.f;
+          pushStaff.staffShade.w = 1.f;
+          vkCmdPushConstants(cmd, pipelineLayout, pushVF, 0, sizeof(PushModel), &pushStaff);
+          vkCmdDraw(cmd, employeeVertexCount, 1, 0, static_cast<uint32_t>(peerSlot));
+          pushStaff.staffShade = glm::vec4(0.f);
         }
 #if defined(VULKAN_GAME_SHREK_EGG_GLB)
         if (shrekEggAssetLoaded && shrekEggActive && shrekEggVertexCount > 0u &&
@@ -12996,7 +13527,11 @@ struct App {
     if (!inTitleMenu && healthHudVertexMapped != nullptr && healthHudVertexBuffer != VK_NULL_HANDLE) {
       constexpr float kHudHpCacheEps = 0.01f;
       constexpr float kHudYawCacheEps = 0.0025f;
+      constexpr float kHudPosCacheEps = 0.08f;
       const int curDayCount = audioGetDayCount();
+      const bool hasRemotePlayer = netMp.active && netMp.remoteValid(3.f);
+      const float remoteX = hasRemotePlayer ? netMp.lastRemote.camX : 0.f;
+      const float remoteZ = hasRemotePlayer ? netMp.lastRemote.camZ : 0.f;
       const bool canShowInteractHint =
           !showPauseMenu && !showInventoryMenu && !showControlsOverlay && !playerDeathActive && !inTitleMenu &&
           canPickupNearbyDeliFood();
@@ -13007,16 +13542,27 @@ struct App {
           std::fabs(playerHunger - healthHudCacheHunger) > kHudHpCacheEps ||
           std::fabs(kPlayerHungerMax - healthHudCacheHungerMax) > kHudHpCacheEps ||
           std::fabs(yaw - healthHudCacheYaw) > kHudYawCacheEps ||
+          std::fabs(camPos.x - healthHudCacheSelfX) > kHudPosCacheEps ||
+          std::fabs(camPos.z - healthHudCacheSelfZ) > kHudPosCacheEps ||
+          hasRemotePlayer != healthHudCacheHasRemote ||
+          (hasRemotePlayer && (std::fabs(remoteX - healthHudCacheRemoteX) > kHudPosCacheEps ||
+                               std::fabs(remoteZ - healthHudCacheRemoteZ) > kHudPosCacheEps)) ||
           curDayCount != healthHudCacheDayCount ||
           canShowInteractHint != healthHudCacheInteractHint;
       if (hudDirty) {
         buildHealthHudOverlayVertices(playerHealth, kPlayerHealthMax, playerHunger, kPlayerHungerMax, yaw,
-                                      curDayCount, canShowInteractHint, healthHudVertexCache);
+                                      camPos.x, camPos.z, hasRemotePlayer, remoteX, remoteZ, curDayCount,
+                                      canShowInteractHint, healthHudVertexCache);
         healthHudCacheHp = playerHealth;
         healthHudCacheHpMax = kPlayerHealthMax;
         healthHudCacheHunger = playerHunger;
         healthHudCacheHungerMax = kPlayerHungerMax;
         healthHudCacheYaw = yaw;
+        healthHudCacheSelfX = camPos.x;
+        healthHudCacheSelfZ = camPos.z;
+        healthHudCacheHasRemote = hasRemotePlayer;
+        healthHudCacheRemoteX = remoteX;
+        healthHudCacheRemoteZ = remoteZ;
         healthHudCacheDayCount = curDayCount;
         healthHudCacheInteractHint = canShowInteractHint;
         healthHudCachedVertexCount = static_cast<uint32_t>(healthHudVertexCache.size());
@@ -13542,18 +14088,18 @@ struct App {
   bool tryHandleMenuClick(float ndcX, float ndcY, uint8_t mouseButton = SDL_BUTTON_LEFT) {
     if (showControlsOverlay)
       return false;
-    const float padY = 0.014f;
     const auto rowHit = [&](const UiMenuClickLayout& L, int rowIndex) -> bool {
+      if (rowIndex < 0 || rowIndex >= L.optionLines)
+        return false;
       if (ndcX < -L.panelHalfW || ndcX > L.panelHalfW)
         return false;
       const float step = std::max(L.lineSkipNdc, 1e-4f);
-      const float rel = (L.line2Y - ndcY) / step;
-      const int nearest = static_cast<int>(std::lround(rel));
-      // Keep each clickable band non-overlapping; only accept clicks near a row center.
-      const float tol = 0.43f + padY / step;
-      if (std::fabs(rel - static_cast<float>(nearest)) > tol)
-        return false;
-      return nearest == rowIndex;
+      const float lineH = std::max(L.lineHeightNdc, 1e-4f);
+      const float baselineY = L.line2Y - static_cast<float>(rowIndex) * step;
+      // Match appendOptionBtnQuads() so clickable chips align with rendered chips.
+      const float centerY = baselineY + lineH * 0.17f;
+      const float halfH = lineH * 1.02f + 0.014f;
+      return ndcY >= (centerY - halfH) && ndcY <= (centerY + halfH);
     };
     if (inTitleMenu) {
       if (titleMenuPickSlot) {
@@ -13612,6 +14158,8 @@ struct App {
     if (playerDeathShowMenu) {
       const UiMenuClickLayout L = computeDeathMenuClickLayout();
       if (rowHit(L, 0)) {
+        if (netMp.active)
+          netMp.sendDeathRetry();
         respawnPlayerAfterDeath();
         return true;
       }
@@ -13622,8 +14170,14 @@ struct App {
       return false;
     }
     if (showPauseMenu) {
-      const UiMenuClickLayout L = computePauseMenuClickLayout();
+      char hostB[96];
+      std::snprintf(hostB, sizeof hostB, "HOST SESSION (UDP %u)", static_cast<unsigned>(kRetroMpDefaultPort));
+      char ipL[128];
+      std::snprintf(ipL, sizeof ipL, "IP %s", pauseMenuJoinIpBuf);
+      const UiMenuClickLayout L = computePauseMenuClickLayout(pauseMenuMpStatusCstr(), hostB, ipL);
       if (rowHit(L, 0)) {
+        pauseMenuMpIpFocused = false;
+        SDL_StopTextInput();
         showPauseMenu = false;
         audioSetStoreDayNightCyclePaused(false);
         mouseGrab = true;
@@ -13631,8 +14185,46 @@ struct App {
         return true;
       }
       if (rowHit(L, 1)) {
+        pauseMenuMpIpFocused = false;
+        SDL_StopTextInput();
         gameSaveWrite();
         returnToTitleMenuFromGame();
+        return true;
+      }
+      if (rowHit(L, 2)) {
+        pauseMenuMpIpFocused = false;
+        SDL_StopTextInput();
+        mpClientSpawnSynced = false;
+        mpClientLastLinkMono = -1.0;
+        netMp.startHost(kRetroMpDefaultPort);
+        recreatePauseMenuGpuMesh();
+        return true;
+      }
+      if (rowHit(L, 3)) {
+        pauseMenuMpIpFocused = false;
+        SDL_StopTextInput();
+        char joinIp[128]{};
+        uint16_t joinPort = kRetroMpDefaultPort;
+        if (parseJoinTargetIpPort(pauseMenuJoinIpBuf, joinIp, sizeof(joinIp), joinPort))
+          mpClientSpawnSynced = false, mpClientLastLinkMono = -1.0,
+          netMp.startJoin(joinIp, joinPort);
+        else
+          std::fprintf(stderr, "[mp] Join target invalid. Use IPv4 or IPv4:port (e.g. 192.168.1.10:27341).\n");
+        recreatePauseMenuGpuMesh();
+        return true;
+      }
+      if (rowHit(L, 4)) {
+        pauseMenuMpIpFocused = false;
+        SDL_StopTextInput();
+        mpClientSpawnSynced = false;
+        mpClientLastLinkMono = -1.0;
+        netMp.stop();
+        recreatePauseMenuGpuMesh();
+        return true;
+      }
+      if (rowHit(L, 5)) {
+        pauseMenuMpIpFocused = true;
+        SDL_StartTextInput();
         return true;
       }
       return false;
@@ -13700,6 +14292,67 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
   // Deterministic 2x2 split per deli cluster: two pizza counters, two meatball counters.
   return ((da + dl) & 1) == 0;
 }
+
+  int deliPizzaSlicesOnHostMaps(uint64_t k) const {
+    auto it = deliPizzaSlicesBySlot.find(k);
+    if (it != deliPizzaSlicesBySlot.end())
+      return static_cast<int>(it->second);
+    auto rt = deliPizzaReplenishTimerBySlot.find(k);
+    if (rt != deliPizzaReplenishTimerBySlot.end() && rt->second > 0.f)
+      return 0;
+    return kDeliPizzaSlicesPerCounter;
+  }
+  int deliMeatballsOnHostMaps(uint64_t k) const {
+    auto it = deliMeatballsBySlot.find(k);
+    if (it != deliMeatballsBySlot.end())
+      return static_cast<int>(it->second);
+    auto rt = deliMeatballReplenishTimerBySlot.find(k);
+    if (rt != deliMeatballReplenishTimerBySlot.end() && rt->second > 0.f)
+      return 0;
+    return kDeliMeatballsPerCounter;
+  }
+  int deliPizzaSlicesRemainingForLocalPlayer(int worldAisleI, int worldAlongI) const {
+    const uint64_t k = deliPizzaSlotKey(worldAisleI, worldAlongI);
+    int base = deliPizzaSlicesOnHostMaps(k);
+    if (netMp.active && !netMp.isHost) {
+      auto d = mpClientDeliLocalTakePizza.find(k);
+      if (d != mpClientDeliLocalTakePizza.end())
+        base -= static_cast<int>(d->second);
+    }
+    return std::max(0, base);
+  }
+  int deliMeatballsRemainingForLocalPlayer(int worldAisleI, int worldAlongI) const {
+    const uint64_t k = deliPizzaSlotKey(worldAisleI, worldAlongI);
+    int base = deliMeatballsOnHostMaps(k);
+    if (netMp.active && !netMp.isHost) {
+      auto d = mpClientDeliLocalTakeMeat.find(k);
+      if (d != mpClientDeliLocalTakeMeat.end())
+        base -= static_cast<int>(d->second);
+    }
+    return std::max(0, base);
+  }
+  void clampMpClientDeliLocalTakesAfterWorldSync() {
+    if (!netMp.active || netMp.isHost)
+      return;
+    for (auto it = mpClientDeliLocalTakePizza.begin(); it != mpClientDeliLocalTakePizza.end();) {
+      const int cap = deliPizzaSlicesOnHostMaps(it->first);
+      if (static_cast<int>(it->second) > cap)
+        it->second = static_cast<uint8_t>(glm::clamp(cap, 0, 255));
+      if (it->second == 0)
+        it = mpClientDeliLocalTakePizza.erase(it);
+      else
+        ++it;
+    }
+    for (auto it = mpClientDeliLocalTakeMeat.begin(); it != mpClientDeliLocalTakeMeat.end();) {
+      const int cap = deliMeatballsOnHostMaps(it->first);
+      if (static_cast<int>(it->second) > cap)
+        it->second = static_cast<uint8_t>(glm::clamp(cap, 0, 255));
+      if (it->second == 0)
+        it = mpClientDeliLocalTakeMeat.erase(it);
+      else
+        ++it;
+    }
+  }
 
   int deliPizzaSlicesRemaining(int worldAisleI, int worldAlongI) {
     const uint64_t k = deliPizzaSlotKey(worldAisleI, worldAlongI);
@@ -13775,8 +14428,9 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
         if (!deliBarSlotOccupied(wa, wl))
           continue;
         const bool meatballCounter = deliCounterUsesMeatballs(wa, wl);
-        const int pizzaRem = meatballCounter ? 0 : deliPizzaSlicesRemaining(wa, wl);
-        const int meatRem = meatballCounter ? deliMeatballsRemaining(wa, wl) : 0;
+        const int pizzaRem = meatballCounter ? 0 : deliPizzaSlicesRemainingForLocalPlayer(wa, wl);
+        const int meatRem =
+            meatballCounter ? deliMeatballsRemainingForLocalPlayer(wa, wl) : 0;
         if (pizzaRem <= 0 && meatRem <= 0)
           continue;
         const float cx = (static_cast<float>(wa) + 0.5f) * kShelfAisleModulePitch;
@@ -13797,28 +14451,54 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
 
     const uint64_t k = deliPizzaSlotKey(bestWa, bestWl);
     const bool meatballCounter = deliCounterUsesMeatballs(bestWa, bestWl);
-    int pizzaRem = 0;
-    auto itPz = deliPizzaSlicesBySlot.find(k);
-    if (itPz != deliPizzaSlicesBySlot.end())
-      pizzaRem = static_cast<int>(itPz->second);
-    int meatRem = 0;
-    auto itMb = deliMeatballsBySlot.find(k);
-    if (itMb != deliMeatballsBySlot.end())
-      meatRem = static_cast<int>(itMb->second);
+    const int pizzaRem = !meatballCounter ? deliPizzaSlicesRemainingForLocalPlayer(bestWa, bestWl) : 0;
+    const int meatRem = meatballCounter && gDeliMeatballMeshLoaded
+                            ? deliMeatballsRemainingForLocalPlayer(bestWa, bestWl)
+                            : 0;
     const bool canPickupPizza = !meatballCounter && pizzaRem > 0;
     const bool canPickupMeatball = meatballCounter && gDeliMeatballMeshLoaded && meatRem > 0;
     if (!canPickupPizza && !canPickupMeatball)
       return false;
-    if (canPickupPizza && itPz != deliPizzaSlicesBySlot.end()) {
-      --itPz->second;
-      deliPizzaReplenishTimerBySlot[k] = kDeliPizzaReplenishSec;
-      inventoryItems.emplace_back("PIZZA SLICE");
-    } else if (canPickupMeatball && itMb != deliMeatballsBySlot.end()) {
-      --itMb->second;
-      deliMeatballReplenishTimerBySlot[k] = kDeliPizzaReplenishSec;
-      inventoryItems.emplace_back("MEATBALL");
+
+    const bool isNetClient = netMp.active && !netMp.isHost;
+    if (!isNetClient) {
+      if (canPickupPizza) {
+        deliPizzaSlicesRemaining(bestWa, bestWl);
+        auto itPz = deliPizzaSlicesBySlot.find(k);
+        if (itPz == deliPizzaSlicesBySlot.end() || itPz->second == 0)
+          return false;
+        --itPz->second;
+        deliPizzaReplenishTimerBySlot[k] = kDeliPizzaReplenishSec;
+        inventoryItems.emplace_back("PIZZA SLICE");
+      } else if (canPickupMeatball) {
+        deliMeatballsRemaining(bestWa, bestWl);
+        auto itMb = deliMeatballsBySlot.find(k);
+        if (itMb == deliMeatballsBySlot.end() || itMb->second == 0)
+          return false;
+        --itMb->second;
+        deliMeatballReplenishTimerBySlot[k] = kDeliPizzaReplenishSec;
+        inventoryItems.emplace_back("MEATBALL");
+      } else {
+        return false;
+      }
     } else {
-      return false;
+      RetroMpDeliPickupPacket dp{};
+      dp.seq = ++mpClientDeliPickupSeq;
+      dp.deliSlotKey = k;
+      dp.camX = camPos.x;
+      dp.camZ = camPos.z;
+      if (canPickupPizza) {
+        dp.foodKind = kRetroMpDeliPickupPizza;
+        ++mpClientDeliLocalTakePizza[k];
+        inventoryItems.emplace_back("PIZZA SLICE");
+      } else if (canPickupMeatball) {
+        dp.foodKind = kRetroMpDeliPickupMeat;
+        ++mpClientDeliLocalTakeMeat[k];
+        inventoryItems.emplace_back("MEATBALL");
+      } else {
+        return false;
+      }
+      netMp.sendDeliPickupRequest(dp);
     }
     ++inventoryRevision;
     const int maxScroll = std::max(0, inventoryStackRowCount() - 8);
@@ -13836,31 +14516,10 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
         if (!deliBarSlotOccupied(wa, wl))
           continue;
         const bool meatballCounter = deliCounterUsesMeatballs(wa, wl);
-        const uint64_t k = deliPizzaSlotKey(wa, wl);
-        int pizzaRem = 0;
-        if (!meatballCounter) {
-          pizzaRem = kDeliPizzaSlicesPerCounter;
-          auto pz = deliPizzaSlicesBySlot.find(k);
-          if (pz != deliPizzaSlicesBySlot.end()) {
-            pizzaRem = static_cast<int>(pz->second);
-          } else {
-            auto pt = deliPizzaReplenishTimerBySlot.find(k);
-            if (pt != deliPizzaReplenishTimerBySlot.end() && pt->second > 0.f)
-              pizzaRem = 0;
-          }
-        }
-        int meatRem = 0;
-        if (meatballCounter && gDeliMeatballMeshLoaded) {
-          meatRem = kDeliMeatballsPerCounter;
-          auto mb = deliMeatballsBySlot.find(k);
-          if (mb != deliMeatballsBySlot.end()) {
-            meatRem = static_cast<int>(mb->second);
-          } else {
-            auto mt = deliMeatballReplenishTimerBySlot.find(k);
-            if (mt != deliMeatballReplenishTimerBySlot.end() && mt->second > 0.f)
-              meatRem = 0;
-          }
-        }
+        const int pizzaRem = !meatballCounter ? deliPizzaSlicesRemainingForLocalPlayer(wa, wl) : 0;
+        const int meatRem =
+            meatballCounter && gDeliMeatballMeshLoaded ? deliMeatballsRemainingForLocalPlayer(wa, wl)
+                                                        : 0;
         if (pizzaRem <= 0 && meatRem <= 0)
           continue;
         const float cx = (static_cast<float>(wa) + 0.5f) * kShelfAisleModulePitch;
@@ -13882,6 +14541,81 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       framebufferResized = true;
     if (inLoadingScreen)
       return;
+    if (e.type == SDL_TEXTINPUT && showPauseMenu && pauseMenuMpIpFocused) {
+      for (const char* p = e.text.text; *p; ++p) {
+        const unsigned char uc = static_cast<unsigned char>(*p);
+        if (uc <= 127u && (std::isdigit(static_cast<int>(uc)) || uc == '.' || uc == ':')) {
+          const size_t len = std::strlen(pauseMenuJoinIpBuf);
+          if (len + 1u < sizeof(pauseMenuJoinIpBuf)) {
+            pauseMenuJoinIpBuf[len] = static_cast<char>(uc);
+            pauseMenuJoinIpBuf[len + 1u] = '\0';
+          }
+        }
+      }
+      recreatePauseMenuGpuMesh();
+      return;
+    }
+    if (e.type == SDL_KEYDOWN && showPauseMenu && !pauseMenuMpIpFocused) {
+      const SDL_Keycode sym = e.key.keysym.sym;
+      if ((sym == SDLK_i || sym == SDLK_F2) && e.key.repeat == 0) {
+        pauseMenuMpIpFocused = true;
+        // Default loopback value is convenient for local testing but annoying when typing a real host.
+        if (std::strcmp(pauseMenuJoinIpBuf, "127.0.0.1") == 0)
+          pauseMenuJoinIpBuf[0] = '\0';
+        SDL_StartTextInput();
+        recreatePauseMenuGpuMesh();
+        return;
+      }
+    }
+    if (e.type == SDL_KEYDOWN && showPauseMenu && pauseMenuMpIpFocused) {
+      const SDL_Keycode sym = e.key.keysym.sym;
+      if ((sym == SDLK_v) && (e.key.keysym.mod & KMOD_CTRL)) {
+        if (char* clip = SDL_GetClipboardText()) {
+          for (const char* p = clip; *p; ++p) {
+            const unsigned char uc = static_cast<unsigned char>(*p);
+            if (uc <= 127u && (std::isdigit(static_cast<int>(uc)) || uc == '.' || uc == ':')) {
+              const size_t len = std::strlen(pauseMenuJoinIpBuf);
+              if (len + 1u < sizeof(pauseMenuJoinIpBuf)) {
+                pauseMenuJoinIpBuf[len] = static_cast<char>(uc);
+                pauseMenuJoinIpBuf[len + 1u] = '\0';
+              }
+            }
+          }
+          SDL_free(clip);
+          recreatePauseMenuGpuMesh();
+        }
+        return;
+      }
+      if (sym == SDLK_BACKSPACE) {
+        const size_t len = std::strlen(pauseMenuJoinIpBuf);
+        if (len > 0u)
+          pauseMenuJoinIpBuf[len - 1u] = '\0';
+        recreatePauseMenuGpuMesh();
+        return;
+      }
+      if (sym == SDLK_ESCAPE && e.key.repeat == 0) {
+        pauseMenuMpIpFocused = false;
+        SDL_StopTextInput();
+        return;
+      }
+      if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) {
+        if (pauseMenuJoinIpBuf[0] != '\0')
+          {
+            char joinIp[128]{};
+            uint16_t joinPort = kRetroMpDefaultPort;
+            if (parseJoinTargetIpPort(pauseMenuJoinIpBuf, joinIp, sizeof(joinIp), joinPort))
+              mpClientSpawnSynced = false, mpClientLastLinkMono = -1.0,
+              netMp.startJoin(joinIp, joinPort);
+            else
+              std::fprintf(stderr, "[mp] Join target invalid. Use IPv4 or IPv4:port (e.g. 192.168.1.10:27341).\n");
+          }
+        pauseMenuMpIpFocused = false;
+        SDL_StopTextInput();
+        recreatePauseMenuGpuMesh();
+        return;
+      }
+      return;
+    }
     if (inIntroSplash && (e.type == SDL_KEYDOWN || e.type == SDL_MOUSEBUTTONDOWN)) {
       inIntroSplash = false;
       inTitleMenu = true;
@@ -14005,15 +14739,21 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
         }
       }
       if (playerDeathShowMenu) {
-        if (sym == SDLK_r || sym == SDLK_RETURN || sym == SDLK_KP_ENTER)
+        if (sym == SDLK_r || sym == SDLK_RETURN || sym == SDLK_KP_ENTER) {
+          if (netMp.active)
+            netMp.sendDeathRetry();
           respawnPlayerAfterDeath();
+        }
         else if (sym == SDLK_ESCAPE)
           returnToTitleMenuFromGame();
         return;
       }
       if (showPauseMenu) {
-        if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER ||
-            (sym == SDLK_ESCAPE && e.key.repeat == 0)) {
+        if (!pauseMenuMpIpFocused &&
+            (sym == SDLK_RETURN || sym == SDLK_KP_ENTER ||
+             (sym == SDLK_ESCAPE && e.key.repeat == 0))) {
+          pauseMenuMpIpFocused = false;
+          SDL_StopTextInput();
           showPauseMenu = false;
           audioSetStoreDayNightCyclePaused(false);
           mouseGrab = true;
@@ -14022,9 +14762,9 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
         return;
       }
       if (showInventoryMenu) {
-        if (sym == SDLK_UP || sym == SDLK_w)
+        if (sym == SDLK_UP)
           inventoryScrollRow = std::max(0, inventoryScrollRow - 1);
-        else if (sym == SDLK_DOWN || sym == SDLK_s)
+        else if (sym == SDLK_DOWN)
           ++inventoryScrollRow;
         else if (sym == SDLK_PAGEUP)
           inventoryScrollRow = std::max(0, inventoryScrollRow - 6);
@@ -14052,7 +14792,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
                  !showPauseMenu && e.key.repeat == 0) {
         showInventoryMenu = !showInventoryMenu;
         if (showInventoryMenu) {
-          audioSetStoreDayNightCyclePaused(true);
+          audioSetStoreDayNightCyclePaused(false);
           mouseGrab = false;
         } else {
           audioSetStoreDayNightCyclePaused(false);
@@ -14069,10 +14809,6 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
                      "[easter] Shrek easter egg disabled at build time: add vulkan_game/assets/models/"
                      "character/proximity_dance.glb (or set VULKAN_GAME_SHREK_EGG_GLB_PATH), reconfigure, rebuild.\n");
 #endif
-      } else if (!inTitleMenu && !showControlsOverlay && !playerDeathActive && !showInventoryMenu &&
-                 !showPauseMenu &&
-                 (e.key.keysym.scancode == SDL_SCANCODE_BACKSLASH || sym == SDLK_BACKSLASH)) {
-        spawnDeadRagdollStaffNearPlayer();
       } else if (showControlsOverlay &&
                  (sym == SDLK_w || sym == SDLK_a || sym == SDLK_s || sym == SDLK_d || sym == SDLK_z ||
                   sym == SDLK_SPACE || sym == SDLK_RETURN || sym == SDLK_KP_ENTER)) {
@@ -14089,11 +14825,15 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
         } else if (!playerDeathActive && !inTitleMenu && e.key.repeat == 0) {
           showPauseMenu = !showPauseMenu;
           if (showPauseMenu) {
-            audioSetStoreDayNightCyclePaused(true);
+            pauseMenuMpIpFocused = false;
+            audioSetStoreDayNightCyclePaused(false);
             mouseGrab = false;
             syncInputGrab();
             gameSaveWrite();
+            recreatePauseMenuGpuMesh();
           } else {
+            pauseMenuMpIpFocused = false;
+            SDL_StopTextInput();
             audioSetStoreDayNightCyclePaused(false);
             mouseGrab = true;
             syncInputGrab();
@@ -14115,6 +14855,26 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
         playerKickAnimRemain = 0.f;
         dropKickActive = false;
         dropKickTimer = 0.f;
+      } else if (!inTitleMenu && !showControlsOverlay && !playerDeathActive && !showPauseMenu &&
+                 !showInventoryMenu && sym == SDLK_SLASH && e.key.repeat == 0 && mouseGrab &&
+                 staffSkinnedActive) {
+        constexpr float kSlashImpactLin = 1.48f;
+        constexpr float kSlashImpactAng = 1.55f;
+        uint64_t dbgKey = 0;
+        float tHit = kStaffShoveMaxDist;
+        if (findStaffNpcCrosshairHit(dbgKey, tHit, kStaffShoveMaxDist)) {
+          ShelfEmployeeNpc* ep = shelfEmpFind(dbgKey);
+          if (ep != nullptr && ep->inited && !ep->staffDead) {
+            ep->staffHp = 0.f;
+            ep->staffDead = true;
+            const glm::vec2 awayRaw(ep->posXZ.x - camPos.x, ep->posXZ.y - camPos.z);
+            const glm::vec2 away =
+                glm::dot(awayRaw, awayRaw) > 1e-8f ? glm::normalize(awayRaw) : glm::vec2(0.f, 1.f);
+            staffNpcInitRagdollCorpse(*ep, away, dbgKey, kSlashImpactLin, kSlashImpactAng);
+          }
+        } else {
+          spawnDebugRagdollCorpseInView(kSlashImpactLin, kSlashImpactAng);
+        }
       }
     }
   }
@@ -15281,30 +16041,173 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     e.nightInvestigateTimer = 0.f;
   }
 
+  void staffNpcApplyMeleeFlinch(ShelfEmployeeNpc& e, const glm::vec2& awayFromPlayerXZ, uint64_t key) {
+    if (!staffSkinnedActive || staffRagdollChestBoneIdx < 0)
+      return;
+    const uint32_t h0 = static_cast<uint32_t>(key & 0xffffffffull);
+    const uint32_t h1 = static_cast<uint32_t>(key >> 32);
+    glm::vec2 away = awayFromPlayerXZ;
+    if (glm::dot(away, away) < 1e-8f)
+      away = glm::vec2(0.f, 1.f);
+    else
+      away = glm::normalize(away);
+    const float face = std::atan2(away.x, away.y);
+    const float jx =
+        (static_cast<float>(static_cast<int>(h0 % 97u)) / 48.5f - 1.f) * 0.24f;
+    const float jy =
+        (static_cast<float>(static_cast<int>(h1 % 89u)) / 44.5f - 1.f) * 0.19f;
+    const float jz =
+        (static_cast<float>(static_cast<int>((h0 ^ h1) % 71u)) / 35.5f - 1.f) * 0.31f;
+    e.staffFlinchEuler.x += glm::radians(15.f) + jx;
+    e.staffFlinchEuler.y += jy + 0.14f * std::sin(face * 2.f);
+    e.staffFlinchEuler.z += glm::radians(11.f) + jz;
+    constexpr float cap = 0.72f;
+    e.staffFlinchEuler.x = glm::clamp(e.staffFlinchEuler.x, -cap, cap);
+    e.staffFlinchEuler.y = glm::clamp(e.staffFlinchEuler.y, -cap, cap);
+    e.staffFlinchEuler.z = glm::clamp(e.staffFlinchEuler.z, -cap, cap);
+  }
+
+  void spawnDebugRagdollCorpseInView(float impactLinScale, float impactAngScale) {
+    if (!staffSkinnedActive)
+      return;
+    constexpr uint64_t kDbgKey = 0x51A501BEEF000001ull;
+    glm::vec3 ro, fwd, right, up;
+    getFirstPersonViewBasis(ro, fwd, right, up);
+    glm::vec2 f2(fwd.x, fwd.z);
+    const float fl = glm::length(f2);
+    if (fl < 1e-4f)
+      f2 = glm::vec2(std::cos(yaw), std::sin(yaw));
+    else
+      f2 *= 1.f / fl;
+    constexpr float kAheadM = 4.25f;
+    const glm::vec2 posXZ(camPos.x + f2.x * kAheadM, camPos.z + f2.y * kAheadM);
+    const float probeFeet = camPos.y - eyeHeight;
+    float feetY = terrainSupportY(posXZ.x, posXZ.y, probeFeet);
+    if (!std::isfinite(feetY) || feetY < kGroundY - 0.25f)
+      feetY = terrainSupportY(posXZ.x, posXZ.y, kGroundY + kStaffTerrainStepProbe);
+    if (!std::isfinite(feetY))
+      feetY = probeFeet;
+    ShelfEmployeeNpc& e = shelfEmpAcquire(kDbgKey);
+    if (e.inited && e.staffRp3dCorpse)
+      staff_rp3d::destroyCorpse(kDbgKey);
+    e.staffRp3dCorpse = false;
+    e.posXZ = posXZ;
+    e.feetWorldY = feetY;
+    e.yaw = std::atan2(f2.x, f2.y);
+    e.bodyScale = staffBodyScaleFromKey(kDbgKey);
+    e.staffClassArchetype = staffClassArchetypeFromKey(kDbgKey);
+    e.staffHpMax = staffClassMaxHp(e.staffClassArchetype);
+    e.staffHp = 0.f;
+    e.staffDead = true;
+    e.staffFlinchEuler = glm::vec3(0.f);
+    for (auto& v : e.staffRagdollEuler)
+      v = glm::vec3(0.f);
+    e.velXZ = glm::vec2(0.f);
+    e.staffVelY = 0.f;
+    e.staffShoveKnockbackVelXZ = glm::vec2(0.f);
+    e.inited = true;
+    staffNpcInitRagdollCorpse(e, f2, kDbgKey, impactLinScale, impactAngScale);
+  }
+
+  void staffNpcInitRagdollCorpse(ShelfEmployeeNpc& e, const glm::vec2& awayFromPlayerXZ, uint64_t key,
+                                float impactLinScale = 1.f, float impactAngScale = 1.f) {
+    e.staffRp3dCorpse = false;
+    for (auto& v : e.staffRagdollEuler)
+      v = glm::vec3(0.f);
+    e.staffFlinchEuler = glm::vec3(0.f);
+    if (staffSkinnedActive) {
+      glm::vec2 away = awayFromPlayerXZ;
+      glm::mat4 Gdeath[staff_skin::kMaxPaletteBones];
+      {
+        int clipIdx = 0;
+        double ph = 0.;
+        bool loopClip = true;
+        staffNpcResolveDrawAnim(e, key, audioAreStoreFluorescentsOn(), clipIdx, ph, loopClip);
+        std::array<glm::vec3, staff_skin::kMaxPaletteBones> flinchExtra{};
+        if (staffRagdollChestBoneIdx >= 0)
+          flinchExtra[static_cast<size_t>(staffRagdollChestBoneIdx)] = e.staffFlinchEuler;
+        staff_skin::sampleClipBoneGlobalMatrices(staffRig, clipIdx, ph, loopClip, flinchExtra.data(), Gdeath);
+      }
+      if (staff_rp3d::spawnCorpse(key, e.posXZ, e.feetWorldY, e.yaw, e.bodyScale, away, -kGravity,
+                                  kEmployeeVisualHeight, staffRig, Gdeath, impactLinScale,
+                                  impactAngScale)) {
+        e.staffRp3dCorpse = true;
+        e.meleeKnockdownFeetAnchorY = e.feetWorldY;
+        e.meleeState = 2;
+        e.meleePhaseSec = 0.0;
+        e.meleeAnimBlend = 1.f;
+        e.staffVelY = 0.f;
+        e.velXZ = glm::vec2(0.f);
+        e.staffShoveKnockbackVelXZ = glm::vec2(0.f);
+        return;
+      }
+    }
+    const uint32_t h0 = static_cast<uint32_t>(key & 0xffffffffull);
+    const uint32_t h1 = static_cast<uint32_t>(key >> 32);
+    auto rnd = [&](unsigned salt) -> float {
+      const uint32_t u =
+          scp3008ShelfHash(static_cast<int>(h0 ^ (salt * 0x9E3779B9u)), static_cast<int>(h1 ^ salt),
+                           static_cast<int>(0x8BADF00Du ^ (salt * 7u)));
+      return static_cast<float>(u & 4095u) * (1.f / 4095.f);
+    };
+    (void)awayFromPlayerXZ;
+    const float rollSign = rnd(1) > 0.5f ? 1.f : -1.f;
+    const float armMulL = 0.62f + 0.78f * rnd(2);
+    const float armMulR = 0.62f + 0.78f * rnd(3);
+    const float pelvisPitch = glm::radians(76.f + 20.f * rnd(4));
+    const float chestPitch = glm::radians(26.f + 24.f * rnd(5));
+    if (staffRagdollPelvisBoneIdx >= 0)
+      e.staffRagdollEuler[staffRagdollPelvisBoneIdx] =
+          glm::vec3(pelvisPitch, glm::radians(10.f) * (rnd(6) - 0.5f),
+                    glm::radians(24.f) * rollSign * rnd(7));
+    if (staffRagdollChestBoneIdx >= 0)
+      e.staffRagdollEuler[staffRagdollChestBoneIdx] =
+          glm::vec3(chestPitch, glm::radians(8.f) * (rnd(8) - 0.5f), 0.f);
+    if (staffRagdollNeckBoneIdx >= 0)
+      e.staffRagdollEuler[staffRagdollNeckBoneIdx] =
+          glm::vec3(glm::radians(-11.f + 28.f * rnd(9)), glm::radians(11.f) * (rnd(10) - 0.5f),
+                    glm::radians(20.f) * rollSign * rnd(11));
+    if (fpHeadBoneIdx >= 0)
+      e.staffRagdollEuler[fpHeadBoneIdx] =
+          glm::vec3(glm::radians(-16.f + 18.f * rnd(12)), 0.f,
+                    glm::radians(22.f) * rollSign * rnd(13));
+    if (staffRagdollUpperArmLBoneIdx >= 0)
+      e.staffRagdollEuler[staffRagdollUpperArmLBoneIdx] =
+          glm::vec3(glm::radians(11.f), glm::radians(-52.f) * armMulL, glm::radians(24.f));
+    if (staffRagdollUpperArmRBoneIdx >= 0)
+      e.staffRagdollEuler[staffRagdollUpperArmRBoneIdx] =
+          glm::vec3(glm::radians(11.f), glm::radians(52.f) * armMulR, glm::radians(-24.f));
+
+    e.meleeKnockdownFeetAnchorY = e.feetWorldY;
+    e.meleeState = 2;
+    e.meleePhaseSec = 0.0;
+    e.meleeAnimBlend = 1.f;
+    e.staffVelY = glm::mix(2.7f, 4.6f, rnd(14));
+  }
+
   bool applyStaffDamageFromPlayerHit(uint64_t key, ShelfEmployeeNpc& e, float damage) {
     if (e.staffHpMax <= 1e-4f) {
       e.staffClassArchetype = staffClassArchetypeFromKey(key);
       e.staffHpMax = staffClassMaxHp(e.staffClassArchetype);
       e.staffHp = e.staffHpMax;
       e.staffDead = false;
-      e.deadRagdollPitch = 0.f;
-      e.deadRagdollRoll = 0.f;
-      e.deadRagdollPitchVel = 0.f;
-      e.deadRagdollRollVel = 0.f;
-      e.deadRagdollYaw = e.yaw;
-      e.deadRagdollYawVel = 0.f;
-      shelfEmpResetDeadJointSim(e);
+      if (e.staffRp3dCorpse)
+        staff_rp3d::destroyCorpse(key);
+      e.staffRp3dCorpse = false;
+      e.staffFlinchEuler = glm::vec3(0.f);
+      for (auto& v : e.staffRagdollEuler)
+        v = glm::vec3(0.f);
     }
     if (e.staffDead)
       return false;
+    const glm::vec2 awayRaw(e.posXZ.x - camPos.x, e.posXZ.y - camPos.z);
+    const glm::vec2 away =
+        glm::dot(awayRaw, awayRaw) > 1e-8f ? glm::normalize(awayRaw) : glm::vec2(0.f, 1.f);
     if (e.meleeState >= 2) {
       e.staffHp = std::max(0.f, e.staffHp - damage * 0.35f);
       if (e.staffHp <= 1e-4f) {
         e.staffDead = true;
-        e.deadRagdollPitchVel += 1.4f;
-        e.deadRagdollRollVel += 0.7f;
-        e.deadRagdollYaw = e.yaw;
-        e.deadRagdollYawVel += ((key & 1ull) != 0ull) ? 2.8f : -2.8f;
+        staffNpcInitRagdollCorpse(e, away, key);
       }
       return false;
     }
@@ -15312,12 +16215,10 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     e.staffHp = std::max(0.f, e.staffHp - damage);
     if (e.staffHp <= 1e-4f) {
       e.staffDead = true;
-      e.deadRagdollPitchVel += 1.9f;
-      e.deadRagdollRollVel += 1.0f;
-      e.deadRagdollYaw = e.yaw;
-      e.deadRagdollYawVel += ((key & 2ull) != 0ull) ? 3.4f : -3.4f;
+      staffNpcInitRagdollCorpse(e, away, key);
       return true;
     }
+    staffNpcApplyMeleeFlinch(e, away, key);
     return false;
   }
 
@@ -15325,6 +16226,26 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
   void applyStaffShoveKnockdown(uint64_t key, ShelfEmployeeNpc& e, const glm::vec2& toKnockDirXZ) {
     if (!staffSkinnedActive || (staffClipMeleeFall < 0 && staffClipShoveHair < 0))
       return;
+    if (e.staffDead) {
+      glm::vec2 toEN = toKnockDirXZ;
+      if (glm::dot(toEN, toEN) < 1e-8f)
+        toEN = glm::vec2(std::sin(yaw), std::cos(yaw));
+      else
+        toEN *= 1.f / glm::length(toEN);
+      e.meleeKnockdownFeetAnchorY = e.feetWorldY;
+      e.meleeState = 2;
+      e.meleePhaseSec = 0.0;
+      e.meleeAnimBlend = 1.f;
+      if (!e.staffRp3dCorpse)
+        e.staffShoveKnockbackVelXZ = toEN * kStaffShoveKnockbackSpeed;
+      else
+        e.staffShoveKnockbackVelXZ = glm::vec2(0.f);
+      e.velXZ = glm::vec2(0.f);
+      horizVel -= toEN * kStaffShovePlayerRecoil;
+      crosshairShoveAnimRemain = kCrosshairShoveAnimDur;
+      audioPlayStaffMeleeImpact();
+      return;
+    }
     if (e.meleeState == 2 || e.meleeState == 3 || e.meleeState == 4)
       return;
     glm::vec2 toEN = toKnockDirXZ;
@@ -15395,7 +16316,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
   }
 
   // Environmental tall fall: melee fall clip only (no shove aggro, player recoil, or hair wind-up).
-  void applyStaffTallFallRagdoll(uint64_t key, ShelfEmployeeNpc& e) {
+  void applyStaffTallFallKnockdown(uint64_t key, ShelfEmployeeNpc& e) {
     if (!staffSkinnedActive || staffClipMeleeFall < 0)
       return;
     if (e.meleeState >= 2)
@@ -15578,8 +16499,21 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       return;
     if (e.meleeState == 2 || e.meleeState == 3 || e.meleeState == 4)
       return;
-    // Shove should knock staff down, but HP loss stays at zero.
-    applyStaffShoveKnockdown(key, e, toEN);
+    const bool mpClient = netMp.active && !netMp.isHost;
+    if (mpClient) {
+      RetroMpStaffMeleePacket pkt{};
+      pkt.seq = ++mpClientStaffMeleeSeq;
+      pkt.staffNpcKey = key;
+      pkt.meleeKind = kRetroMpStaffMeleeShove;
+      pkt.camX = camPos.x;
+      pkt.camZ = camPos.z;
+      pkt.fwdX = f.x;
+      pkt.fwdZ = f.y;
+      netMp.sendStaffMeleeRequest(pkt);
+    } else {
+      // Shove should knock staff down, but HP loss stays at zero.
+      applyStaffShoveKnockdown(key, e, toEN);
+    }
   }
 
   void processPendingPlayerKick() {
@@ -15596,6 +16530,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     const bool canDropKick = airborne && runSpd >= kDropKickMinRunSpeed &&
                              (avClipSlideRight >= 0 || avClipSlideLight >= 0);
     if (canDropKick) {
+      mpClientDropKickNetHitSentForAir = false;
       dropKickActive = true;
       dropKickTimer = kDropKickMaxAirSec;
       dropKickHitApplied = false;
@@ -15638,18 +16573,23 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     const glm::vec2 toEN = toStaff * (1.f / distP);
     if (glm::dot(f, toEN) < kStaffShoveCosCone)
       return;
+    if (netMp.active && !netMp.isHost) {
+      RetroMpStaffMeleePacket pkt{};
+      pkt.seq = ++mpClientStaffMeleeSeq;
+      pkt.staffNpcKey = key;
+      pkt.meleeKind = kRetroMpStaffMeleeKick;
+      pkt.camX = camPos.x;
+      pkt.camZ = camPos.z;
+      pkt.fwdX = f.x;
+      pkt.fwdZ = f.y;
+      netMp.sendStaffMeleeRequest(pkt);
+      return;
+    }
     if (e.meleeState == 2 || e.meleeState == 3 || e.meleeState == 4) {
-      const bool killedOnGround = applyStaffDamageFromPlayerHit(key, e, kStaffHitDamageKick);
-      // Dead staff stay ragdolled on the floor; downed alive staff can be re-staggered.
+      applyStaffDamageFromPlayerHit(key, e, kStaffHitDamageKick);
+      // Lethal: applyStaffDamageFromPlayerHit sets ragdoll; keep slide knockback only.
       e.meleeState = 2;
-      if (killedOnGround || e.staffDead) {
-        const double dFallDead = staffClipMeleeFall >= 0
-                                     ? staff_skin::clipDuration(staffRig, staffClipMeleeFall)
-                                     : 0.0;
-        e.meleePhaseSec = std::max(0.0, dFallDead);
-      } else {
-        e.meleePhaseSec = 0.0;
-      }
+      e.meleePhaseSec = 0.0;
       e.meleeKnockdownFeetAnchorY = e.feetWorldY;
       e.staffVelY = 0.f;
       e.velXZ = glm::vec2(0.f);
@@ -15879,6 +16819,35 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
         writeCeilingChunkVerts(gcx, gcz, c + (cx + kChunkRadius) * kCv);
       }
     }
+  }
+
+  // Peer avatar draw: whether palette sampling should wrap this clip's timeline (mirrors typical
+  // resolvePlayerAvatarPhase loop/deadline behavior when we only have network scrub time).
+  bool peerAvatarClipLoopsDefault(int clipIn) const {
+    int c = clipIn;
+    if (c < 0 || static_cast<size_t>(c) >= staffRig.clips.size())
+      c = 0;
+    if (staffClipMeleeFall >= 0 && c == staffClipMeleeFall)
+      return false;
+    if (avClipStepPush >= 0 && c == avClipStepPush)
+      return false;
+    if (staffClipMeleeKick >= 0 && c == staffClipMeleeKick)
+      return false;
+    if (avClipJump >= 0 && c == avClipJump)
+      return false;
+    if (avClipJumpRun >= 0 && c == avClipJumpRun)
+      return false;
+    if (avClipLand >= 0 && c == avClipLand)
+      return false;
+    if (avClipLedgeClimb >= 0 && c == avClipLedgeClimb)
+      return false;
+    if (avClipLedgeGrab >= 0 && c == avClipLedgeGrab)
+      return false;
+    if (avClipSlideRight >= 0 && c == avClipSlideRight)
+      return false;
+    if (avClipSlideLight >= 0 && c == avClipSlideLight)
+      return false;
+    return true;
   }
 
   bool avatarClipsAllowCrossfade(int fromC, int toC) const {
@@ -16173,8 +17142,9 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     // Match gameplay: C held = crouch immediately (don’t wait for eyeHeight lerp); also low ceiling / lerped crouch.
     const bool crouchHeldRaw = down(SDL_SCANCODE_C);
     const bool crouchAnim = crouchHeldRaw || eyeHeight < (kEyeHeight - 0.12f);
-    const bool runGroundedAnim =
-        groundedEnd && inputSprintHeld(down) && !crouchAnim && !slideActive;
+    const bool runGroundedAnim = groundedEnd && inputSprintHeld(down) && !crouchAnim && !slideActive &&
+                               !playerDanceEmoteActive &&
+                               !playerSprintBackwardBlocked(down, yaw, horizVel);
 
     const glm::vec2 f(std::cos(yaw), std::sin(yaw));
     const glm::vec2 r(std::cos(yaw + glm::half_pi<float>()), std::sin(yaw + glm::half_pi<float>()));
@@ -16320,7 +17290,8 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       playerWalkReverseHold = false;
       const bool movingGap =
           wasLoco ? (sp > kLocoStaySpeed) : (sp > std::min(kLocoEnterSpeed, 0.064f));
-      const bool runAirSmall = inputSprintHeld(down) && !crouchAnim && !slideActive;
+      const bool runAirSmall = inputSprintHeld(down) && !crouchAnim && !slideActive &&
+                             !playerSprintBackwardBlocked(down, yaw, horizVel);
       if (runAirSmall && movingGap && avClipSprint >= 0) {
         playerWalkAnimReverse = false;
         playerWalkReverseHold = false;
@@ -16400,22 +17371,28 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       return;
     }
     if (moving && avClipWalk >= 0) {
-      // Camera-forward (f): reverse walk cycle when moving backward; hysteresis stops strafe flicker.
-      constexpr float kWalkBackEnter = -0.09f;
-      constexpr float kWalkBackExit = 0.04f;
-      const float fd = glm::dot(horizVel, f);
-      if (playerWalkReverseHold) {
-        if (fd > kWalkBackExit)
-          playerWalkReverseHold = false;
+      if (!fpLocoBackwardBodyFlip) {
+        // Camera-forward mesh: scrub walk backward by reversing timeline.
+        constexpr float kWalkBackEnter = -0.09f;
+        constexpr float kWalkBackExit = 0.04f;
+        const float fd = glm::dot(horizVel, f);
+        if (playerWalkReverseHold) {
+          if (fd > kWalkBackExit)
+            playerWalkReverseHold = false;
+        } else {
+          if (fd < kWalkBackEnter)
+            playerWalkReverseHold = true;
+        }
+        playerWalkAnimReverse = playerWalkReverseHold;
       } else {
-        if (fd < kWalkBackEnter)
-          playerWalkReverseHold = true;
+        // Body yaw is flipped π for backpedal; walk clip plays forward in mesh space.
+        playerWalkAnimReverse = false;
+        playerWalkReverseHold = false;
       }
-      playerWalkAnimReverse = playerWalkReverseHold;
       playerAvatarClip = avClipWalk;
       return;
     }
-    if (moving && avClipSprint >= 0) {
+    if (moving && avClipSprint >= 0 && !playerSprintBackwardBlocked(down, yaw, horizVel)) {
       playerWalkAnimReverse = false;
       playerWalkReverseHold = false;
       playerAvatarClip = avClipSprint;
@@ -17024,6 +18001,39 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
                       titleMenuSlotVertexBufferMemory, titleMenuSlotVertexCount);
   }
 
+  const char* pauseMenuMpStatusCstr() const {
+    static thread_local char st[192];
+    if (!netMp.active)
+      std::snprintf(st, sizeof st, "MULTIPLAYER: OFF");
+    else if (netMp.isHost) {
+      if (netMp.remoteValid(3.f) && netMp.peerHostUtf8[0] != '\0')
+        std::snprintf(st, sizeof st, "HOST LINKED %s:%u", netMp.peerHostUtf8,
+                      static_cast<unsigned>(netMp.peerPort));
+      else if (netMp.publicHostUtf8[0] != '\0')
+        std::snprintf(st, sizeof st, "HOST WAITING %s:%u", netMp.publicHostUtf8,
+                      static_cast<unsigned>(kRetroMpDefaultPort));
+      else
+        std::snprintf(st, sizeof st, "HOST WAITING UDP %u", static_cast<unsigned>(kRetroMpDefaultPort));
+    } else {
+      if (netMp.remoteValid(3.f))
+        std::snprintf(st, sizeof st, "CLIENT LINKED %s:%u", netMp.peerHostUtf8,
+                      static_cast<unsigned>(netMp.peerPort));
+      else
+        std::snprintf(st, sizeof st, "CLIENT CONNECTING %s:%u", netMp.peerHostUtf8,
+                      static_cast<unsigned>(netMp.peerPort));
+    }
+    return st;
+  }
+
+  void recreatePauseMenuGpuMesh() {
+    char hostB[96];
+    std::snprintf(hostB, sizeof hostB, "HOST SESSION (UDP %u)", static_cast<unsigned>(kRetroMpDefaultPort));
+    char ipL[128];
+    std::snprintf(ipL, sizeof ipL, "IP %s", pauseMenuJoinIpBuf);
+    uploadUiMeshToGpu(buildPauseMenuOverlayVertices(pauseMenuMpStatusCstr(), hostB, ipL), pauseMenuVertexBuffer,
+                      pauseMenuVertexBufferMemory, pauseMenuVertexCount);
+  }
+
   void destroyTitleMenuGpuMeshes() {
     if (titleMenuMainVertexBuffer != VK_NULL_HANDLE) {
       vkDestroyBuffer(device, titleMenuMainVertexBuffer, nullptr);
@@ -17123,6 +18133,8 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     deliPizzaReplenishTimerBySlot.clear();
     deliMeatballsBySlot.clear();
     deliMeatballReplenishTimerBySlot.clear();
+    mpClientDeliLocalTakePizza.clear();
+    mpClientDeliLocalTakeMeat.clear();
     ++inventoryRevision;
     inventoryScrollRow = 0;
     inventoryMenuCacheScroll = -1;
@@ -17316,10 +18328,66 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     audioUpdateStore(dt);
     if (!std::isfinite(dt) || dt < 1e-5f)
       dt = 1.f / static_cast<float>(kTargetFps);
-    const bool uiMenuFreeze =
-        (showPauseMenu || showInventoryMenu || showControlsOverlay || inTitleMenu) && !playerDeathActive;
+    fpLocoAvatarYawFlip = 0.f;
+    fpLocoBackwardBodyFlip = false;
+    const bool uiMenuFreeze = (showControlsOverlay || inTitleMenu) && !playerDeathActive;
+    netMp.pollReceive(dt);
+    if (netMp.active && netMp.consumeRemoteDeathRetry()) {
+      // Peer pressed RETRY: respawn locally only if we're still in death flow (don't re-roll spawn if alive).
+      if (playerDeathActive || playerDeathShowMenu)
+        respawnPlayerAfterDeath();
+    }
+    if (!netMp.active) {
+      mpLastAppliedWorldSeq = 0;
+      mpClientDeliLocalTakePizza.clear();
+      mpClientDeliLocalTakeMeat.clear();
+      mpClientDeliPickupSeq = 0;
+      mpClientStaffMeleeSeq = 0;
+      mpHostLastClientDeliPickupSeq = 0;
+      mpHostLastClientStaffMeleeSeq = 0;
+      mpClientDropKickNetHitSentForAir = false;
+    } else if (netMp.isHost) {
+      mpClientDeliLocalTakePizza.clear();
+      mpClientDeliLocalTakeMeat.clear();
+    } else {
+      applyMpWorldSyncFromNet();
+    }
+    if (!netMp.active || netMp.isHost) {
+      mpClientSpawnSynced = false;
+      mpClientLastLinkMono = -1.0;
+    } else if (netMp.remoteValid(3.f)) {
+      mpClientLastLinkMono = retroMpMonotonicSec();
+      if (!mpClientSpawnSynced) {
+        const RetroMpWirePacket& R = netMp.lastRemote;
+        const glm::vec2 hostF(std::cos(R.yaw), std::sin(R.yaw));
+        const glm::vec2 hostR(-hostF.y, hostF.x);
+        const glm::vec2 spawnXZ = glm::vec2(R.camX, R.camZ) + hostR * 1.8f - hostF * 0.8f;
+        camPos.x = spawnXZ.x;
+        camPos.z = spawnXZ.y;
+        camPos.y = R.camY;
+        velY = 0.f;
+        horizVel = glm::vec2(0.f);
+        // Match host day/night music timeline and active song cursors on first successful link.
+        AudioStoreCycleSaveState netAudio{};
+        netAudio.version = R.audioVersion;
+        netAudio.storePhase = R.audioStorePhase;
+        netAudio.flags = R.audioFlags;
+        netAudio.storeCursorFrames = R.audioStoreCursorFrames;
+        netAudio.horrorCursorFrames = R.audioHorrorCursorFrames;
+        netAudio.chaseCursorFrames = R.audioChaseCursorFrames;
+        netAudio.shrekCursorFrames = R.audioShrekCursorFrames;
+        netAudio.blackoutRemainingMs = R.audioBlackoutRemainingMs;
+        netAudio.dayRestoreRemainingMs = R.audioDayRestoreRemainingMs;
+        netAudio.storeDayMusicTrackIdx = R.audioStoreDayMusicTrackIdx;
+        if (netAudio.version != 0)
+          audioRestoreStoreCycleSaveState(netAudio);
+        mpClientSpawnSynced = true;
+      }
+    }
     if (!uiMenuFreeze) {
-      tickDeliPizzaReplenish(dt);
+      const bool hostOwnsWorld = !netMp.active || netMp.isHost;
+      if (!netMp.active || netMp.isHost)
+        tickDeliPizzaReplenish(dt);
       playerHunger = std::max(0.f, playerHunger - dt * kPlayerHungerDrainPerSec);
       if (crosshairShoveAnimRemain > 0.f)
         crosshairShoveAnimRemain = std::max(0.f, crosshairShoveAnimRemain - dt);
@@ -17329,7 +18397,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
         playerKickAnimRemain = std::max(0.f, playerKickAnimRemain - dt * kKickAnimPlaybackScale);
       if (dropKickActive) {
         dropKickTimer = std::max(0.f, dropKickTimer - dt);
-        if (!dropKickHitApplied && staffSkinnedActive &&
+        if (hostOwnsWorld && !dropKickHitApplied && staffSkinnedActive &&
             (staffClipMeleeFall >= 0 || staffClipShoveHair >= 0)) {
           const glm::vec2 pXZ(camPos.x, camPos.z);
           bool hitAny = false;
@@ -17346,13 +18414,16 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
             const glm::vec2 toN = toNpc * (1.f / dist);
             if (glm::dot(dropKickDir, toN) < kDropKickCosCone)
               continue;
-            if (applyStaffDamageFromPlayerHit(npc.residentKey, npc, kStaffHitDamageDropKick)) {
-              applyStaffShoveKnockdown(npc.residentKey, npc, toN);
+            const bool dropKickLethal =
+                applyStaffDamageFromPlayerHit(npc.residentKey, npc, kStaffHitDamageDropKick);
+            if (dropKickLethal) {
               npc.staffShoveKnockbackVelXZ = dropKickDir * kDropKickKnockbackSpeed;
               npc.meleeState = 2;
               npc.meleePhaseSec = 0.0;
-              npc.staffVelY = kDropKickNpcVerticalPop;
+              npc.staffVelY = std::max(npc.staffVelY, kDropKickNpcVerticalPop);
+              npc.velXZ = glm::vec2(0.f);
             } else {
+              applyStaffShoveKnockdown(npc.residentKey, npc, toN);
               npc.staffShoveKnockbackVelXZ = dropKickDir * (kDropKickKnockbackSpeed * 0.62f);
               audioPlayStaffMeleeImpact();
             }
@@ -17361,12 +18432,43 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
           if (hitAny) {
             dropKickHitApplied = true;
           }
+        } else if (!hostOwnsWorld && netMp.active && !netMp.isHost && !dropKickHitApplied &&
+                   !mpClientDropKickNetHitSentForAir && staffSkinnedActive &&
+                   (staffClipMeleeFall >= 0 || staffClipShoveHair >= 0)) {
+          const glm::vec2 pXZ(camPos.x, camPos.z);
+          for (uint32_t si : shelfEmpActiveSlots) {
+            ShelfEmployeeNpc& npc = shelfEmpPool[si];
+            if (!npc.inited)
+              continue;
+            if (npc.meleeState == 2 || npc.meleeState == 3 || npc.meleeState == 4)
+              continue;
+            const glm::vec2 toNpc = npc.posXZ - pXZ;
+            const float dist = glm::length(toNpc);
+            if (dist > kDropKickMaxDist || dist < 1e-4f)
+              continue;
+            const glm::vec2 toN = toNpc * (1.f / dist);
+            if (glm::dot(dropKickDir, toN) < kDropKickCosCone)
+              continue;
+            RetroMpStaffMeleePacket pkt{};
+            pkt.seq = ++mpClientStaffMeleeSeq;
+            pkt.staffNpcKey = npc.residentKey;
+            pkt.meleeKind = kRetroMpStaffMeleeDropKick;
+            pkt.camX = camPos.x;
+            pkt.camZ = camPos.z;
+            pkt.fwdX = dropKickDir.x;
+            pkt.fwdZ = dropKickDir.y;
+            netMp.sendStaffMeleeRequest(pkt);
+            mpClientDropKickNetHitSentForAir = true;
+            dropKickHitApplied = true;
+            break;
+          }
         }
         if (isGrounded() && dropKickTimer > kDropKickGroundSlideSec)
           dropKickTimer = kDropKickGroundSlideSec;
         if (dropKickTimer <= 0.f) {
           dropKickActive = false;
           dropKickTimer = 0.f;
+          mpClientDropKickNetHitSentForAir = false;
         }
       }
       if (playerJumpPostLandRemain > 0.f)
@@ -17414,8 +18516,11 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       else if (isGrounded())
         playerFallAnimTime = 0.f;
     }
-    if (!playerDeathActive && !showPauseMenu && !showInventoryMenu && !inTitleMenu && !inLoadingScreen) {
+    if (!playerDeathActive && !inTitleMenu && !inLoadingScreen) {
       staffSimTime += dt;
+      const bool hostOwnsWorld = !netMp.active || netMp.isHost;
+      if (hostOwnsWorld && netMp.active && netMp.isHost && netMp.peerHostUtf8[0] != '\0')
+        tickMpHostClientRpcQueues();
       processPendingStaffShove();
       processPendingPlayerKick();
 #if defined(VULKAN_GAME_SHREK_EGG_GLB)
@@ -17428,6 +18533,19 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       updateShrekEggEaster(dt);
 #endif
       updateShelfEmployees(dt);
+      if (netMp.active && netMp.isHost && netMp.peerHostUtf8[0] != '\0') {
+        netWorldSyncAccumSec += dt;
+        constexpr float kWorldSyncHz = 12.f;
+        const float worldStep = 1.f / kWorldSyncHz;
+        while (netWorldSyncAccumSec >= worldStep) {
+          netWorldSyncAccumSec -= worldStep;
+          buildAndSendMpWorldSync();
+        }
+      } else {
+        netWorldSyncAccumSec = 0.f;
+      }
+      if (netMp.active && !netMp.isHost)
+        tickNetClientStaffVersusPlayer(dt);
     }
     if (inIntroSplash) {
       introSplashTime += dt;
@@ -17453,23 +18571,21 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       rebuildTerrainIfNeeded();
       return;
     }
-    if ((showPauseMenu || showInventoryMenu || inTitleMenu) && !playerDeathActive) {
+    if (inTitleMenu && !playerDeathActive) {
       audioSetLowHealthHeartbeat(playerHealth > 0.f && playerHealth < kPlayerHealthMercyCap);
       tickPlayerDeathScene(dt);
-      if (inTitleMenu) {
-        titleMenuSceneTime += dt;
-        if (titleMenuSlideWasSlot != titleMenuPickSlot) {
-          titleMenuSlideTime = 0.f;
-          titleMenuSlideWasSlot = titleMenuPickSlot;
-        }
-        titleMenuSlideTime += dt;
-        staffSimTime += dt;
-        syncTitleMenuSceneAnchor();
+      titleMenuSceneTime += dt;
+      if (titleMenuSlideWasSlot != titleMenuPickSlot) {
+        titleMenuSlideTime = 0.f;
+        titleMenuSlideWasSlot = titleMenuPickSlot;
       }
+      titleMenuSlideTime += dt;
+      staffSimTime += dt;
+      syncTitleMenuSceneAnchor();
       rebuildTerrainIfNeeded();
       return;
     }
-    if (!playerDeathActive && !showPauseMenu && !showInventoryMenu && !inTitleMenu) {
+    if (!playerDeathActive && !showPauseMenu && !inTitleMenu) {
       autoSaveAccumSec += dt;
       constexpr float kAutoSaveIntervalSec = 45.f;
       if (autoSaveAccumSec >= kAutoSaveIntervalSec) {
@@ -17478,12 +18594,12 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       }
     }
     if (newGameControlsPopupDelay >= 0.f && !showControlsOverlay && !showPauseMenu &&
-        !showInventoryMenu && !playerDeathActive && !inTitleMenu) {
+        !playerDeathActive && !inTitleMenu) {
       newGameControlsPopupDelay -= dt;
       if (newGameControlsPopupDelay <= 0.f) {
         newGameControlsPopupDelay = -1.f;
         showControlsOverlay = true;
-        audioSetStoreDayNightCyclePaused(true);
+            audioSetStoreDayNightCyclePaused(false);
         mouseGrab = false;
         syncInputGrab();
       }
@@ -17805,8 +18921,10 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     if (inputStrafeRight(down))
       wish += glm::vec2(rightDir.x, rightDir.z);
     hasWishInput = glm::length(wish) > 1e-4f;
+    const bool wishStrafeOnly = !inputForward(down) && !inputBack(down) &&
+                                (inputStrafeLeft(down) || inputStrafeRight(down));
     if (playerDanceEmoteActive && !playerDeathActive &&
-        (hasWishInput || slideActive ||
+        ((!wishStrafeOnly && hasWishInput) || slideActive ||
          (playerDanceEmoteStopGraceRemain <= 0.f &&
           (down(SDL_SCANCODE_SPACE) || crouchHeldRaw)))) {
       playerDanceEmoteActive = false;
@@ -17814,6 +18932,27 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     }
     if (hasWishInput)
       wish = glm::normalize(wish);
+    {
+      const glm::vec2 camF(std::cos(yaw), std::sin(yaw));
+      bool showBackBody = false;
+      // Dance uses a fixed facing clip — don't π-flip from S/backpedal (looks broken); ledge/shimmy use
+      // geometry yaw above, not this path (those states skip this locomotion block).
+      if (!playerDeathActive && !playerDanceEmoteActive) {
+        if (slideActive && glm::length(slideDir) > 1e-4f) {
+          const glm::vec2 sd = glm::normalize(slideDir);
+          if (glm::dot(sd, camF) < -0.045f)
+            showBackBody = true;
+        } else if (hasWishInput && glm::dot(wish, camF) < -1e-3f)
+          showBackBody = true;
+        else if (!hasWishInput && glm::length(horizVel) > 0.09f) {
+          const glm::vec2 hv = horizVel * (1.f / glm::length(horizVel));
+          if (glm::dot(hv, camF) < -0.32f)
+            showBackBody = true;
+        }
+      }
+      fpLocoBackwardBodyFlip = showBackBody;
+      fpLocoAvatarYawFlip = showBackBody ? glm::pi<float>() : 0.f;
+    }
     if (!playerDeathActive && !slideActive && groundedStart && slideCooldownTimer <= 0.f && slideInput) {
       glm::vec2 startDir = horizVel;
       if (glm::length(startDir) < 0.2f)
@@ -17854,7 +18993,9 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       horizVel *= std::exp(-kPreFallHorizBrakePerSec * dt);
 
     const bool crouchedMove = eyeHeight < (kEyeHeight - 0.12f);
-    runGrounded = groundedStart && inputSprintHeld(down) && !crouchedMove && !slideActive;
+    runGrounded = groundedStart && inputSprintHeld(down) && !crouchedMove && !slideActive &&
+                  !playerDanceEmoteActive &&
+                  !playerSprintBackwardBlocked(down, yaw, horizVel);
     const bool airSmallGapSlow = !groundedStart && playerAirWalkSmallGap;
     const float accel =
         groundedStart ? kWalkAccel * (runGrounded ? kSprintAccelMult : 1.f)
@@ -18834,7 +19975,9 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     audioSetSlide(slideActive);
 
     const float runTarget =
-        (groundedEnd && inputSprintHeld(down) && sp > 0.2f) ? std::clamp(sp / kSprintSpeed, 0.f, 1.f) : 0.f;
+        (groundedEnd && inputSprintHeld(down) && sp > 0.2f && !playerSprintBackwardBlocked(down, yaw, horizVel))
+            ? std::clamp(sp / kSprintSpeed, 0.f, 1.f)
+            : 0.f;
     const float runBlendRate = runTarget > runAnimBlend ? kRunAnimBlendInRate : kRunAnimBlendOutRate;
     runAnimBlend = glm::mix(runAnimBlend, runTarget, 1.f - std::exp(-dt * runBlendRate));
 
@@ -19030,6 +20173,321 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       }
     }
 
+      if (netMp.active && !inLoadingScreen) {
+        AudioStoreCycleSaveState netAudio{};
+        AudioStoreCycleSaveState* netAudioPtr = nullptr;
+        if (audioCaptureStoreCycleSaveState(&netAudio))
+          netAudioPtr = &netAudio;
+        int netAvatarClip = playerAvatarClip;
+        int netBlendFromClip = playerAvatarBlendFromClip;
+        float netClipBlend = playerAvatarClipBlend;
+        double netLocoPhaseSec = avatarLocoPhaseSec;
+        uint8_t netEmoteFlags = 0;
+        uint8_t netEmoteAux0 = 0;
+        uint8_t netEmoteAux1 = kRetroMpAnimTagNone;
+        uint8_t netEmoteAux2 = kRetroMpAnimTagNone;
+        if (playerDeathActive) {
+          netEmoteFlags = kRetroMpEmoteDeath;
+          if (playerDeathClipIndex >= 0 &&
+              static_cast<size_t>(playerDeathClipIndex) < staffRig.clips.size()) {
+            if (staffClipMeleeFall >= 0 && playerDeathClipIndex == staffClipMeleeFall)
+              netEmoteAux0 = kRetroMpDeathAuxClipMeleeFall;
+            else if (avClipLand >= 0 && playerDeathClipIndex == avClipLand)
+              netEmoteAux0 = kRetroMpDeathAuxClipLand;
+            else
+              netEmoteAux0 = kRetroMpDeathAuxClipMeleeFall;
+            if (playerDeathPlayingFallClip)
+              netEmoteAux0 =
+                  static_cast<uint8_t>(netEmoteAux0 | kRetroMpDeathAuxPlayingFall);
+            if (playerDeathPlayingFallClip)
+              netLocoPhaseSec = playerDeathAnimTime;
+            else {
+              const double dur = staff_skin::clipDuration(staffRig, playerDeathClipIndex);
+              netLocoPhaseSec = dur * static_cast<double>(playerDeathClipFracEnd);
+            }
+            netAvatarClip = playerDeathClipIndex;
+            netBlendFromClip = netAvatarClip;
+            netClipBlend = 1.f;
+          } else {
+            netEmoteAux0 = kRetroMpDeathAuxClipNone;
+            netLocoPhaseSec = 0.;
+          }
+        } else if (playerDanceEmoteActive && staffClipShrekProximityDance >= 0 &&
+                   static_cast<size_t>(staffClipShrekProximityDance) < staffRig.clips.size()) {
+          netAvatarClip = staffClipShrekProximityDance;
+          netBlendFromClip = netAvatarClip;
+          netClipBlend = 1.f;
+          const double d = staff_skin::clipDuration(staffRig, netAvatarClip);
+          netLocoPhaseSec = std::fmod(static_cast<double>(staffSimTime), std::max(d, 1e-6));
+          netEmoteFlags = static_cast<uint8_t>(netEmoteFlags | kRetroMpEmoteDance);
+          netEmoteAux1 = kRetroMpAnimTagDanceProximity;
+        } else if (ledgeHangActive) {
+          int shimmyClip = -1;
+          if (ledgeHangShimmyDir > 0 && avClipShimmyLeft >= 0)
+            shimmyClip = avClipShimmyLeft;
+          else if (ledgeHangShimmyDir < 0 && avClipShimmyRight >= 0)
+            shimmyClip = avClipShimmyRight;
+          if (shimmyClip >= 0) {
+            netAvatarClip = shimmyClip;
+            netBlendFromClip = netAvatarClip;
+            netClipBlend = 1.f;
+            const double d = staff_skin::clipDuration(staffRig, netAvatarClip);
+            netLocoPhaseSec = std::fmod(static_cast<double>(ledgeHangShimmyPhase), std::max(d, 1e-6));
+            netEmoteAux1 = (ledgeHangShimmyDir > 0) ? kRetroMpAnimTagShimmyLeft : kRetroMpAnimTagShimmyRight;
+          }
+        } else if (ledgeClimbT >= 0.f || ladderClimbActive || wallClimbActive) {
+          if (avClipLedgeClimb >= 0 && static_cast<size_t>(avClipLedgeClimb) < staffRig.clips.size()) {
+            netAvatarClip = avClipLedgeClimb;
+            netBlendFromClip = netAvatarClip;
+            netClipBlend = 1.f;
+            netEmoteAux1 = kRetroMpAnimTagLedgeClimb;
+          }
+        } else if (playerJumpAnimRemain > 1e-4f || playerJumpPostLandRemain > 1e-4f ||
+                   (playerAvatarJumpFallMidPose() && (avClipJump >= 0 || avClipJumpRun >= 0))) {
+          if (netAvatarClip == avClipJumpRun) {
+            netBlendFromClip = netAvatarClip;
+            netClipBlend = 1.f;
+            netEmoteAux1 = kRetroMpAnimTagJumpRun;
+          } else if (netAvatarClip == avClipJump) {
+            netBlendFromClip = netAvatarClip;
+            netClipBlend = 1.f;
+            netEmoteAux1 = kRetroMpAnimTagJump;
+          }
+        } else if (playerKickAnimRemain > 1e-4f && netAvatarClip == staffClipMeleeKick &&
+                   staffClipMeleeKick >= 0 && static_cast<size_t>(staffClipMeleeKick) < staffRig.clips.size()) {
+          netBlendFromClip = netAvatarClip;
+          netClipBlend = 1.f;
+          netEmoteAux1 = kRetroMpAnimTagKick;
+        }
+        auto mapClipToAnimTag = [&](int c) -> uint8_t {
+          if (avClipJump >= 0 && c == avClipJump) return kRetroMpAnimTagJump;
+          if (avClipJumpRun >= 0 && c == avClipJumpRun) return kRetroMpAnimTagJumpRun;
+          if (avClipLedgeClimb >= 0 && c == avClipLedgeClimb) return kRetroMpAnimTagLedgeClimb;
+          if (avClipShimmyLeft >= 0 && c == avClipShimmyLeft) return kRetroMpAnimTagShimmyLeft;
+          if (avClipShimmyRight >= 0 && c == avClipShimmyRight) return kRetroMpAnimTagShimmyRight;
+          if (staffClipMeleeKick >= 0 && c == staffClipMeleeKick) return kRetroMpAnimTagKick;
+          if (avClipIdle >= 0 && c == avClipIdle) return kRetroMpAnimTagIdle;
+          if (avClipWalk >= 0 && c == avClipWalk) return kRetroMpAnimTagWalk;
+          if (avClipSprint >= 0 && c == avClipSprint) return kRetroMpAnimTagSprint;
+          if (avClipCrouchFwd >= 0 && c == avClipCrouchFwd) return kRetroMpAnimTagCrouchFwd;
+          if (avClipCrouchBack >= 0 && c == avClipCrouchBack) return kRetroMpAnimTagCrouchBack;
+          if (avClipCrouchLeft >= 0 && c == avClipCrouchLeft) return kRetroMpAnimTagCrouchLeft;
+          if (avClipCrouchRight >= 0 && c == avClipCrouchRight) return kRetroMpAnimTagCrouchRight;
+          if (avClipCrouchIdleBow >= 0 && c == avClipCrouchIdleBow) return kRetroMpAnimTagCrouchIdle;
+          if (avClipLand >= 0 && c == avClipLand) return kRetroMpAnimTagLand;
+          if (avClipLedgeGrab >= 0 && c == avClipLedgeGrab) return kRetroMpAnimTagLedgeGrab;
+          if (avClipStepPush >= 0 && c == avClipStepPush) return kRetroMpAnimTagStepPush;
+          if (avClipSlideRight >= 0 && c == avClipSlideRight) return kRetroMpAnimTagSlideRight;
+          if (avClipSlideLight >= 0 && c == avClipSlideLight) return kRetroMpAnimTagSlideLight;
+          if (staffClipShrekProximityDance >= 0 && c == staffClipShrekProximityDance)
+            return kRetroMpAnimTagDanceProximity;
+          return kRetroMpAnimTagNone;
+        };
+        // Always populate semantic motion tags when not dying (helps peers remap clip indices and dance without Shrek DLL path match).
+        if (!(netEmoteFlags & kRetroMpEmoteDeath)) {
+          if (netEmoteAux1 == kRetroMpAnimTagNone)
+            netEmoteAux1 = mapClipToAnimTag(netAvatarClip);
+          if (netEmoteFlags & kRetroMpEmoteDance)
+            netEmoteAux1 = kRetroMpAnimTagDanceProximity;
+          netEmoteAux2 = mapClipToAnimTag(netBlendFromClip);
+        }
+        if (!(netEmoteFlags & kRetroMpEmoteDeath)) {
+          double phaseResolved = 0.0;
+          bool loopResolved = true;
+          resolvePlayerAvatarPhase(netAvatarClip, phaseResolved, loopResolved);
+          netLocoPhaseSec = phaseResolved;
+        }
+        // Decouple network snapshots from render rate: Wine/low-FPS hosts stay responsive for peers.
+        constexpr float kNetSnapshotHz = 90.f;
+        constexpr int kNetSnapshotBurstMax = 4;
+        const float sendStep = 1.f / kNetSnapshotHz;
+        netSnapshotSendAccumSec = std::min(netSnapshotSendAccumSec + dt, sendStep * kNetSnapshotBurstMax);
+        int sends = 0;
+        while (netSnapshotSendAccumSec >= sendStep && sends < kNetSnapshotBurstMax) {
+          netMp.sendSnapshot(camPos, yaw, pitch, eyeHeight, horizVel, netAvatarClip, netBlendFromClip,
+                             netClipBlend, netLocoPhaseSec, netEmoteFlags, netEmoteAux0, netEmoteAux1,
+                             netEmoteAux2,
+                             netAudioPtr);
+          netSnapshotSendAccumSec -= sendStep;
+          ++sends;
+        }
+        if (sends == 0) {
+          netMp.sendSnapshot(camPos, yaw, pitch, eyeHeight, horizVel, netAvatarClip, netBlendFromClip,
+                             netClipBlend, netLocoPhaseSec, netEmoteFlags, netEmoteAux0, netEmoteAux1,
+                             netEmoteAux2,
+                             netAudioPtr);
+        }
+      } else {
+        netSnapshotSendAccumSec = 0.f;
+      }
+
+    } else {
+      // Ledge hang, ladder climb, and mantle ascent skip the locomotion-integration block above; still
+      // advance avatar selection + multiplayer snapshots so peers see shimmy/climb/dance reliably.
+      const float feetGh = camPos.y - eyeHeight;
+      float terrainYGh = playerTerrainSupportY(camPos.x, camPos.z, feetGh);
+      const bool groundedHangPath =
+          std::isfinite(terrainYGh) && isGroundedUsingSupport(terrainYGh);
+
+      const int clipBeforeSyncGh = playerAvatarClip;
+      avatarLocoGroundedSmoothed =
+          glm::mix(avatarLocoGroundedSmoothed, groundedHangPath ? 1.f : 0.f, 1.f - std::exp(-dt * 17.f));
+      syncPlayerAvatarClip(groundedHangPath, down);
+      if (playerAvatarClip != clipBeforeSyncGh) {
+        if (avatarClipsAllowCrossfade(clipBeforeSyncGh, playerAvatarClip)) {
+          playerAvatarBlendFromClip = clipBeforeSyncGh;
+          playerAvatarClipBlend = 0.f;
+        } else
+          playerAvatarClipBlend = 1.f;
+      }
+
+      if (netMp.active && !inLoadingScreen) {
+        AudioStoreCycleSaveState netAudioGh{};
+        AudioStoreCycleSaveState* netAudioPtrGh = nullptr;
+        if (audioCaptureStoreCycleSaveState(&netAudioGh))
+          netAudioPtrGh = &netAudioGh;
+        int netAvatarClip = playerAvatarClip;
+        int netBlendFromClip = playerAvatarBlendFromClip;
+        float netClipBlend = playerAvatarClipBlend;
+        double netLocoPhaseSec = avatarLocoPhaseSec;
+        uint8_t netEmoteFlags = 0;
+        uint8_t netEmoteAux0 = 0;
+        uint8_t netEmoteAux1 = kRetroMpAnimTagNone;
+        uint8_t netEmoteAux2 = kRetroMpAnimTagNone;
+        if (playerDeathActive) {
+          netEmoteFlags = kRetroMpEmoteDeath;
+          if (playerDeathClipIndex >= 0 &&
+              static_cast<size_t>(playerDeathClipIndex) < staffRig.clips.size()) {
+            if (staffClipMeleeFall >= 0 && playerDeathClipIndex == staffClipMeleeFall)
+              netEmoteAux0 = kRetroMpDeathAuxClipMeleeFall;
+            else if (avClipLand >= 0 && playerDeathClipIndex == avClipLand)
+              netEmoteAux0 = kRetroMpDeathAuxClipLand;
+            else
+              netEmoteAux0 = kRetroMpDeathAuxClipMeleeFall;
+            if (playerDeathPlayingFallClip)
+              netEmoteAux0 =
+                  static_cast<uint8_t>(netEmoteAux0 | kRetroMpDeathAuxPlayingFall);
+            if (playerDeathPlayingFallClip)
+              netLocoPhaseSec = playerDeathAnimTime;
+            else {
+              const double durGh = staff_skin::clipDuration(staffRig, playerDeathClipIndex);
+              netLocoPhaseSec = durGh * static_cast<double>(playerDeathClipFracEnd);
+            }
+            netAvatarClip = playerDeathClipIndex;
+            netBlendFromClip = netAvatarClip;
+            netClipBlend = 1.f;
+          } else {
+            netEmoteAux0 = kRetroMpDeathAuxClipNone;
+            netLocoPhaseSec = 0.;
+          }
+        } else if (playerDanceEmoteActive && staffClipShrekProximityDance >= 0 &&
+                   static_cast<size_t>(staffClipShrekProximityDance) < staffRig.clips.size()) {
+          netAvatarClip = staffClipShrekProximityDance;
+          netBlendFromClip = netAvatarClip;
+          netClipBlend = 1.f;
+          const double dGh = staff_skin::clipDuration(staffRig, netAvatarClip);
+          netLocoPhaseSec = std::fmod(static_cast<double>(staffSimTime), std::max(dGh, 1e-6));
+          netEmoteFlags = static_cast<uint8_t>(netEmoteFlags | kRetroMpEmoteDance);
+          netEmoteAux1 = kRetroMpAnimTagDanceProximity;
+        } else if (ledgeHangActive) {
+          int shimmyClip = -1;
+          if (ledgeHangShimmyDir > 0 && avClipShimmyLeft >= 0)
+            shimmyClip = avClipShimmyLeft;
+          else if (ledgeHangShimmyDir < 0 && avClipShimmyRight >= 0)
+            shimmyClip = avClipShimmyRight;
+          if (shimmyClip >= 0) {
+            netAvatarClip = shimmyClip;
+            netBlendFromClip = netAvatarClip;
+            netClipBlend = 1.f;
+            const double dGh = staff_skin::clipDuration(staffRig, netAvatarClip);
+            netLocoPhaseSec = std::fmod(static_cast<double>(ledgeHangShimmyPhase), std::max(dGh, 1e-6));
+            netEmoteAux1 =
+                (ledgeHangShimmyDir > 0) ? kRetroMpAnimTagShimmyLeft : kRetroMpAnimTagShimmyRight;
+          }
+        } else if (ledgeClimbT >= 0.f || ladderClimbActive || wallClimbActive) {
+          if (avClipLedgeClimb >= 0 && static_cast<size_t>(avClipLedgeClimb) < staffRig.clips.size()) {
+            netAvatarClip = avClipLedgeClimb;
+            netBlendFromClip = netAvatarClip;
+            netClipBlend = 1.f;
+            netEmoteAux1 = kRetroMpAnimTagLedgeClimb;
+          }
+        } else if (playerJumpAnimRemain > 1e-4f || playerJumpPostLandRemain > 1e-4f ||
+                   (playerAvatarJumpFallMidPose() && (avClipJump >= 0 || avClipJumpRun >= 0))) {
+          if (netAvatarClip == avClipJumpRun) {
+            netBlendFromClip = netAvatarClip;
+            netClipBlend = 1.f;
+            netEmoteAux1 = kRetroMpAnimTagJumpRun;
+          } else if (netAvatarClip == avClipJump) {
+            netBlendFromClip = netAvatarClip;
+            netClipBlend = 1.f;
+            netEmoteAux1 = kRetroMpAnimTagJump;
+          }
+        } else if (playerKickAnimRemain > 1e-4f && netAvatarClip == staffClipMeleeKick &&
+                   staffClipMeleeKick >= 0 && static_cast<size_t>(staffClipMeleeKick) < staffRig.clips.size()) {
+          netBlendFromClip = netAvatarClip;
+          netClipBlend = 1.f;
+          netEmoteAux1 = kRetroMpAnimTagKick;
+        }
+        auto mapClipToAnimTagGh = [&](int c) -> uint8_t {
+          if (avClipJump >= 0 && c == avClipJump) return kRetroMpAnimTagJump;
+          if (avClipJumpRun >= 0 && c == avClipJumpRun) return kRetroMpAnimTagJumpRun;
+          if (avClipLedgeClimb >= 0 && c == avClipLedgeClimb) return kRetroMpAnimTagLedgeClimb;
+          if (avClipShimmyLeft >= 0 && c == avClipShimmyLeft) return kRetroMpAnimTagShimmyLeft;
+          if (avClipShimmyRight >= 0 && c == avClipShimmyRight) return kRetroMpAnimTagShimmyRight;
+          if (staffClipMeleeKick >= 0 && c == staffClipMeleeKick) return kRetroMpAnimTagKick;
+          if (avClipIdle >= 0 && c == avClipIdle) return kRetroMpAnimTagIdle;
+          if (avClipWalk >= 0 && c == avClipWalk) return kRetroMpAnimTagWalk;
+          if (avClipSprint >= 0 && c == avClipSprint) return kRetroMpAnimTagSprint;
+          if (avClipCrouchFwd >= 0 && c == avClipCrouchFwd) return kRetroMpAnimTagCrouchFwd;
+          if (avClipCrouchBack >= 0 && c == avClipCrouchBack) return kRetroMpAnimTagCrouchBack;
+          if (avClipCrouchLeft >= 0 && c == avClipCrouchLeft) return kRetroMpAnimTagCrouchLeft;
+          if (avClipCrouchRight >= 0 && c == avClipCrouchRight) return kRetroMpAnimTagCrouchRight;
+          if (avClipCrouchIdleBow >= 0 && c == avClipCrouchIdleBow) return kRetroMpAnimTagCrouchIdle;
+          if (avClipLand >= 0 && c == avClipLand) return kRetroMpAnimTagLand;
+          if (avClipLedgeGrab >= 0 && c == avClipLedgeGrab) return kRetroMpAnimTagLedgeGrab;
+          if (avClipStepPush >= 0 && c == avClipStepPush) return kRetroMpAnimTagStepPush;
+          if (avClipSlideRight >= 0 && c == avClipSlideRight) return kRetroMpAnimTagSlideRight;
+          if (avClipSlideLight >= 0 && c == avClipSlideLight) return kRetroMpAnimTagSlideLight;
+          if (staffClipShrekProximityDance >= 0 && c == staffClipShrekProximityDance)
+            return kRetroMpAnimTagDanceProximity;
+          return kRetroMpAnimTagNone;
+        };
+        if (!(netEmoteFlags & kRetroMpEmoteDeath)) {
+          if (netEmoteAux1 == kRetroMpAnimTagNone)
+            netEmoteAux1 = mapClipToAnimTagGh(netAvatarClip);
+          if (netEmoteFlags & kRetroMpEmoteDance)
+            netEmoteAux1 = kRetroMpAnimTagDanceProximity;
+          netEmoteAux2 = mapClipToAnimTagGh(netBlendFromClip);
+        }
+        if (!(netEmoteFlags & kRetroMpEmoteDeath)) {
+          double phaseResolvedGh = 0.0;
+          bool loopResolvedGh = true;
+          resolvePlayerAvatarPhase(netAvatarClip, phaseResolvedGh, loopResolvedGh);
+          netLocoPhaseSec = phaseResolvedGh;
+        }
+        constexpr float kNetSnapshotHzGh = 90.f;
+        constexpr int kNetSnapshotBurstMaxGh = 4;
+        const float sendStepGh = 1.f / kNetSnapshotHzGh;
+        netSnapshotSendAccumSec =
+            std::min(netSnapshotSendAccumSec + dt, sendStepGh * static_cast<float>(kNetSnapshotBurstMaxGh));
+        int sendsGh = 0;
+        while (netSnapshotSendAccumSec >= sendStepGh && sendsGh < kNetSnapshotBurstMaxGh) {
+          netMp.sendSnapshot(camPos, yaw, pitch, eyeHeight, horizVel, netAvatarClip, netBlendFromClip,
+                             netClipBlend, netLocoPhaseSec, netEmoteFlags, netEmoteAux0, netEmoteAux1,
+                             netEmoteAux2,
+                             netAudioPtrGh);
+          netSnapshotSendAccumSec -= sendStepGh;
+          ++sendsGh;
+        }
+        if (sendsGh == 0) {
+          netMp.sendSnapshot(camPos, yaw, pitch, eyeHeight, horizVel, netAvatarClip, netBlendFromClip,
+                             netClipBlend, netLocoPhaseSec, netEmoteFlags, netEmoteAux0, netEmoteAux1,
+                             netEmoteAux2,
+                             netAudioPtrGh);
+        }
+      } else {
+        netSnapshotSendAccumSec = 0.f;
+      }
     }
 
     playerAvatarClipBlend = std::min(1.f, playerAvatarClipBlend + dt / kAvatarClipBlendSec);
@@ -19077,7 +20535,9 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     }
 
     {
-      const bool mercyZone = playerHealth > 0.f && playerHealth < kPlayerHealthMercyCap;
+      const bool starving = playerHunger <= 1e-3f;
+      const bool mercyZone =
+          !starving && playerHealth > 0.f && playerHealth < kPlayerHealthMercyCap;
       if (!mercyZone) {
         playerMercyHealDelayRemain = 0.f;
         playerInMercyHealthZone = false;
@@ -19100,6 +20560,17 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
         playerHealth = std::min(kPlayerHealthMax, playerHealth + dt * kPlayerHungerAutoHealPerSec);
       }
     }
+    {
+      if (playerHunger <= 1e-3f && playerHealth > 0.f && !playerDeathActive) {
+        const float starveDmg = dt * kPlayerHungerStarveDamagePerSec;
+        playerHealth = std::max(0.f, playerHealth - starveDmg);
+        playerScreenDamagePulse = std::max(
+            playerScreenDamagePulse,
+            glm::clamp(starveDmg / std::max(1e-4f, kPlayerScreenDamagePulseRefDmg), 0.12f, 0.55f));
+        if (playerHealth <= 0.f)
+          beginPlayerDeath();
+      }
+    }
     // Loop brvhrtz heartbeat while in mercy band (HP < cap); ≤15 alone was inaudible vs fast mercy heal.
     audioSetLowHealthHeartbeat(playerHealth > 0.f && playerHealth < kPlayerHealthMercyCap);
 
@@ -19110,6 +20581,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
   bool running = true;
 
   void shutdown() {
+    netMp.shutdown();
     vkDeviceWaitIdle(device);
     savePipelineCacheToDisk();
     audioShutdown();
@@ -19391,6 +20863,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     vkFreeMemory(device, fluorescentVertexBufferMemory, nullptr);
     if (staffBoneSsbMapped)
       vkUnmapMemory(device, staffBoneSsbMemory);
+    staff_rp3d::shutdown();
     vkDestroyBuffer(device, staffBoneSsbBuffer, nullptr);
     vkFreeMemory(device, staffBoneSsbMemory, nullptr);
     staffBoneSsbMapped = nullptr;
@@ -19433,10 +20906,9 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  (void)argc;
-  (void)argv;
   try {
     App app;
+    app.netMp.initFromArgs(argc, argv);
     app.initWindow();
     if (!audioInit())
       std::cerr << "Footstep audio failed to load (check assets/audio/sfx_footstep_concrete.mp3).\n";
@@ -19446,6 +20918,9 @@ int main(int argc, char** argv) {
       audioSetTitleMenuMusicActive(true);
     }
     app.initVulkan();
+    std::fprintf(stderr,
+                 "[retro-ikea] v%s — built %s %s — if fixes are missing, confirm this stamp changed after rebuild.\n",
+                 VULKAN_GAME_VERSION_STRING, __DATE__, __TIME__);
 
     auto last = std::chrono::steady_clock::now();
     SDL_Event e;

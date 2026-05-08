@@ -86,11 +86,6 @@ bool appendLongestRetargetedClipFromGlb(const char* path, Rig& rig, bool freeRoo
 void computePalette(const Rig& rig, int clipIndex, double phaseSec, glm::mat4* outPalette,
                     bool loopPhase = true);
 
-// Same as computePalette, then applies extra local rotations (radians, XYZ then Z*Y*X) per palette bone
-// on top of the sampled clip. extraLocalEulerPerBone[i] is for boneNames[i]; nullptr = no extras.
-void computePaletteWithRagdollExtras(const Rig& rig, int clipIndex, double phaseSec, bool loopPhase,
-                                     const glm::vec3* extraLocalEulerPerBone, glm::mat4* outPalette);
-
 // Bone globals before meshNorm * invBind (same space as internal eval). optional euler extras per palette bone.
 void sampleClipBoneGlobalMatrices(const Rig& rig, int clipIndex, double phaseSec, bool loopPhase,
                                   const glm::vec3* extraLocalEulerPerBone, glm::mat4* outGlobalBone);
@@ -98,24 +93,20 @@ void sampleClipBoneGlobalMatrices(const Rig& rig, int clipIndex, double phaseSec
 // Rest pose only (no clip sampling): meshNorm * bind hierarchy * invBind per bone.
 void computeBindPosePalette(const Rig& rig, glm::mat4* outPalette);
 
-// Bind pose + same extra local euler convention as computePaletteWithRagdollExtras (no clip keys).
-void computeBindPosePaletteWithRagdollExtras(const Rig& rig, const glm::vec3* extraLocalEulerPerBone,
-                                             glm::mat4* outPalette);
+// Full bone globals in armature space (same as internal animation eval). meshNorm * G * invBind.
+void computePaletteFromBoneGlobals(const Rig& rig, const glm::mat4* globalBone, glm::mat4* outPalette);
 
-// Rigid-body ragdoll: per-sim-bone world transforms (must match characterModel * meshNorm * bindGlobal for that
-// bone at spawn). Other bones follow bind pose relative to the nearest simulated ancestor.
-void computePaletteFromRagdollSimWorldMatrices(const Rig& rig, const glm::mat4& characterModel,
-                                               const glm::mat4* bindGlobalArmature, int nSim,
-                                               const int* simRigBoneIdx, const glm::mat4* worldBoneSim,
-                                               glm::mat4* outPalette);
+// Bind pose + optional local-space euler deltas per bone index (same layout as computePalette).
+void computeBindPosePaletteWithExtras(const Rig& rig, const glm::vec3* extraLocalEulerPerBone,
+                                      glm::mat4* outPalette);
+
+// Sample clip then apply optional per-bone local euler extras (hit-flinch on top of locomotion).
+void computePaletteWithLocalExtras(const Rig& rig, int clipIndex, double phaseSec, bool loopPhase,
+                                   const glm::vec3* extraLocalEulerPerBone, glm::mat4* outPalette);
 
 // Bind hierarchy globals (before meshNorm * invBind), optional per-bone euler extras.
 void sampleBindBoneGlobalMatricesWithExtras(const Rig& rig, const glm::vec3* extraLocalEulerPerBone,
                                             glm::mat4* outGlobalBone);
-
-// Bind pose with extra local rotations on limbs (ragdollAngVel = pitch/yaw/roll rates, rad/s).
-void computeLooseBindPosePalette(const Rig& rig, glm::mat4* outPalette, const glm::vec3& ragdollAngVelRadPerSec,
-                                 float simTimeSec, uint32_t hashSeed);
 
 // Smooth transition between clips (t=0 → A, t=1 → B). Per-bone matrix lerp + smoothstep(t).
 void computePaletteLerp(const Rig& rig, int clipA, double phaseA, bool loopA, int clipB, double phaseB,

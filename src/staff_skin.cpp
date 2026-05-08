@@ -336,7 +336,14 @@ static glm::mat4 localFromChannel(const Rig::AnimChannel* ch, double tickT, cons
     return bindLocal;
   const glm::vec3 t = interpVec(ch->posKeys, tickT, defT);
   const glm::quat r = interpQuat(ch->rotKeys, tickT, defR);
-  const glm::vec3 s = interpVec(ch->sclKeys, tickT, defS);
+  glm::vec3 s = interpVec(ch->sclKeys, tickT, defS);
+  // Some GLB exports carry bogus scale keys (or huge node scales) that still survive Assimp; without a clamp
+  // idle/walk clips can blow the skinned mesh to many meters tall while the NPC logic still assumes ~1.7 m.
+  for (int k = 0; k < 3; ++k) {
+    const float base = glm::max(defS[static_cast<size_t>(k)], 0.02f);
+    s[static_cast<size_t>(k)] =
+        glm::clamp(s[static_cast<size_t>(k)], base * 0.18f, glm::min(base * 5.5f, 8.f));
+  }
   return composeTrs(t, r, s);
 }
 
@@ -978,8 +985,8 @@ void computePalette(const Rig& rig, int clipIndex, double phaseSec, glm::mat4* o
     outPalette[i] = glm::mat4(1.f);
 }
 
-void computePaletteWithRagdollExtras(const Rig& rig, int clipIndex, double phaseSec, bool loopPhase,
-                                     const glm::vec3* extraLocalEulerPerBone, glm::mat4* outPalette) {
+void computePaletteWithLocalExtras(const Rig& rig, int clipIndex, double phaseSec, bool loopPhase,
+                                   const glm::vec3* extraLocalEulerPerBone, glm::mat4* outPalette) {
   glm::mat4 g[kMaxPaletteBones];
   evalClipToBoneGlobals(rig, clipIndex, phaseSec, loopPhase, g, extraLocalEulerPerBone);
   for (int i = 0; i < rig.boneCount; ++i)
@@ -998,148 +1005,11 @@ void sampleClipBoneGlobalMatrices(const Rig& rig, int clipIndex, double phaseSec
     outGlobalBone[i] = glm::mat4(1.f);
 }
 
-// Local-space euler (radians), applied as Z * Y * X after bind rotation for a prone / collapsed silhouette.
-static glm::quat ragdollQuatEulerXYZ(float ex, float ey, float ez) {
-  return glm::normalize(glm::angleAxis(ez, glm::vec3(0.f, 0.f, 1.f)) *
-                        glm::angleAxis(ey, glm::vec3(0.f, 1.f, 0.f)) *
-                        glm::angleAxis(ex, glm::vec3(1.f, 0.f, 0.f)));
-}
-
-static int ragdollSideSign(const std::string& lower) {
-  if (lower.find("right") != std::string::npos)
-    return -1;
-  if (lower.find("left") != std::string::npos)
-    return 1;
-  return 0;
-}
-
-// Baked prone pose: keep angles modest — large per-spine flex stacks into a fetal curl; big local-Z on
-// upper arms reads as “hands overhead” on Mixamo-style rest poses.
-static glm::vec3 ragdollProneCollapseEuler(const std::string& nm, const std::string& rootName) {
-  if (nm == rootName)
-    return {0.08f, 0.f, 0.f};
-  std::string lower = nm;
-  for (char& c : lower)
-    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  const int side = ragdollSideSign(lower);
-
-  if (isPelvisHipsBone(lower))
-    return {0.12f, 0.f, 0.f};
-
-  // Less flex per spine bone avoids a sharp “cardboard hinge” at the waist; chest gets a bit more.
-  if (lower.find("chest") != std::string::npos)
-    return {0.1f, 0.f, side * 0.02f};
-  if (lower.find("spine") != std::string::npos) {
-    if (lower.find("spine2") != std::string::npos || lower.find("spine_02") != std::string::npos ||
-        lower.find("spine03") != std::string::npos || lower.find("spine_03") != std::string::npos)
-      return {0.07f, 0.f, side * 0.015f};
-    if (lower.find("spine1") != std::string::npos || lower.find("spine_01") != std::string::npos ||
-        lower.find("spine02") != std::string::npos)
-      return {0.08f, 0.f, side * 0.015f};
-    return {0.09f, 0.f, side * 0.02f};
-  }
-  if (lower.find("neck") != std::string::npos)
-    return {0.14f, 0.f, 0.f};
-  if (lower.find("head") != std::string::npos)
-    return {0.12f, side * 0.05f, 0.f};
-
-  // Roll shoulders forward / inward — negative Y pulls typical Mixamo arms off a wide T-pose.
-  if (lower.find("clavicle") != std::string::npos || lower.find("collar") != std::string::npos)
-    return {0.04f, side * -0.2f, side * -0.06f};
-  if (lower.find("shoulder") != std::string::npos)
-    return {0.06f, side * -0.22f, side * -0.08f};
-
-  if (lower.find("forearm") != std::string::npos || lower.find("lowerarm") != std::string::npos ||
-      lower.find("elbow") != std::string::npos)
-    return {0.68f, side * 0.03f, 0.f};
-  if (lower.find("hand") != std::string::npos || lower.find("wrist") != std::string::npos ||
-      lower.find("finger") != std::string::npos || lower.find("thumb") != std::string::npos)
-    return {0.1f, side * -0.08f, 0.f};
-  // Upper arm: +X forward flex, -Y adduct (swing toward torso), -Z slight inward roll.
-  if (lower.find("upperarm") != std::string::npos || lower.find("uparm") != std::string::npos)
-    return {0.4f, side * -0.32f, side * -0.38f};
-  if (lower.find("arm") != std::string::npos)
-    return {0.36f, side * -0.3f, side * -0.34f};
-
-  if (lower.find("thigh") != std::string::npos || lower.find("upleg") != std::string::npos)
-    return {-0.12f, side * 0.1f, side * 0.04f};
-  if (lower.find("calf") != std::string::npos || lower.find("shin") != std::string::npos ||
-      lower.find("knee") != std::string::npos)
-    return {0.42f, 0.f, 0.f};
-  if (lower.find("foot") != std::string::npos || lower.find("toe") != std::string::npos ||
-      lower.find("ankle") != std::string::npos)
-    return {-0.22f, side * 0.1f, side * 0.08f};
-  if (lower.find("leg") != std::string::npos)
-    return {0.18f, 0.f, 0.f};
-
-  return {0.f, 0.f, 0.f};
-}
-
-static float ragdollJointSlack(const std::string& nm, const std::string& rootName) {
-  if (nm == rootName)
-    return 0.f;
-  std::string lower = nm;
-  for (char& c : lower)
-    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  if (isPelvisHipsBone(lower))
-    return 0.1f;
-  if (lower.find("spine") != std::string::npos || lower.find("chest") != std::string::npos)
-    return 0.4f;
-  if (lower.find("neck") != std::string::npos)
-    return 0.42f;
-  if (lower.find("head") != std::string::npos)
-    return 0.52f;
-  if (lower.find("clavicle") != std::string::npos || lower.find("shoulder") != std::string::npos)
-    return 0.58f;
-  if (lower.find("upperarm") != std::string::npos || lower.find("lowerarm") != std::string::npos ||
-      lower.find("forearm") != std::string::npos || lower.find("elbow") != std::string::npos)
-    return 0.9f;
-  if (lower.find("hand") != std::string::npos || lower.find("wrist") != std::string::npos ||
-      lower.find("finger") != std::string::npos || lower.find("thumb") != std::string::npos)
-    return 0.95f;
-  if (lower.find("arm") != std::string::npos)
-    return 0.88f;
-  if (lower.find("thigh") != std::string::npos || lower.find("upleg") != std::string::npos)
-    return 0.85f;
-  if (lower.find("calf") != std::string::npos || lower.find("shin") != std::string::npos)
-    return 0.9f;
-  if (lower.find("knee") != std::string::npos)
-    return 0.84f;
-  if (lower.find("foot") != std::string::npos || lower.find("toe") != std::string::npos ||
-      lower.find("ankle") != std::string::npos)
-    return 0.93f;
-  if (lower.find("leg") != std::string::npos)
-    return 0.78f;
-  return 0.16f;
-}
-
-static glm::quat quatSmallAxisAngleVec(const glm::vec3& v) {
-  const float m = glm::length(v);
-  if (m < 1e-7f)
-    return glm::quat(1.f, 0.f, 0.f, 0.f);
-  const float a = glm::min(m, 1.25f);
-  const glm::vec3 axis = v * (1.f / m);
-  const float h = 0.5f * a;
-  return glm::normalize(glm::quat(std::cos(h), axis * std::sin(h)));
-}
-
-static uint32_t hashBoneWobble(uint32_t seed, const std::string& nm) {
-  uint32_t h = seed ^ (static_cast<uint32_t>(nm.size()) * 2166136261u);
-  for (char c : nm) {
-    h ^= static_cast<uint8_t>(c);
-    h *= 16777619u;
-  }
-  return h;
-}
-
-static glm::vec3 ragdollProneCollapseEulerScaled(const std::string& nm, const std::string& rootName,
-                                                 uint32_t hashSeed) {
-  glm::vec3 e = ragdollProneCollapseEuler(nm, rootName);
-  if (glm::length(e) < 1e-5f)
-    return e;
-  const uint32_t h = hashBoneWobble(hashSeed, nm + "|rag");
-  const float v = 0.82f + static_cast<float>(h & 255u) * (0.34f / 255.f);
-  return e * v;
+void computePaletteFromBoneGlobals(const Rig& rig, const glm::mat4* globalBone, glm::mat4* outPalette) {
+  for (int i = 0; i < rig.boneCount; ++i)
+    outPalette[i] = rig.meshNorm * globalBone[i] * rig.invBindTweaked[static_cast<size_t>(i)];
+  for (int i = rig.boneCount; i < kMaxPaletteBones; ++i)
+    outPalette[i] = glm::mat4(1.f);
 }
 
 void computeBindPosePalette(const Rig& rig, glm::mat4* outPalette) {
@@ -1201,101 +1071,6 @@ static void accumBindLocalsWithOptionalExtras(const Rig& rig, const glm::vec3* e
   dfsAccumBoneGlobals(rig, rig.rootName, glm::mat4(1.f), gTlsBoneLocals, gTlsBoneGlobals);
 }
 
-void computeBindPosePaletteWithRagdollExtras(const Rig& rig, const glm::vec3* extraLocalEulerPerBone,
-                                             glm::mat4* outPalette) {
-  if (rig.boneCount <= 0) {
-    for (int i = 0; i < kMaxPaletteBones; ++i)
-      outPalette[i] = glm::mat4(1.f);
-    return;
-  }
-  accumBindLocalsWithOptionalExtras(rig, extraLocalEulerPerBone);
-  for (int i = 0; i < rig.boneCount; ++i) {
-    const std::string& nm = rig.boneNames[static_cast<size_t>(i)];
-    auto git = gTlsBoneGlobals.find(nm);
-    const glm::mat4 g = git != gTlsBoneGlobals.end() ? git->second : glm::mat4(1.f);
-    outPalette[i] = rig.meshNorm * g * rig.invBindTweaked[static_cast<size_t>(i)];
-  }
-  for (int i = rig.boneCount; i < kMaxPaletteBones; ++i)
-    outPalette[i] = glm::mat4(1.f);
-}
-
-static int boneParentIndexSkin(const Rig& rig, int boneIdx) {
-  if (boneIdx < 0 || boneIdx >= rig.boneCount)
-    return -1;
-  const std::string& nm = rig.boneNames[static_cast<size_t>(boneIdx)];
-  auto it = rig.nodes.find(nm);
-  if (it == rig.nodes.end())
-    return -1;
-  const std::string& pn = it->second.parent;
-  if (pn.empty())
-    return -1;
-  auto pi = rig.boneNameToIndex.find(pn);
-  if (pi == rig.boneNameToIndex.end())
-    return -1;
-  return pi->second;
-}
-
-void computePaletteFromRagdollSimWorldMatrices(const Rig& rig, const glm::mat4& characterModel,
-                                               const glm::mat4* bindGlobalArmature, int nSim,
-                                               const int* simRigBoneIdx, const glm::mat4* worldBoneSim,
-                                               glm::mat4* outPalette) {
-  if (rig.boneCount <= 0) {
-    for (int i = 0; i < kMaxPaletteBones; ++i)
-      outPalette[i] = glm::mat4(1.f);
-    return;
-  }
-  const glm::mat4 invChar = glm::inverse(characterModel);
-  std::vector<int> parent(static_cast<size_t>(rig.boneCount));
-  std::vector<int> depth(static_cast<size_t>(rig.boneCount), 0);
-  for (int i = 0; i < rig.boneCount; ++i) {
-    parent[static_cast<size_t>(i)] = boneParentIndexSkin(rig, i);
-  }
-  for (int i = 0; i < rig.boneCount; ++i) {
-    int d = 0;
-    for (int x = i; x >= 0;) {
-      const int p = parent[static_cast<size_t>(x)];
-      if (p < 0)
-        break;
-      d++;
-      x = p;
-    }
-    depth[static_cast<size_t>(i)] = d;
-  }
-  std::vector<int> order(static_cast<size_t>(rig.boneCount));
-  std::iota(order.begin(), order.end(), 0);
-  std::stable_sort(order.begin(), order.end(),
-                   [&](int a, int b) { return depth[static_cast<size_t>(a)] < depth[static_cast<size_t>(b)]; });
-  std::vector<uint8_t> isSim(static_cast<size_t>(rig.boneCount), 0);
-  std::vector<int> simSlotForBone(static_cast<size_t>(rig.boneCount), -1);
-  for (int j = 0; j < nSim; ++j) {
-    const int bi = simRigBoneIdx[j];
-    if (bi >= 0 && bi < rig.boneCount) {
-      isSim[static_cast<size_t>(bi)] = 1;
-      simSlotForBone[static_cast<size_t>(bi)] = j;
-    }
-  }
-  static thread_local std::vector<glm::mat4> W;
-  W.assign(static_cast<size_t>(rig.boneCount), glm::mat4(1.f));
-  for (int idx : order) {
-    const size_t i = static_cast<size_t>(idx);
-    if (isSim[i]) {
-      const int sj = simSlotForBone[i];
-      W[i] = worldBoneSim[sj];
-      continue;
-    }
-    const int p = parent[i];
-    if (p < 0)
-      W[i] = characterModel * rig.meshNorm * bindGlobalArmature[i];
-    else
-      W[i] = W[static_cast<size_t>(p)] * glm::inverse(bindGlobalArmature[static_cast<size_t>(p)]) *
-             bindGlobalArmature[i];
-  }
-  for (int i = 0; i < rig.boneCount; ++i)
-    outPalette[i] = invChar * W[static_cast<size_t>(i)] * rig.invBindTweaked[static_cast<size_t>(i)];
-  for (int i = rig.boneCount; i < kMaxPaletteBones; ++i)
-    outPalette[i] = glm::mat4(1.f);
-}
-
 void sampleBindBoneGlobalMatricesWithExtras(const Rig& rig, const glm::vec3* extraLocalEulerPerBone,
                                             glm::mat4* outGlobalBone) {
   for (int i = 0; i < kMaxPaletteBones; ++i)
@@ -1310,75 +1085,12 @@ void sampleBindBoneGlobalMatricesWithExtras(const Rig& rig, const glm::vec3* ext
   }
 }
 
-void computeLooseBindPosePalette(const Rig& rig, glm::mat4* outPalette, const glm::vec3& ragdollAngVelRadPerSec,
-                                 float simTimeSec, uint32_t hashSeed) {
-  if (rig.boneCount <= 0) {
-    for (int i = 0; i < kMaxPaletteBones; ++i)
-      outPalette[i] = glm::mat4(1.f);
-    return;
-  }
-  constexpr float kVelToAngle = 0.11f;
-  constexpr float kWobbleRad = 0.17f;
-  const glm::vec3 velBasis = ragdollAngVelRadPerSec * kVelToAngle;
-
-  const size_t nNodes = rig.nodes.size();
-  gTlsBoneLocals.clear();
-  gTlsBoneGlobals.clear();
-  if (gTlsBoneLocals.bucket_count() < nNodes * 2)
-    gTlsBoneLocals.reserve(nNodes);
-  if (gTlsBoneGlobals.bucket_count() < nNodes * 2)
-    gTlsBoneGlobals.reserve(nNodes);
-
-  for (const auto& kv : rig.nodes) {
-    const std::string& nm = kv.first;
-    const glm::mat4& bindLocal = kv.second.bindLocal;
-    const glm::vec3 bindT(bindLocal[3]);
-    const glm::quat bindR = matToQuat(bindLocal);
-    const glm::vec3 bindS = matScale(bindLocal);
-
-    const glm::vec3 colE = ragdollProneCollapseEulerScaled(nm, rig.rootName, hashSeed);
-    const glm::quat qCollapse =
-        glm::length(colE) > 1e-5f ? ragdollQuatEulerXYZ(colE.x, colE.y, colE.z) : glm::quat(1.f, 0.f, 0.f, 0.f);
-    glm::quat rBase = glm::normalize(bindR * qCollapse);
-    if (glm::dot(rBase, bindR) < 0.f)
-      rBase = -rBase;
-
-    const float slack = ragdollJointSlack(nm, rig.rootName);
-    glm::quat rOut = rBase;
-    if (slack > 1e-4f) {
-      const uint32_t bh = hashBoneWobble(hashSeed, nm);
-      const float ph0 = static_cast<float>(bh & 1023u) * 0.00613592315f;
-      const float ph1 = static_cast<float>((bh >> 10) & 1023u) * 0.00613592315f;
-      const float ph2 = static_cast<float>((bh >> 20) & 1023u) * 0.00613592315f;
-      const float t = simTimeSec;
-      const glm::vec3 wobble(
-          std::sin(t * 4.7f + ph0) * kWobbleRad,
-          std::sin(t * 3.9f + ph1) * kWobbleRad * 0.85f,
-          std::sin(t * 5.4f + ph2) * kWobbleRad * 0.9f);
-
-      const float ax = slack * (0.35f + static_cast<float>((bh >> 3) & 63u) * 0.01f);
-      const float ay = slack * (0.28f + static_cast<float>((bh >> 9) & 63u) * 0.01f);
-      const float az = slack * (0.32f + static_cast<float>((bh >> 15) & 63u) * 0.01f);
-      glm::vec3 swing = glm::vec3(velBasis.x * ax, velBasis.y * ay, velBasis.z * az);
-      swing += wobble * slack * 0.75f;
-
-      const glm::quat qExtra = quatSmallAxisAngleVec(swing);
-      glm::quat rW = glm::normalize(rBase * qExtra);
-      if (glm::dot(rW, rBase) < 0.f)
-        rW = -rW;
-      const float looseBlend = glm::clamp(slack * 1.08f, 0.f, 0.97f);
-      rOut = glm::normalize(glm::slerp(rBase, rW, looseBlend));
-    }
-    gTlsBoneLocals[nm] = composeTrs(bindT, rOut, bindS);
-  }
-
-  dfsAccumBoneGlobals(rig, rig.rootName, glm::mat4(1.f), gTlsBoneLocals, gTlsBoneGlobals);
-  for (int i = 0; i < rig.boneCount; ++i) {
-    const std::string& nm = rig.boneNames[static_cast<size_t>(i)];
-    auto git = gTlsBoneGlobals.find(nm);
-    const glm::mat4 g = git != gTlsBoneGlobals.end() ? git->second : glm::mat4(1.f);
-    outPalette[i] = rig.meshNorm * g * rig.invBindTweaked[static_cast<size_t>(i)];
-  }
+void computeBindPosePaletteWithExtras(const Rig& rig, const glm::vec3* extraLocalEulerPerBone,
+                                      glm::mat4* outPalette) {
+  glm::mat4 g[kMaxPaletteBones];
+  sampleBindBoneGlobalMatricesWithExtras(rig, extraLocalEulerPerBone, g);
+  for (int i = 0; i < rig.boneCount; ++i)
+    outPalette[i] = rig.meshNorm * g[i] * rig.invBindTweaked[static_cast<size_t>(i)];
   for (int i = rig.boneCount; i < kMaxPaletteBones; ++i)
     outPalette[i] = glm::mat4(1.f);
 }
