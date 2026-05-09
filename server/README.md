@@ -25,8 +25,9 @@ Point the game at `http://127.0.0.1:8765`.
 
 GitHub Pages only serves static files — run this FastAPI app on a small host:
 
-- **Render (recommended with this repo):** In the Render dashboard use **New → Blueprint**, connect the RetroIkea GitHub repo, and apply the root [`render.yaml`](../render.yaml). That defines a Python web service with `rootDir: server`.
-- **Render (manual):** Web Service, root directory `server`, build `pip install -r requirements.txt`, start `uvicorn main:app --host 0.0.0.0 --port $PORT`.
+- **Render (recommended with this repo):** In the Render dashboard use **New → Blueprint**, connect the RetroIkea GitHub repo, and apply the root [`render.yaml`](../render.yaml). It runs from the repo root with `uvicorn server.main:app`.
+- **Render (manual):** Web Service from the repo root, build `pip install -r server/requirements.txt`, start `uvicorn server.main:app --host 0.0.0.0 --port $PORT --workers 1`.
+- If the public URL returns plain text `Not Found` with header `x-render-routing: no-server`, Render is not routing that hostname to any live service. Reapply the blueprint or recreate the service named `retro-ikea-lobby`, then redeploy.
 - **Railway / Fly.io**: same idea — set `PORT`, enable HTTPS at the edge.
 
 Set `LOBBY_TTL_SEC` (default `90`) so stale sessions disappear if a host crashes without unregistering.

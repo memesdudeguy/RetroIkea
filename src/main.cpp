@@ -104,6 +104,16 @@ static float gamepadAxisToUnit(Sint16 v) {
   return v < 0 ? static_cast<float>(v) / 32768.f : static_cast<float>(v) / 32767.f;
 }
 
+static int envIntOrDefault(const char* name, int fallback) {
+  if (const char* raw = std::getenv(name)) {
+    char* end = nullptr;
+    const long v = std::strtol(raw, &end, 10);
+    if (end != raw)
+      return static_cast<int>(v);
+  }
+  return fallback;
+}
+
 static int joystickButtonToControllerButton(Uint8 b) {
   // Common SDL/XInput-style raw joystick layout: A,B,X,Y,LB,RB,Back,Start,LStick,RStick.
   // This keeps generic USB pads usable when SDL has no GameController mapping for them.
@@ -9681,7 +9691,29 @@ struct App {
       return static_cast<int>(e.cbutton.button);
     if (e.type == SDL_JOYBUTTONDOWN && eventMatchesFallbackJoystick(e))
       return joystickButtonToControllerButton(e.jbutton.button);
+    if (e.type == SDL_JOYHATMOTION && eventMatchesFallbackJoystick(e)) {
+      if (e.jhat.value & SDL_HAT_UP)
+        return SDL_CONTROLLER_BUTTON_DPAD_UP;
+      if (e.jhat.value & SDL_HAT_DOWN)
+        return SDL_CONTROLLER_BUTTON_DPAD_DOWN;
+      if (e.jhat.value & SDL_HAT_LEFT)
+        return SDL_CONTROLLER_BUTTON_DPAD_LEFT;
+      if (e.jhat.value & SDL_HAT_RIGHT)
+        return SDL_CONTROLLER_BUTTON_DPAD_RIGHT;
+    }
     return -1;
+  }
+
+  float fallbackJoystickAxis(int axis) const {
+    if (!fallbackJoystick || axis < 0 || axis >= SDL_JoystickNumAxes(fallbackJoystick))
+      return 0.f;
+    return gamepadAxisToUnit(SDL_JoystickGetAxis(fallbackJoystick, axis));
+  }
+
+  bool fallbackJoystickButton(int button) const {
+    if (!fallbackJoystick || button < 0 || button >= SDL_JoystickNumButtons(fallbackJoystick))
+      return false;
+    return SDL_JoystickGetButton(fallbackJoystick, button) != 0;
   }
 
   void initWindow() {
@@ -15528,6 +15560,121 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       rebuildTitleMenuServerUiMesh();
       return;
     }
+    if (padButtonDown >= 0) {
+      if (inTitleMenu) {
+        if (titleMenuBrowseServers) {
+          if (padButtonDown == SDL_CONTROLLER_BUTTON_B) {
+            titleMenuBrowseServers = false;
+            titleMenuLobbyScroll = 0;
+            recreateTitleMenuMainGpuMesh();
+            return;
+          }
+          if (padButtonDown == SDL_CONTROLLER_BUTTON_Y) {
+            refreshTitleMenuLobbyFetchAndMesh();
+            return;
+          }
+          if (padButtonDown == SDL_CONTROLLER_BUTTON_DPAD_UP) {
+            titleMenuLobbyScroll = std::max(0, titleMenuLobbyScroll - 1);
+            rebuildTitleMenuServerUiMesh();
+            return;
+          }
+          if (padButtonDown == SDL_CONTROLLER_BUTTON_DPAD_DOWN) {
+            titleMenuLobbyScroll += 1;
+            rebuildTitleMenuServerUiMesh();
+            return;
+          }
+        } else if (titleMenuPickSlot) {
+          if (padButtonDown == SDL_CONTROLLER_BUTTON_B) {
+            titleMenuPickSlot = false;
+            titleMenuPendingLobbyJoin = false;
+            titleMenuPendingLobbyJoinHost[0] = '\0';
+            recreateTitleMenuMainGpuMesh();
+            return;
+          }
+          if (padButtonDown == SDL_CONTROLLER_BUTTON_A) {
+            beginGameFromSaveSlot(0);
+            return;
+          }
+          if (padButtonDown == SDL_CONTROLLER_BUTTON_X) {
+            beginGameFromSaveSlot(1);
+            return;
+          }
+          if (padButtonDown == SDL_CONTROLLER_BUTTON_Y) {
+            beginGameFromSaveSlot(2);
+            return;
+          }
+        } else {
+          if (padButtonDown == SDL_CONTROLLER_BUTTON_B) {
+            running = false;
+            return;
+          }
+          if (padButtonDown == SDL_CONTROLLER_BUTTON_A) {
+            if (titleMenuHasContinue)
+              continueFromLastSave();
+            else {
+              titleMenuPickSlot = true;
+              recreateTitleMenuSlotGpuMesh();
+            }
+            return;
+          }
+          if (padButtonDown == SDL_CONTROLLER_BUTTON_X) {
+            titleMenuPickSlot = true;
+            recreateTitleMenuSlotGpuMesh();
+            return;
+          }
+          if (padButtonDown == SDL_CONTROLLER_BUTTON_Y) {
+            titleMenuBrowseServers = true;
+            refreshTitleMenuLobbyFetchAndMesh();
+            return;
+          }
+        }
+      }
+      if (playerDeathShowMenu) {
+        if (padButtonDown == SDL_CONTROLLER_BUTTON_A || padButtonDown == SDL_CONTROLLER_BUTTON_START) {
+          if (netMp.active)
+            netMp.sendDeathRetry();
+          respawnPlayerAfterDeath();
+          return;
+        }
+        if (padButtonDown == SDL_CONTROLLER_BUTTON_B) {
+          returnToTitleMenuFromGame();
+          return;
+        }
+      }
+      if (showInventoryMenu) {
+        bool handledInventoryPad = true;
+        if (padButtonDown == SDL_CONTROLLER_BUTTON_DPAD_UP)
+          inventoryScrollRow = std::max(0, inventoryScrollRow - 1);
+        else if (padButtonDown == SDL_CONTROLLER_BUTTON_DPAD_DOWN)
+          ++inventoryScrollRow;
+        else if (padButtonDown == SDL_CONTROLLER_BUTTON_X)
+          (void)tryExecuteInventoryFoodDrop();
+        else if (padButtonDown == SDL_CONTROLLER_BUTTON_B || padButtonDown == SDL_CONTROLLER_BUTTON_BACK) {
+          showInventoryMenu = false;
+          inventoryUiSelectedStackIdx = -1;
+          audioSetStoreDayNightCyclePaused(false);
+          mouseGrab = true;
+          syncInputGrab();
+        } else
+          handledInventoryPad = false;
+        if (handledInventoryPad) {
+          const int maxScroll = std::max(0, inventoryStackRowCount() - 8);
+          inventoryScrollRow = std::clamp(inventoryScrollRow, 0, maxScroll);
+          inventoryMenuCacheScroll = -1;
+          return;
+        }
+      }
+      if (showPauseMenu && !pauseMenuMpIpFocused &&
+          (padButtonDown == SDL_CONTROLLER_BUTTON_A || padButtonDown == SDL_CONTROLLER_BUTTON_B)) {
+        pauseMenuMpIpFocused = false;
+        SDL_StopTextInput();
+        showPauseMenu = false;
+        audioSetStoreDayNightCyclePaused(false);
+        mouseGrab = true;
+        syncInputGrab();
+        return;
+      }
+    }
     if (e.type == SDL_MOUSEWHEEL && showInventoryMenu) {
       inventoryScrollRow = std::max(0, inventoryScrollRow - e.wheel.y);
       {
@@ -19648,26 +19795,19 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       gamepadRadialDeadzone(gpRX, gpRY, 0.15f);
     } else if (fallbackJoystick) {
       const int axes = SDL_JoystickNumAxes(fallbackJoystick);
-      const int buttons = SDL_JoystickNumButtons(fallbackJoystick);
-      const auto joyButton = [this, buttons](int idx) -> bool {
-        return idx >= 0 && idx < buttons && SDL_JoystickGetButton(fallbackJoystick, idx) != 0;
-      };
-      gpA = joyButton(0);
-      gpB = joyButton(1);
-      gpYBtn = joyButton(3);
-      gpSprintHeldPad = joyButton(4) || (axes > 4 && SDL_JoystickGetAxis(fallbackJoystick, 4) > 12000);
-      gpRtHeldPad = axes > 5 && SDL_JoystickGetAxis(fallbackJoystick, 5) > 10000;
-      gpRbHeldPad = joyButton(5);
-      gpRStickHeldPad = joyButton(9);
-      if (axes > 0)
-        gpLX = gamepadAxisToUnit(SDL_JoystickGetAxis(fallbackJoystick, 0));
-      if (axes > 1)
-        gpLY = gamepadAxisToUnit(SDL_JoystickGetAxis(fallbackJoystick, 1));
+      gpA = fallbackJoystickButton(envIntOrDefault("VULKAN_GAME_JOY_A", 0));
+      gpB = fallbackJoystickButton(envIntOrDefault("VULKAN_GAME_JOY_B", 1));
+      gpYBtn = fallbackJoystickButton(envIntOrDefault("VULKAN_GAME_JOY_Y", 3));
+      gpSprintHeldPad = fallbackJoystickButton(envIntOrDefault("VULKAN_GAME_JOY_LB", 4)) ||
+                        fallbackJoystickAxis(envIntOrDefault("VULKAN_GAME_JOY_LT_AXIS", 4)) > 0.35f;
+      gpRtHeldPad = fallbackJoystickAxis(envIntOrDefault("VULKAN_GAME_JOY_RT_AXIS", 5)) > 0.30f;
+      gpRbHeldPad = fallbackJoystickButton(envIntOrDefault("VULKAN_GAME_JOY_RB", 5));
+      gpRStickHeldPad = fallbackJoystickButton(envIntOrDefault("VULKAN_GAME_JOY_RS", 9));
+      gpLX = fallbackJoystickAxis(envIntOrDefault("VULKAN_GAME_JOY_LX_AXIS", 0));
+      gpLY = fallbackJoystickAxis(envIntOrDefault("VULKAN_GAME_JOY_LY_AXIS", 1));
       gamepadRadialDeadzone(gpLX, gpLY, 0.15f);
-      if (axes > 2)
-        gpRX = gamepadAxisToUnit(SDL_JoystickGetAxis(fallbackJoystick, 2));
-      if (axes > 3)
-        gpRY = gamepadAxisToUnit(SDL_JoystickGetAxis(fallbackJoystick, 3));
+      gpRX = fallbackJoystickAxis(envIntOrDefault("VULKAN_GAME_JOY_RX_AXIS", axes >= 5 ? 3 : 2));
+      gpRY = fallbackJoystickAxis(envIntOrDefault("VULKAN_GAME_JOY_RY_AXIS", axes >= 5 ? 4 : 3));
       gamepadRadialDeadzone(gpRX, gpRY, 0.15f);
       if (SDL_JoystickNumHats(fallbackJoystick) > 0) {
         const Uint8 hat = SDL_JoystickGetHat(fallbackJoystick, 0);
