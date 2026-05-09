@@ -23,18 +23,76 @@ Expected output:
 
   iscc packaging/windows_setup.iss
 
+Linux + Wine (Inno Setup installed in ~/.wine): after cross-building MinGW output to build-win-mingw/
+
+  ./packaging/build-installer.sh
+
+Optional: INNO_ISCC=/path/to/ISCC.exe ./packaging/build-installer.sh
+The script passes ISCC /DRetroIkeaRepoRoot=Z:\... so game files are taken from that clone's assets/
+(e.g. /home/<user>/Downloads/RetroIkea/assets under Wine's Z: drive mapping).
+
 Output:
-  packaging/RetroIkea.exe
+  packaging/RetroIkea-Beta-Setup.exe
+
+Installer look (IKEA-style palette)
+-----------------------------------
+The Inno script uses blue `#0058AB` and yellow `#FFCC00` (WizardBackColor, sidebar/header bitmaps, etc.).
+Requires **Inno Setup 6.3+** for `WizardBackColor` / related directives.
+
+To regenerate the wizard sidebar/header BMPs after editing `packaging/generate_setup_wizard_bmps.py`:
+
+  python3 packaging/generate_setup_wizard_bmps.py
+
+Tailscale + WAN multiplayer (installer + in-game hints)
+-------------------------------------------------------
+The game multiplayer stack is UDP. Tailscale assigns each machine an IPv4 in 100.64.x.x → 100.127.x.x
+(CG-NAT carrier space): two friends on the *same Tailscale tailnet* can join host using that IP.
+
+Bundled Tailscale installer (optional):
+- Place `tailscale-setup-amd64.exe` in `packaging/third_party/` — or run `packaging/build-installer.sh`,
+  which curl-downloads pkgs.tailscale.com/stable unless the file exists.
+- The Inno wizard task "Install Tailscale" runs the bundled EXE silently (`/S`) when selected.
+
+Runtime:
+- On host start the game prefers detecting that Tailscale-style IP (adapter scan + optional `tailscale ip -4`)
+  over the legacy Amazon “check WAN IP” HTTP hint (which rarely helps for raw UDP anyway).
+- Pause menu refreshes Tailscale IPv4 while hosting and shows “HOST WAITING TS …” for 100.x addresses.
+  Key **C** copies `IP:27341`; **O** opens Tailscale’s install/overview KB in the browser.
+
+“Public Tailscale”: peers must be logged into the **same tailnet** (invite in the Tailscale admin console).
+UDP play is **not** carried by Tailscale Funnel/Serve; use tailnet IPs or LAN.
 
 Notes
 - If you build with a different generator/path, update the Source path in
   packaging/windows_setup.iss to point at your actual RetroIkea.exe.
 - Keep the assets folder next to the executable in the installer package.
+- SDL2_image loads PNG/JPEG via zlib/libpng/libjpeg DLLs next to RetroIkea.exe (CMake copies them
+  from the MinGW sysroot into build-win-mingw/; Inno Setup lists them in windows_setup.iss).
+  Without them, UI PNGs fall back to solid blue placeholders.
+
+Fully dynamic Windows cross-build (optional)
+-------------------------------------------
+From a **fresh** build directory (required when toggling Assimp shared vs static):
+
+  cmake -S . -B build-win-mingw -DCMAKE_TOOLCHAIN_FILE=mingw.cmake \
+    -DVULKAN_GAME_WINDOWS_ALL_DYNAMIC=ON
+  cmake --build build-win-mingw ...
+
+CMake copies **libassimp-5.dll**, **libgcc_s_seh-1.dll**, **libstdc++-6.dll**, and **libwinpthread-1.dll**
+(next to RetroIkea.exe where your MinGW sysroot exposes them under `/usr/x86_64-w64-mingw32/bin/`).
+
+The Inno script lists those DLLs with `skipifsourcedoesntexist` so static-assimp installers still build.
 
 MinGW cross-build from Linux (this repo’s CMake)
+- H / proximity dance loads from assets/models/character/proximity_dance.glb embedded in the
+  binary for Windows (avoids baking a Linux_meshy_path that does not exist next to RetroIkea.exe).
+  Override: cmake -DVULKAN_GAME_STAFF_SHREK_DANCE_GLB_PATH=C:/path/to/dance.glb
 - The Windows target links Assimp statically and uses -static-libgcc,
   -static-libstdc++, and static winpthread so you do NOT need to ship
   libgcc_s_seh-1.dll, libstdc++-6.dll, libwinpthread-1.dll, or libassimp-5.dll.
+- Arch MinGW libwebp.dll pulls in libsharpyuv.dll and libssp-0.dll; CMake copies
+  those next to RetroIkea.exe with libwebp/libwebpdemux, and the Inno script
+  ships them. Re-run cmake --build after pulling so POST_BUILD refreshes the copies.
 - After changing Assimp from shared to static, delete build-win/_deps/assimp-build
   (or use a fresh build dir) and reconfigure so Assimp rebuilds as a static .a.
 

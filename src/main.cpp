@@ -5,6 +5,7 @@
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_filesystem.h>
 #include <SDL2/SDL_image.h>
+#include <SDL2/SDL_misc.h>
 #include <SDL2/SDL_vulkan.h>
 #include <vulkan/vulkan.h>
 
@@ -41,6 +42,8 @@
 #include "staff_skin.hpp"
 #include "staff_rp3d_ragdoll.hpp"
 #include "net_p2p.hpp"
+#include "lobby_http.hpp"
+#include "portable_path.hpp"
 // MinGW may define isfinite as a macro, which breaks qualified std::isfinite calls.
 #ifdef isfinite
 #undef isfinite
@@ -82,6 +85,17 @@ constexpr int kTargetFps = 60;
 
 namespace {
 
+static void gamepadRadialDeadzone(float& lx, float& ly, float dz) {
+  const float m = std::hypot(lx, ly);
+  if (m <= dz) {
+    lx = ly = 0.f;
+    return;
+  }
+  const float scale = (m - dz) / std::max(1.f - dz, 1e-4f);
+  lx = (lx / m) * scale;
+  ly = (ly / m) * scale;
+}
+
 template <typename DownFn>
 static bool inputSprintHeld(DownFn down) {
   return down(SDL_SCANCODE_LSHIFT) || down(SDL_SCANCODE_RSHIFT);
@@ -105,8 +119,12 @@ static bool inputStrafeRight(DownFn down) {
 
 // Sprint disabled while moving clearly backward vs camera — pure sideways (or strafe-dominant diagonals) can still sprint.
 constexpr float kSprintBackVelRefSpeed = 0.08f;
+// Third-person locomotion stays camera-forward; when actual velocity is behind the view, use walk (reversed timeline)
+// instead of the sprint clip so the avatar does not “run backward.”
+constexpr float kLocomotionSprintMinVelFwd = -0.04f;
 template <typename DownFn>
-static bool playerSprintBackwardBlocked(DownFn down, float yaw, const glm::vec2& horizVel) {
+static bool playerSprintBackwardBlocked(DownFn down, float yaw, const glm::vec2& horizVel,
+                                       float gpStickLX = 0.f, float gpStickLY = 0.f) {
   const glm::vec2 f(std::cos(yaw), std::sin(yaw));
   const glm::vec2 r(std::cos(yaw + glm::half_pi<float>()), std::sin(yaw + glm::half_pi<float>()));
   glm::vec2 wish(0.f);
@@ -114,6 +132,8 @@ static bool playerSprintBackwardBlocked(DownFn down, float yaw, const glm::vec2&
   if (inputBack(down)) wish -= f;
   if (inputStrafeLeft(down)) wish -= r;
   if (inputStrafeRight(down)) wish += r;
+  if (std::fabs(gpStickLX) > 1e-4f || std::fabs(gpStickLY) > 1e-4f)
+    wish += f * (-gpStickLY) + r * gpStickLX;
   if (glm::length(wish) > 1e-4f) {
     wish = glm::normalize(wish);
     const float wishFwd = glm::dot(wish, f);
@@ -136,30 +156,6 @@ static bool playerSprintBackwardBlocked(DownFn down, float yaw, const glm::vec2&
     return true;
   }
   return false;
-}
-
-// CMake often embeds portable paths like "assets/models/...". Assimp opens paths literally; on Windows,
-// shortcuts leave cwd in System32 or elsewhere — resolve relative paths against SDL_GetBasePath() first.
-static std::string resolvePortableDataFile(const char* path) {
-  if (!path || !path[0])
-    return {};
-#ifdef _WIN32
-  const bool absolute = (path[0] != '\0' && path[1] == ':') ||
-                        (path[0] == '\\' && path[1] == '\\');
-#else
-  const bool absolute = path[0] == '/';
-#endif
-  if (absolute)
-    return std::string(path);
-  if (char* bp = SDL_GetBasePath()) {
-    std::filesystem::path base(bp);
-    SDL_free(bp);
-    const std::filesystem::path combined = (base / path).lexically_normal();
-    std::error_code ec;
-    if (std::filesystem::is_regular_file(combined, ec))
-      return combined.string();
-  }
-  return std::string(path);
 }
 
 // SDL surfaces may pad rows (pitch > width*4); a single memcpy corrupts GPU uploads.
@@ -194,6 +190,41 @@ static std::vector<std::string> parseExtraTexturePathsFromEnv() {
     out.resize(kMaxExtraTextures);
   }
   return out;
+}
+
+// Optional pants/shirt/skin atlases for staff (extras 0..2). Drop files under assets/textures/ — no CMake needed.
+static std::vector<std::string> mergedExtraTexturePathsForLoad() {
+  std::vector<std::string> paths = parseExtraTexturePathsFromEnv();
+  static const char* kBundledStaffOptional[] = {
+      "assets/textures/staff_pants.png", "assets/textures/staff_shirt.png", "assets/textures/staff_skin.png"};
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  for (const char* logical : kBundledStaffOptional) {
+    if (paths.size() >= kMaxExtraTextures)
+      break;
+    if (std::find(paths.begin(), paths.end(), std::string(logical)) != paths.end())
+      continue;
+    fs::path resolved(resolvePortableAssetPath(logical));
+    ec.clear();
+    if (!fs::is_regular_file(resolved, ec))
+      continue;
+    paths.emplace_back(logical);
+  }
+  if (paths.size() > kMaxExtraTextures)
+    paths.resize(kMaxExtraTextures);
+  return paths;
+}
+
+static bool skipStaffGlbEmbeddedDiffuseAtlas() {
+#if defined(VULKAN_GAME_STAFF_DISABLE_EMBEDDED_DIFFUSE)
+  return true;
+#else
+  const char* force = std::getenv("VULKAN_GAME_STAFF_FORCE_PROCEDURAL_UNIFORM");
+  if (!force || !force[0])
+    return false;
+  return force[0] == '1' || std::strcmp(force, "true") == 0 || std::strcmp(force, "yes") == 0 ||
+         std::strcmp(force, "on") == 0;
+#endif
 }
 
 static void copySdlRgbaSurfaceRowsToBuffer(const SDL_Surface* rgba, void* dst, uint32_t texW,
@@ -891,9 +922,14 @@ struct SwapchainSupportDetails {
   } while (0)
 
 std::vector<char> readFile(const std::string& path) {
-  std::ifstream file(path, std::ios::ate | std::ios::binary);
+  const std::string usePath = resolvePortableAssetPath(path.c_str());
+#ifdef _WIN32
+  std::ifstream file(std::filesystem::u8path(usePath), std::ios::ate | std::ios::binary);
+#else
+  std::ifstream file(usePath, std::ios::ate | std::ios::binary);
+#endif
   if (!file)
-    throw std::runtime_error("failed to open file: " + path);
+    throw std::runtime_error("failed to open file: " + usePath);
   const size_t size = static_cast<size_t>(file.tellg());
   std::vector<char> buffer(size);
   file.seekg(0);
@@ -4732,19 +4768,22 @@ static std::vector<Vertex> buildControlsHelpOverlayVertices() {
   std::vector<Vertex> mesh;
 
   static char kTitle[] = "CONTROLS";
-  static char kBody[] = "WASD / ARROWS      MOVE\n"
-                        "MOUSE              LOOK\n"
-                        "SPACE              JUMP\n"
-                        "SHIFT              SPRINT\n"
-                        "C                  CROUCH\n"
-                        "C + SHIFT          SLIDE\n"
+  static char kBody[] = "WASD / STICK       MOVE\n"
+                        "MOUSE / R STICK    LOOK\n"
+                        "SPACE / A          JUMP\n"
+                        "SHIFT / LB (LT)    SPRINT\n"
+                        "C / B              CROUCH\n"
+                        "C + SHIFT + FWD    SLIDE\n"
                         "\n"
                         "SPACE AT LEDGE     GRAB / CLIMB\n"
                         "SPACE AT WALL      WALL JUMP / CLIMB\n"
                         "SHIFT AT WALL      WALL RUN\n"
-                        "X                  CANCEL CLIMB\n"
+                        "X / Y              CANCEL CLIMB\n"
                         "\n"
-                        "LMB                SHOVE STAFF\n"
+                        "LMB / RB           SHOVE STAFF\n"
+                        "R3 (PRESS STICK)   KICK\n"
+                        "RT / X (WEST)      PICK UP FOOD\n"
+                        "START              PAUSE   BACK = INV\n"
                         "ESC                PAUSE";
   static char kDismiss[] = "PRESS ANY KEY TO CONTINUE";
   constexpr float kHelpPxToNdc = 0.00052f;
@@ -4971,7 +5010,8 @@ static std::vector<Vertex> buildDeathMenuOverlayVertices() {
 
 static std::string pauseMenuBuildSubString(const char* hostBtnLine, const char* ipLine) {
   return std::string("RESUME\nEXIT\n") + hostBtnLine + "\nJOIN AT IP\nSTOP MULTIPLAYER\n" + ipLine +
-         "\n(press I to edit, Enter to join)";
+         "\n(press I to edit, Enter to join)\n"
+         "WAN: TAILSCALE + YOUR 100.x HOST IP  |  C COPY JOIN LINE  |  O TAILSCALE HELP";
 }
 
 static bool parseJoinTargetIpPort(const char* raw, char* outIp, size_t outIpCap, uint16_t& outPort) {
@@ -5127,6 +5167,29 @@ static std::vector<Vertex> buildPauseMenuOverlayVertices(const char* mpStatusLin
   return mesh;
 }
 
+struct WorldDroppedFood {
+  glm::vec3 pos{0.f};
+  std::string item;
+};
+
+/// Keep in sync with `buildInventoryOverlayVertices` DROP chip.
+static constexpr float kInvDropBtnBaselineY = -0.525f;
+static constexpr float kInvDropBtnPxToNdc = 0.00056f;
+static constexpr float kInvDropBtnHalfW = 0.16f;
+static constexpr float kInvDropChipCenterXNdc = 0.62f;
+
+static bool inventoryDropButtonContainsNdc(float ndcX, float ndcY) {
+  if (!gHudUiFontReady)
+    return false;
+  const float lineH = gHudUiFontLineSkipPx * kInvDropBtnPxToNdc;
+  const float btnHalfH = lineH * 1.02f;
+  constexpr float kBaselineMul = 0.17f;
+  const float cy = kInvDropBtnBaselineY + lineH * kBaselineMul;
+  const float x0 = kInvDropChipCenterXNdc - kInvDropBtnHalfW;
+  const float x1 = kInvDropChipCenterXNdc + kInvDropBtnHalfW;
+  return ndcX >= x0 && ndcX <= x1 && ndcY >= cy - btnHalfH && ndcY <= cy + btnHalfH;
+}
+
 static std::vector<std::pair<std::string, int>> buildInventoryStacks(
     const std::vector<std::string>& items) {
   std::vector<std::pair<std::string, int>> stacks;
@@ -5146,7 +5209,8 @@ static std::vector<std::pair<std::string, int>> buildInventoryStacks(
 }
 
 static std::vector<Vertex> buildInventoryOverlayVertices(const std::vector<std::string>& items,
-                                                         int scrollRow) {
+                                                         int scrollRow,
+                                                         int selectedStackIdx) {
   const glm::vec3 n{0.0f, 0.0f, 1.0f};
   std::vector<Vertex> mesh;
   mesh.reserve(2200);
@@ -5215,9 +5279,11 @@ static std::vector<Vertex> buildInventoryOverlayVertices(const std::vector<std::
         const int idx = start + r;
         if (idx >= totalRows)
           break;
-        const std::string row = std::to_string(idx + 1) + ". " +
-                                stacks[static_cast<size_t>(idx)].first + " x" +
-                                std::to_string(stacks[static_cast<size_t>(idx)].second);
+        std::string row = std::to_string(idx + 1) + ". " +
+                          stacks[static_cast<size_t>(idx)].first + " x" +
+                          std::to_string(stacks[static_cast<size_t>(idx)].second);
+        if (selectedStackIdx >= 0 && idx == selectedStackIdx)
+          row += "  [SELECTED]";
         const float rw = measureHudFontRunPx(row.c_str(), row.size(), kTrack) * kItemPx;
         appendHudFontRun(mesh, n, kUiIkeaFontOpt, row.c_str(), row.size(),
                          -std::min(0.58f, 0.5f * rw), rowY, kItemPx, kTrack);
@@ -5226,11 +5292,25 @@ static std::vector<Vertex> buildInventoryOverlayVertices(const std::vector<std::
     }
 
     const std::string hint =
-        "MOUSE WHEEL / UP-DOWN SCROLL  |  STACKS " + std::to_string(stacks.size()) +
-        "  ITEMS " + std::to_string(items.size());
+        "LMB EAT (FOOD)  |  SHIFT+LMB / MMB DROP ROW  |  RMB SELECT + DROP / G  |  WHEEL SCROLL  |  STACKS " +
+        std::to_string(stacks.size()) + "  ITEMS " + std::to_string(items.size());
     const float hw = measureHudFontRunPx(hint.c_str(), hint.size(), kTrack) * kSubPx;
-    appendHudFontRun(mesh, n, kUiIkeaFontPri, hint.c_str(), hint.size(), -0.5f * hw, -0.58f, kSubPx,
+    appendHudFontRun(mesh, n, kUiIkeaFontPri, hint.c_str(), hint.size(), -0.5f * hw, -0.62f, kSubPx,
                      kTrack);
+
+    static const char kDrop[] = "DROP";
+    const float dropLineH = gHudUiFontLineSkipPx * kInvDropBtnPxToNdc;
+    const float dropBtnHalfH = dropLineH * 1.02f;
+    constexpr float kBaselineMulDrop = 0.17f;
+    const float dropCy = kInvDropBtnBaselineY + dropLineH * kBaselineMulDrop;
+    const glm::vec3 ba{kInvDropChipCenterXNdc - kInvDropBtnHalfW, dropCy - dropBtnHalfH, 0.f};
+    const glm::vec3 bb{kInvDropChipCenterXNdc + kInvDropBtnHalfW, dropCy - dropBtnHalfH, 0.f};
+    const glm::vec3 bc{kInvDropChipCenterXNdc + kInvDropBtnHalfW, dropCy + dropBtnHalfH, 0.f};
+    const glm::vec3 bd{kInvDropChipCenterXNdc - kInvDropBtnHalfW, dropCy + dropBtnHalfH, 0.f};
+    appendPanelQuad(mesh, n, kUiOptionBtnTag, ba, bb, bc, bd);
+    const float dw = measureHudFontRunPx(kDrop, sizeof(kDrop) - 1, kTrack) * kItemPx;
+    appendHudFontRun(mesh, n, kUiIkeaFontOpt, kDrop, sizeof(kDrop) - 1,
+                     kInvDropChipCenterXNdc - 0.5f * dw, kInvDropBtnBaselineY, kItemPx, kTrack);
   }
 
   return mesh;
@@ -5286,7 +5366,7 @@ static UiMenuClickLayout computeTitleMenuMainClickLayout(bool showContinue) {
   int subLines = 1;
   if (gHudUiFontReady) {
     const char* kSub =
-        showContinue ? "CONTINUE\nNEW GAME\nEXIT" : "NEW GAME\nEXIT";
+        showContinue ? "CONTINUE\nNEW GAME\nONLINE\nEXIT" : "NEW GAME\nONLINE\nEXIT";
     for (const char* q = kSub; *q; ++q)
       if (*q == '\n')
         ++subLines;
@@ -5299,10 +5379,10 @@ static UiMenuClickLayout computeTitleMenuMainClickLayout(bool showContinue) {
         sn = p + 1;
       }
     }
-    L.optionLines = showContinue ? 3 : 2;
+    L.optionLines = showContinue ? 4 : 3;
   } else {
     subW = 0.5f;
-    subLines = showContinue ? 3 : 2;
+    subLines = showContinue ? 4 : 3;
     L.optionLines = subLines;
   }
   constexpr float panelPadX = 0.22f;
@@ -5384,6 +5464,7 @@ static UiMenuClickLayout computeTitleMenuSlotPickerClickLayout(const std::array<
 static UiMenuClickLayout computeDeathMenuClickLayout() {
   UiMenuClickLayout L{};
   static const char kTitle[] = "YOU DIED";
+  static const char kSub[] = "RETRY\nEXIT";
   constexpr float kDeathTitlePx = 0.00095f;
   constexpr float kDeathSubPx = 0.00056f;
   const float deathLineMul = kIkeaMenuOptionLineSkipMul * kDeathMenuOptionLineExtraMul;
@@ -5392,7 +5473,6 @@ static UiMenuClickLayout computeDeathMenuClickLayout() {
   constexpr int subLines = 2;
   if (gHudUiFontReady) {
     titleW = measureHudFontRunPx(kTitle, std::strlen(kTitle), kIkeaMenuFontTrackPx) * kDeathTitlePx;
-  static const char kSub[] = "RETRY\nEXIT";
     const char* sn = kSub;
     for (const char* p = kSub;; ++p) {
       if (*p == '\n' || *p == '\0') {
@@ -5416,11 +5496,13 @@ static UiMenuClickLayout computeDeathMenuClickLayout() {
   const float subBlockH =
       gHudUiFontReady ? (static_cast<float>(subLines) * gHudUiFontLineSkipPx * kDeathSubPx * deathLineMul + 0.06f)
                       : 0.24f;
-  const float textStackH = titleBlockH + subBlockH + (gHudUiFontReady ? 0.1f : 0.05f);
+  // Must match buildDeathMenuOverlayVertices() textStackH / panel extent.
+  const float textStackH = titleBlockH + subBlockH + (gHudUiFontReady ? 0.14f : 0.05f);
   const float panelBotY = panelTopY - textStackH - 2.f * panelPadY;
   (void)panelBotY;
   const float line1Y = panelTopY - panelPadY - titleBlockH * 0.2f;
-  L.line2Y = line1Y - titleBlockH - (gHudUiFontReady ? 0.055f : 0.03f);
+  // Must match buildDeathMenuOverlayVertices() line2Y (option row baseline).
+  L.line2Y = line1Y - titleBlockH - (gHudUiFontReady ? 0.08f : 0.04f);
   L.lineHeightNdc = gHudUiFontReady ? gHudUiFontLineSkipPx * kDeathSubPx
                                     : std::max(gHudUiFontLineSkipPx * kDeathSubPx, 0.048f);
   L.lineSkipNdc = L.lineHeightNdc * deathLineMul;
@@ -5561,7 +5643,7 @@ static std::vector<Vertex> buildTitleMenuMainOverlayVertices(bool showContinue) 
   const glm::vec3 n{0.0f, 0.0f, 1.0f};
   std::vector<Vertex> mesh;
   mesh.reserve(1200);
-  const char* kSub = showContinue ? "CONTINUE\nNEW GAME\nEXIT" : "NEW GAME\nEXIT";
+  const char* kSub = showContinue ? "CONTINUE\nNEW GAME\nONLINE\nEXIT" : "NEW GAME\nONLINE\nEXIT";
   constexpr float kSubPx = 0.00062f;
 
   {
@@ -5606,7 +5688,7 @@ static std::vector<Vertex> buildTitleMenuMainOverlayVertices(bool showContinue) 
     }
   } else {
     subW = 0.5f;
-    subLines = showContinue ? 3 : 2;
+    subLines = showContinue ? 4 : 3;
   }
 
   constexpr float panelPadX = 0.22f;
@@ -5633,7 +5715,7 @@ static std::vector<Vertex> buildTitleMenuMainOverlayVertices(bool showContinue) 
     appendHudFontMultilineCentered(mesh, n, kUiIkeaFontOpt, kSub, 0.f, line2Y, kSubPx,
                                    kIkeaMenuFontTrackPx, kTitleMenuOptionLineSkipMul);
   } else {
-    const char* fb = showContinue ? "CONTINUE\nNEW GAME\nEXIT" : "NEW GAME\nEXIT";
+    const char* fb = showContinue ? "CONTINUE\nNEW GAME\nONLINE\nEXIT" : "NEW GAME\nONLINE\nEXIT";
     constexpr float scale = 0.0048f;
     stb_easy_font_spacing(-0.5f);
     const int fontW = stb_easy_font_width(const_cast<char*>(fb));
@@ -5705,6 +5787,182 @@ static std::vector<Vertex> buildTitleMenuSlotPickerVertices(const std::array<boo
       gHudUiFontReady ? (static_cast<float>(subLines) * gHudUiFontLineSkipPx * kSubPx * kIkeaMenuOptionLineSkipMul +
                          0.02f)
                       : 0.38f;
+  const float textStackH = titleBlockH + subBlockH + 0.04f;
+  const float panelBotY = panelTopY - textStackH - 2.f * panelPadY;
+
+  const glm::vec3 pa{-panelHalfW, panelBotY, 0.f};
+  const glm::vec3 pb{panelHalfW, panelBotY, 0.f};
+  const glm::vec3 pc{panelHalfW, panelTopY, 0.f};
+  const glm::vec3 pd{-panelHalfW, panelTopY, 0.f};
+  appendPanelQuad(mesh, n, kUiIkeaPanelTag, pa, pb, pc, pd);
+  appendMenuFrameQuad(mesh, n, pa, pb, pc, pd);
+
+  const float line1Y = panelTopY - panelPadY - titleBlockH * 0.2f;
+  const float line2Y = line1Y - titleBlockH - 0.03f;
+  if (gHudUiFontReady) {
+    const float tw = measureHudFontRunPx(kTitle, std::strlen(kTitle), kIkeaMenuFontTrackPx) * kTitlePx;
+    appendHudFontRun(mesh, n, kUiIkeaFontAcc, kTitle, std::strlen(kTitle), -0.5f * tw, line1Y, kTitlePx,
+                     kIkeaMenuFontTrackPx);
+    appendOptionBtnQuads(mesh, n, block, line2Y, kSubPx, kIkeaMenuOptionLineSkipMul, panelHalfW - 0.02f);
+    appendHudFontMultilineCentered(mesh, n, kUiIkeaFontOpt, block, 0.f, line2Y, kSubPx,
+                                   kIkeaMenuFontTrackPx, kIkeaMenuOptionLineSkipMul);
+  } else {
+    constexpr float scale = 0.0042f;
+    stb_easy_font_spacing(-0.5f);
+    appendStbEasyQuads(mesh, n, kUiTextTag, block, -0.5f * subW, line2Y, scale);
+  }
+  return mesh;
+}
+
+static constexpr int kLobbyBrowserVisibleRows = 6;
+
+static void fillLobbyBrowserBlock(const std::vector<LobbyListedServer>& servers, int& scrollInOut,
+                                  const std::string& statusLine, char* block, size_t cap) {
+  const int n = static_cast<int>(servers.size());
+  const int maxScroll = std::max(0, n - kLobbyBrowserVisibleRows);
+  scrollInOut = std::clamp(scrollInOut, 0, maxScroll);
+  int pos = 0;
+  pos += std::snprintf(block + pos, cap - pos, "FIND SESSION\n");
+  const char* st = statusLine.empty() ? "—" : statusLine.c_str();
+  pos += std::snprintf(block + pos, cap - pos, "%s\nREFRESH\n", st);
+  if (n == 0)
+    pos += std::snprintf(block + pos, cap - pos, "(LIST EMPTY)\n");
+  else {
+    for (int i = 0; i < kLobbyBrowserVisibleRows && scrollInOut + i < n; ++i) {
+      const LobbyListedServer& s = servers[static_cast<size_t>(scrollInOut + i)];
+      const char* nm = s.name.empty() ? "game" : s.name.c_str();
+      pos += std::snprintf(block + pos, cap - pos, "%s  %s:%u\n", nm, s.host.c_str(),
+                           static_cast<unsigned>(s.port));
+    }
+  }
+  pos += std::snprintf(block + pos, cap - pos, "BACK\n");
+  if (pos >= static_cast<int>(cap))
+    block[cap - 1] = '\0';
+}
+
+static int lobbyShownServerRows(const std::vector<LobbyListedServer>& servers, int scrollInOut) {
+  const int n = static_cast<int>(servers.size());
+  if (n == 0)
+    return 1;
+  const int maxScroll = std::max(0, n - kLobbyBrowserVisibleRows);
+  const int sc = std::clamp(scrollInOut, 0, maxScroll);
+  return std::min(kLobbyBrowserVisibleRows, n - sc);
+}
+
+static UiMenuClickLayout computeTitleMenuServerBrowserClickLayout(const std::vector<LobbyListedServer>& servers,
+                                                                  int scrollInOut,
+                                                                  const std::string& statusLine) {
+  UiMenuClickLayout L{};
+  char block[4096]{};
+  int scrollTmp = scrollInOut;
+  fillLobbyBrowserBlock(servers, scrollTmp, statusLine, block, sizeof(block));
+  static const char kTitle[] = "LOBBY";
+  constexpr float kTitlePx = 0.00112f;
+  constexpr float kSubPx = 0.00058f;
+  float titleW = 0.f;
+  float subW = 0.f;
+  int subLines = 1;
+  if (gHudUiFontReady) {
+    titleW = measureHudFontRunPx(kTitle, std::strlen(kTitle), kIkeaMenuFontTrackPx) * kTitlePx;
+    for (const char* q = block; *q; ++q)
+      if (*q == '\n')
+        ++subLines;
+    const char* sn = block;
+    for (const char* p = block;; ++p) {
+      if (*p == '\n' || *p == '\0') {
+        subW = std::max(
+            subW, measureHudFontRunPx(sn, static_cast<size_t>(p - sn), kIkeaMenuFontTrackPx) * kSubPx);
+        if (*p == '\0')
+          break;
+        sn = p + 1;
+      }
+    }
+  } else {
+    titleW = 0.4f;
+    subW = 0.58f;
+    subLines = 10;
+  }
+  constexpr float panelPadX = 0.22f;
+  constexpr float panelPadY = 0.12f;
+  L.panelHalfW = std::max(0.5f * std::max(titleW, subW) + panelPadX, 0.64f);
+  constexpr float panelTopY = 0.16f;
+  const float titleBlockH = gHudUiFontReady ? gHudUiFontLineSkipPx * kTitlePx : 0.09f;
+  const float subBlockH =
+      gHudUiFontReady ? (static_cast<float>(subLines) * gHudUiFontLineSkipPx * kSubPx * kIkeaMenuOptionLineSkipMul +
+                         0.02f)
+                      : 0.42f;
+  const float textStackH = titleBlockH + subBlockH + 0.04f;
+  const float panelBotY = panelTopY - textStackH - 2.f * panelPadY;
+  (void)panelBotY;
+  const float line1Y = panelTopY - panelPadY - titleBlockH * 0.2f;
+  const float line2Y = line1Y - titleBlockH - 0.03f;
+  L.line2Y = line2Y;
+  L.lineHeightNdc =
+      gHudUiFontReady ? gHudUiFontLineSkipPx * kSubPx : std::max(gHudUiFontLineSkipPx * kSubPx, 0.048f);
+  L.lineSkipNdc = L.lineHeightNdc * kIkeaMenuOptionLineSkipMul;
+  L.optionLines = subLines;
+  return L;
+}
+
+static std::vector<Vertex> buildTitleMenuServerBrowserVertices(const std::vector<LobbyListedServer>& servers,
+                                                               int scrollInOut,
+                                                               const std::string& statusLine) {
+  const glm::vec3 n{0.0f, 0.0f, 1.0f};
+  std::vector<Vertex> mesh;
+  mesh.reserve(2500);
+  char block[4096]{};
+  int scrollTmp = scrollInOut;
+  fillLobbyBrowserBlock(servers, scrollTmp, statusLine, block, sizeof(block));
+  static const char kTitle[] = "LOBBY";
+  constexpr float kTitlePx = 0.00112f;
+  constexpr float kSubPx = 0.00058f;
+
+  {
+    const glm::vec3 v0{-1.f, -1.f, 0.f};
+    const glm::vec3 v1{1.f, -1.f, 0.f};
+    const glm::vec3 v2{1.f, 1.f, 0.f};
+    const glm::vec3 v3{-1.f, 1.f, 0.f};
+    mesh.push_back({v0, n, kUiHudVignetteTag, {}});
+    mesh.push_back({v2, n, kUiHudVignetteTag, {}});
+    mesh.push_back({v1, n, kUiHudVignetteTag, {}});
+    mesh.push_back({v0, n, kUiHudVignetteTag, {}});
+    mesh.push_back({v3, n, kUiHudVignetteTag, {}});
+    mesh.push_back({v2, n, kUiHudVignetteTag, {}});
+  }
+
+  float titleW = 0.f;
+  float subW = 0.f;
+  int subLines = 1;
+  if (gHudUiFontReady) {
+    titleW = measureHudFontRunPx(kTitle, std::strlen(kTitle), kIkeaMenuFontTrackPx) * kTitlePx;
+    for (const char* q = block; *q; ++q)
+      if (*q == '\n')
+        ++subLines;
+    const char* sn = block;
+    for (const char* p = block;; ++p) {
+      if (*p == '\n' || *p == '\0') {
+        subW = std::max(
+            subW, measureHudFontRunPx(sn, static_cast<size_t>(p - sn), kIkeaMenuFontTrackPx) * kSubPx);
+        if (*p == '\0')
+          break;
+        sn = p + 1;
+      }
+    }
+  } else {
+    titleW = 0.4f;
+    subW = 0.58f;
+    subLines = 10;
+  }
+
+  constexpr float panelPadX = 0.22f;
+  constexpr float panelPadY = 0.12f;
+  const float panelHalfW = std::max(0.5f * std::max(titleW, subW) + panelPadX, 0.64f);
+  constexpr float panelTopY = 0.16f;
+  const float titleBlockH = gHudUiFontReady ? gHudUiFontLineSkipPx * kTitlePx : 0.09f;
+  const float subBlockH =
+      gHudUiFontReady ? (static_cast<float>(subLines) * gHudUiFontLineSkipPx * kSubPx * kIkeaMenuOptionLineSkipMul +
+                         0.02f)
+                      : 0.42f;
   const float textStackH = titleBlockH + subBlockH + 0.04f;
   const float panelBotY = panelTopY - textStackH - 2.f * panelPadY;
 
@@ -6246,6 +6504,7 @@ struct App {
   std::vector<Vertex> inventoryMenuVertexCache;
   uint32_t inventoryMenuVertexCount = 0;
   int inventoryMenuCacheScroll = -1;
+  int inventoryMenuCacheSelectedIdx = std::numeric_limits<int>::max();
   uint32_t inventoryMenuCacheRevision = 0;
   VkBuffer titleMenuMainVertexBuffer = VK_NULL_HANDLE;
   VkDeviceMemory titleMenuMainVertexBufferMemory = VK_NULL_HANDLE;
@@ -6253,6 +6512,18 @@ struct App {
   VkBuffer titleMenuSlotVertexBuffer = VK_NULL_HANDLE;
   VkDeviceMemory titleMenuSlotVertexBufferMemory = VK_NULL_HANDLE;
   uint32_t titleMenuSlotVertexCount = 0;
+  VkBuffer titleMenuServerVertexBuffer = VK_NULL_HANDLE;
+  VkDeviceMemory titleMenuServerVertexBufferMemory = VK_NULL_HANDLE;
+  uint32_t titleMenuServerVertexCount = 0;
+  bool titleMenuBrowseServers = false;
+  std::vector<LobbyListedServer> titleMenuLobbyServers;
+  std::string titleMenuLobbyStatus;
+  int titleMenuLobbyScroll = 0;
+  char titleMenuPendingLobbyJoinHost[128]{};
+  uint16_t titleMenuPendingLobbyJoinPort = kRetroMpDefaultPort;
+  bool titleMenuPendingLobbyJoin = false;
+  char lobbyHeartbeatSessionId[40]{};
+  double lobbyHeartbeatAccumSec = 0.;
   bool inIntroSplash = true;
   float introSplashTime = 0.f;
   VkBuffer introSplashVertexBuffer = VK_NULL_HANDLE;
@@ -6418,7 +6689,7 @@ struct App {
   int staffClipMeleeFall = -1;
   int staffClipMeleeStand = -1;
   int staffClipShoveHair = -1;
-  // Retargeted from VULKAN_GAME_STAFF_SHREK_PROXIMITY_DANCE_GLB or Shrek egg GLB; phase syncs shrekEggAnimPhase.
+  // Retargeted from proximity dance GLB (Meshy hip-hop preferred) or Shrek egg GLB; phase syncs shrekEggAnimPhase.
   int staffClipShrekProximityDance = -1;
   bool pendingStaffShoveLmb = false;
   bool pendingPlayerKick = false;
@@ -6479,9 +6750,8 @@ struct App {
   float thirdPersonCamDist = 3.35f;
   float lastDrawFrameDt = 1.f / 60.f;
   float fpAvatarYawSmooth = 0.f;
-  // Extra yaw added to FP body when backpedalling (normally 0 or π): keeps mesh facing motion, not camera.
+  // Kept for clarity (always 0): locomotion mesh stays camera-aligned.
   float fpLocoAvatarYawFlip = 0.f;
-  bool fpLocoBackwardBodyFlip = false;
   float avatarHorizSpeedSmoothed = 0.f;
   // Distance-driven phase (seconds of clip timeline) for idle/walk/sprint/crouch — synced to horizDist.
   double avatarLocoPhaseSec = 0.0;
@@ -6545,6 +6815,10 @@ struct App {
   bool playerJumpSquatCharging = false;
   float playerDepthJumpWindowRemain = 0.f;
   bool spaceWasDown = false;
+  SDL_GameController* gameController = nullptr;
+  bool gpRtPickupHeldPrev = false;
+  bool gpRbShoveHeldPrev = false;
+  bool gpRStickKickHeldPrev = false;
   float playerJumpMinIntervalRem = 0.f;
   float playerJumpRepeatWindowRem = 0.f;
   // One slide trigger per physical C keydown (avoids double-edge from merged keyboard state).
@@ -6567,8 +6841,10 @@ struct App {
   double mpClientLastLinkMono = -1.0;
   bool showInventoryMenu = false;
   int inventoryScrollRow = 0;
+  int inventoryUiSelectedStackIdx = -1;
   uint32_t inventoryRevision = 1;
   std::vector<std::string> inventoryItems;
+  std::vector<WorldDroppedFood> worldDroppedFood;
   std::unordered_map<uint64_t, uint8_t> deliPizzaSlicesBySlot;
   std::unordered_map<uint64_t, float> deliPizzaReplenishTimerBySlot;
   std::unordered_map<uint64_t, uint8_t> deliMeatballsBySlot;
@@ -7199,7 +7475,8 @@ struct App {
 
   // Player visible to staff for pursuit (same geometry as night chase: wide cone, behind sense, shelf elev).
   bool staffPlayerVisibleInChaseCone(const ShelfEmployeeNpc& e, float distP, const glm::vec2& toPlayer,
-                                      float playerFeetYVis) const {
+                                      float playerFeetYVis, float playerHeadWorldY,
+                                      float playerEyeHeight) const {
     const glm::vec2 fwd(std::sin(e.yaw), std::cos(e.yaw));
     glm::vec2 toPn(0.f);
     if (distP > 1e-4f)
@@ -7211,9 +7488,10 @@ struct App {
       dotCone = std::max(dotF, glm::dot(toPn, e.velXZ * (1.f / vCh)));
     const float staffEyeY =
         e.feetWorldY + (kNightStaffVisionEyeY - kGroundY) * e.bodyScale.y;
-    const float dyPlayerEyes = camPos.y - staffEyeY;
+    const float dyPlayerEyes = playerHeadWorldY - staffEyeY;
     const float elevAboveHoriz = std::atan2(dyPlayerEyes, std::max(distP, 1e-3f));
-    const float crouchT = glm::clamp((kEyeHeight - eyeHeight) / (kEyeHeight - kCrouchEyeHeight), 0.f, 1.f);
+    const float crouchT =
+        glm::clamp((kEyeHeight - playerEyeHeight) / (kEyeHeight - kCrouchEyeHeight), 0.f, 1.f);
     const float visRange = kNightStaffChaseVisionRange * glm::mix(1.f, kCrouchStealthVisionRangeMul, crouchT);
     const float visCosHalf = kNightStaffChaseVisionCosHalfFov;
     const float behindSenseM = kNightStaffChaseBehindSenseM * glm::mix(1.f, kCrouchStealthBehindSenseMul, crouchT);
@@ -7229,6 +7507,50 @@ struct App {
         withinElevSight && distP <= visRange && dotCone >= visCosHalf;
     const bool closeBehind =
         withinElevSight && distP <= behindSenseM && dotF < 0.12f;
+    return inFrontCone || closeBehind;
+  }
+
+  // Night AI vision check for an arbitrary player anchor (local host or linked MP peer).
+  bool staffNpcNightVisionDetectPlayer(const ShelfEmployeeNpc& e, const glm::vec2& playerXZ,
+                                       float playerFeetYVis, float playerHeadWorldY,
+                                       float playerEyeHeight) const {
+    const glm::vec2 toPlayer = playerXZ - e.posXZ;
+    const float distP = glm::length(toPlayer);
+    const glm::vec2 fwd(std::sin(e.yaw), std::cos(e.yaw));
+    glm::vec2 toPn(0.f);
+    if (distP > 1e-4f)
+      toPn = toPlayer / distP;
+    const float dotF = glm::dot(toPn, fwd);
+    const bool chaseVision = (e.nightPhase == 2);
+    float dotCone = dotF;
+    if (chaseVision) {
+      const float vCh = glm::length(e.velXZ);
+      if (vCh > kNightStaffChaseVisionVelConeMinSpeed)
+        dotCone = std::max(dotF, glm::dot(toPn, e.velXZ * (1.f / vCh)));
+    }
+    const float staffEyeY =
+        e.feetWorldY + (kNightStaffVisionEyeY - kGroundY) * e.bodyScale.y;
+    const float dyPlayerEyes = playerHeadWorldY - staffEyeY;
+    const float elevAboveHoriz =
+        std::atan2(dyPlayerEyes, std::max(distP, 1e-3f)); // + = player above staff eye level
+    const float crouchT = glm::clamp((kEyeHeight - playerEyeHeight) / (kEyeHeight - kCrouchEyeHeight), 0.f, 1.f);
+    const float stealthVisMul = glm::mix(1.f, kCrouchStealthVisionRangeMul, crouchT);
+    const float stealthBehindMul = glm::mix(1.f, kCrouchStealthBehindSenseMul, crouchT);
+    const float visRange = (chaseVision ? kNightStaffChaseVisionRange : kNightStaffVisionRange) * stealthVisMul;
+    const float visCosHalf = chaseVision ? kNightStaffChaseVisionCosHalfFov : kNightStaffVisionCosHalfFov;
+    const float behindSenseM =
+        (chaseVision ? kNightStaffChaseBehindSenseM : kNightStaffBehindSenseM) * stealthBehindMul;
+    const float maxElevAboveDeg =
+        chaseVision ? kNightStaffChaseVisionMaxElevAboveDeg : kNightStaffVisionMaxElevAboveDeg;
+    const bool ledgedUpForVision =
+        playerFeetYVis >= kGroundY + kNightStaffVisionPlayerLedgedFeetAboveFloorM;
+    const float elevCapRad =
+        (ledgedUpForVision && distP <= visRange)
+            ? glm::radians(kNightStaffVisionLedgedMaxElevAboveDeg)
+            : glm::radians(maxElevAboveDeg);
+    const bool withinElevSight = elevAboveHoriz <= elevCapRad;
+    const bool inFrontCone = withinElevSight && distP <= visRange && dotCone >= visCosHalf;
+    const bool closeBehind = withinElevSight && distP <= behindSenseM && dotF < 0.12f;
     return inFrontCone || closeBehind;
   }
 
@@ -7326,7 +7648,7 @@ struct App {
   // blackoutPursuit: fluorescents off — extra speed/accel so the run reads as an active hunt (day shove uses false).
   void shelfEmployeeRunChasePhase2(ShelfEmployeeNpc& e, float dt, const glm::vec2& pXZ, float distP,
                                    const glm::vec2& toPlayer, float playerFeetY, bool blackoutPursuit,
-                                   bool suppressMeleeNearShrek) {
+                                   bool suppressMeleeNearShrek, const glm::vec2& chaseLeadHorizVel) {
     if (suppressMeleeNearShrek) {
       if (e.meleeState == 1) {
         e.meleeState = 0;
@@ -7365,7 +7687,7 @@ struct App {
         const float leadT =
             blackoutPursuit ? glm::clamp(0.26f + distP * 0.041f, 0.19f, 1.18f)
                             : glm::clamp(0.2f + distP * 0.03f, 0.16f, 0.95f);
-        const glm::vec2 lead = pXZ + horizVel * leadT - e.posXZ;
+        const glm::vec2 lead = pXZ + chaseLeadHorizVel * leadT - e.posXZ;
         const float dL = glm::length(lead);
         if (dL > (blackoutPursuit ? 0.16f : 0.22f))
           aim = lead;
@@ -8145,6 +8467,26 @@ struct App {
     }
     staff_rp3d::step(dt);
     const glm::vec2 pXZ(camPos.x, camPos.z);
+    const bool mpHostWithLinkedPeer =
+        netMp.active && netMp.isHost && netMp.peerHostUtf8[0] != '\0' && netMp.remoteValid(3.f);
+    glm::vec2 mpPeerXZ(0.f);
+    float mpPeerFeetYVis = 0.f;
+    float mpPeerHeadY = 0.f;
+    float mpPeerEyeH = kEyeHeight;
+    glm::vec2 mpPeerHorizVel(0.f);
+    bool mpPeerEligible = false;
+    if (mpHostWithLinkedPeer) {
+      const RetroMpWirePacket& Pz = netMp.lastRemote;
+      if ((Pz.emoteFlags & kRetroMpEmoteDeath) == 0u) {
+        mpPeerEligible = true;
+        mpPeerXZ = glm::vec2(Pz.camX, Pz.camZ);
+        mpPeerEyeH = Pz.eyeHeight;
+        mpPeerHeadY = Pz.camY;
+        mpPeerFeetYVis = Pz.camY - Pz.eyeHeight;
+        mpPeerHorizVel = glm::vec2(Pz.horizVelX, Pz.horizVelZ);
+      }
+    }
+    const glm::vec2 mpNightAlertWitnessXZ = mpPeerEligible ? 0.5f * (pXZ + mpPeerXZ) : pXZ;
     for (uint32_t siR3 : shelfEmpActiveSlots) {
       ShelfEmployeeNpc& e3 = shelfEmpPool[siR3];
       if (e3.inited && e3.staffDead && e3.staffRp3dCorpse)
@@ -8218,9 +8560,12 @@ struct App {
       // leaving corpses in upright bind pose.
       const bool npcIsAggressive = e.staffDead || (e.meleeState != 0) || e.staffPushAggro ||
                                    e.staffNightShoveChase || (e.nightPhase >= 2);
-      if (!npcIsAggressive && distPSq > kStaffAiMidDistSq) {
+      const float mpPeerDistSq =
+          mpPeerEligible ? glm::dot(mpPeerXZ - e.posXZ, mpPeerXZ - e.posXZ) : distPSq;
+      const float distPSqForStagger = glm::min(distPSq, mpPeerDistSq);
+      if (!npcIsAggressive && distPSqForStagger > kStaffAiMidDistSq) {
         const uint32_t slotHash = static_cast<uint32_t>(e.residentKey ^ (e.residentKey >> 32));
-        if (distPSq > kStaffAiFarDistSq) {
+        if (distPSqForStagger > kStaffAiFarDistSq) {
           if (((aiFrameCounter + slotHash) & 3u) != 0u)
             continue;
         } else {
@@ -8280,7 +8625,32 @@ struct App {
       if (day) {
         e.staffNightShoveChase = false;
         e.staffNightShoveRevealRemain = 0.f;
-        if (e.staffPushAggro && !staffPlayerVisibleInChaseCone(e, distP, toPlayer, playerFeetYVis)) {
+        const bool visLocalDay =
+            staffPlayerVisibleInChaseCone(e, distP, toPlayer, playerFeetYVis, camPos.y, eyeHeight);
+        bool visPeerDay = false;
+        if (mpPeerEligible) {
+          const glm::vec2 toPeerXZ = mpPeerXZ - e.posXZ;
+          const float distPeerXZ = glm::length(toPeerXZ);
+          visPeerDay = staffPlayerVisibleInChaseCone(e, distPeerXZ, toPeerXZ, mpPeerFeetYVis, mpPeerHeadY,
+                                                     mpPeerEyeH);
+        }
+        glm::vec2 dayChaseXZ = pXZ;
+        glm::vec2 dayChaseTo = toPlayer;
+        float dayChaseDist = distP;
+        float dayChaseFeet = playerFeetForStaffSupport;
+        glm::vec2 dayChaseVel = horizVel;
+        if (mpPeerEligible) {
+          const glm::vec2 toPeerXZ = mpPeerXZ - e.posXZ;
+          const float distPeerXZ = glm::length(toPeerXZ);
+          if (visPeerDay && (!visLocalDay || distPeerXZ < distP - 1e-3f)) {
+            dayChaseXZ = mpPeerXZ;
+            dayChaseTo = toPeerXZ;
+            dayChaseDist = distPeerXZ;
+            dayChaseFeet = mpPeerFeetYVis;
+            dayChaseVel = mpPeerHorizVel;
+          }
+        }
+        if (e.staffPushAggro && !visLocalDay && !visPeerDay) {
           e.staffPushAggro = false;
           e.staffPushAggroCalmRemain = 0.f;
         }
@@ -8303,9 +8673,9 @@ struct App {
           shelfEmpStepWanderTowardTarget(e, dt, e.residentKey, pXZ, false, playerFeetForStaffSupport);
         } else {
           e.nightPhase = 2;
-          e.nightLastKnownPlayerXZ = pXZ;
-          shelfEmployeeRunChasePhase2(e, dt, pXZ, distP, toPlayer, playerFeetForStaffSupport, false,
-                                        staffSuppressMeleeNearShrekThisFrame);
+          e.nightLastKnownPlayerXZ = dayChaseXZ;
+          shelfEmployeeRunChasePhase2(e, dt, dayChaseXZ, dayChaseDist, dayChaseTo, dayChaseFeet, false,
+                                        staffSuppressMeleeNearShrekThisFrame, dayChaseVel);
         }
       } else {
         if (e.nightPhase != 2 || e.meleeState != 0) {
@@ -8314,48 +8684,37 @@ struct App {
           e.staffMantelAnimPhaseSpanSec = 0.f;
           e.staffMantelRunnerChase = 0;
         }
-        // Forward in XZ matches draw / movement: yaw = atan2(dir.x, dir.y) for dir toward target.
-        const glm::vec2 fwd(std::sin(e.yaw), std::cos(e.yaw));
-        glm::vec2 toPn(0.f);
-        if (distP > 1e-4f)
-          toPn = toPlayer / distP;
-        const float dotF = glm::dot(toPn, fwd);
-        const bool chaseVision = (e.nightPhase == 2);
-        float dotCone = dotF;
-        if (chaseVision) {
-          const float vCh = glm::length(e.velXZ);
-          if (vCh > kNightStaffChaseVisionVelConeMinSpeed)
-            dotCone = std::max(dotF, glm::dot(toPn, e.velXZ * (1.f / vCh)));
+        const bool detectedLocal =
+            staffNpcNightVisionDetectPlayer(e, pXZ, playerFeetYVis, camPos.y, eyeHeight);
+        glm::vec2 peerTo(0.f);
+        float distPeer = 1e30f;
+        bool detectedPeer = false;
+        if (mpPeerEligible) {
+          peerTo = mpPeerXZ - e.posXZ;
+          distPeer = glm::length(peerTo);
+          detectedPeer =
+              staffNpcNightVisionDetectPlayer(e, mpPeerXZ, mpPeerFeetYVis, mpPeerHeadY, mpPeerEyeH);
         }
-        const float staffEyeY =
-            e.feetWorldY + (kNightStaffVisionEyeY - kGroundY) * e.bodyScale.y;
-        const float dyPlayerEyes = camPos.y - staffEyeY;
-        const float elevAboveHoriz =
-            std::atan2(dyPlayerEyes, std::max(distP, 1e-3f)); // + = player above staff eye level
-        const float crouchT = glm::clamp((kEyeHeight - eyeHeight) / (kEyeHeight - kCrouchEyeHeight), 0.f, 1.f);
-        const float stealthVisMul = glm::mix(1.f, kCrouchStealthVisionRangeMul, crouchT);
-        const float stealthBehindMul = glm::mix(1.f, kCrouchStealthBehindSenseMul, crouchT);
-        const float visRange = (chaseVision ? kNightStaffChaseVisionRange : kNightStaffVisionRange) * stealthVisMul;
-        const float visCosHalf = chaseVision ? kNightStaffChaseVisionCosHalfFov : kNightStaffVisionCosHalfFov;
-        const float behindSenseM = (chaseVision ? kNightStaffChaseBehindSenseM : kNightStaffBehindSenseM) * stealthBehindMul;
-        const float maxElevAboveDeg =
-            chaseVision ? kNightStaffChaseVisionMaxElevAboveDeg : kNightStaffVisionMaxElevAboveDeg;
-        const bool ledgedUpForVision =
-            playerFeetYVis >= kGroundY + kNightStaffVisionPlayerLedgedFeetAboveFloorM;
-        const float elevCapRad =
-            (ledgedUpForVision && distP <= visRange)
-                ? glm::radians(kNightStaffVisionLedgedMaxElevAboveDeg)
-                : glm::radians(maxElevAboveDeg);
-        const bool withinElevSight = elevAboveHoriz <= elevCapRad;
-        const bool inFrontCone =
-            withinElevSight && distP <= visRange && dotCone >= visCosHalf;
-        const bool closeBehind =
-            withinElevSight && distP <= behindSenseM && dotF < 0.12f; // rear + “really close”
-        const bool detected = inFrontCone || closeBehind;
+        const bool detected = detectedLocal || detectedPeer;
+        glm::vec2 nightChaseXZ = pXZ;
+        glm::vec2 nightChaseTo = toPlayer;
+        float nightChaseDist = distP;
+        float nightChaseFeet = playerFeetForStaffSupport;
+        glm::vec2 nightChaseVel = horizVel;
+        float spotCrouchT = glm::clamp((kEyeHeight - eyeHeight) / (kEyeHeight - kCrouchEyeHeight), 0.f, 1.f);
+        if (mpPeerEligible && detectedPeer && (!detectedLocal || distPeer < distP - 1e-3f)) {
+          nightChaseXZ = mpPeerXZ;
+          nightChaseTo = peerTo;
+          nightChaseDist = distPeer;
+          nightChaseFeet = mpPeerFeetYVis;
+          nightChaseVel = mpPeerHorizVel;
+          spotCrouchT =
+              glm::clamp((kEyeHeight - mpPeerEyeH) / (kEyeHeight - kCrouchEyeHeight), 0.f, 1.f);
+        }
         const bool pushRevealKnows =
             e.staffNightShoveChase && e.staffNightShoveRevealRemain > 0.f;
         if (pushRevealKnows)
-          e.nightLastKnownPlayerXZ = pXZ;
+          e.nightLastKnownPlayerXZ = mpNightAlertWitnessXZ;
 
         if ((e.staffPushAggro || e.staffNightShoveChase) && !detected && !pushRevealKnows) {
           e.staffPushAggro = false;
@@ -8365,7 +8724,7 @@ struct App {
         }
         if (detected || pushRevealKnows) {
           if (detected)
-            e.nightLastKnownPlayerXZ = pXZ;
+            e.nightLastKnownPlayerXZ = nightChaseXZ;
           if (e.staffPushAggro || e.staffNightShoveChase)
             e.nightPhase = 2;
           if (e.nightPhase == 3 && detected) {
@@ -8375,18 +8734,19 @@ struct App {
             e.nightInvestigateTimer = 0.f;
           }
           if (e.nightPhase == 2) {
-            shelfEmployeeRunChasePhase2(e, dt, pXZ, distP, toPlayer, playerFeetForStaffSupport, true,
-                                        staffSuppressMeleeNearShrekThisFrame);
+            shelfEmployeeRunChasePhase2(e, dt, nightChaseXZ, nightChaseDist, nightChaseTo, nightChaseFeet,
+                                        true, staffSuppressMeleeNearShrekThisFrame, nightChaseVel);
           } else if (!e.staffPushAggro && !e.staffNightShoveChase) {
             if (e.nightPhase == 0)
               audioPlayStaffSpotted();
             e.velXZ = glm::vec2(0.f);
-            e.yaw = std::atan2(toPlayer.x, toPlayer.y);
+            e.yaw = std::atan2(nightChaseTo.x, nightChaseTo.y);
             e.lastHorizSpeed = 0.f;
             e.nightSpotTimer += dt;
             if (e.nightPhase == 0)
               e.nightPhase = 1;
-            const float chaseDelay = kNightStaffChaseDelayS * glm::mix(1.f, kCrouchStealthChaseDelayMul, crouchT);
+            const float chaseDelay =
+                kNightStaffChaseDelayS * glm::mix(1.f, kCrouchStealthChaseDelayMul, spotCrouchT);
             if (e.nightPhase == 1 && e.nightSpotTimer >= chaseDelay) {
               e.nightPhase = 2;
               e.nightSpotTimer = 0.f;
@@ -8470,8 +8830,14 @@ struct App {
       for (uint32_t si2 : shelfEmpActiveSlots) {
         ShelfEmployeeNpc& e2 = shelfEmpPool[si2];
         if (!e2.inited || e2.meleeState >= 2) continue;
-        const glm::vec2 dp2 = e2.posXZ - pXZ;
-        if (glm::dot(dp2, dp2) > nearP2) continue;
+        const glm::vec2 dpH = e2.posXZ - pXZ;
+        const float dH2 = glm::dot(dpH, dpH);
+        float bestD2 = dH2;
+        if (mpPeerEligible) {
+          const glm::vec2 dpP = e2.posXZ - mpPeerXZ;
+          bestD2 = glm::min(bestD2, glm::dot(dpP, dpP));
+        }
+        if (bestD2 > nearP2) continue;
         alertGrid[alertBucketKey(e2.posXZ.x, e2.posXZ.y)].push_back({e2.residentKey, &e2});
       }
       const int bucketR = static_cast<int>(std::ceil(alertR / kAlertBucketSize));
@@ -8499,7 +8865,7 @@ struct App {
                   if (b.nightPhase == 2) continue;
                   b.nightPhase = 2;
                   b.staffNightShoveChase = true;
-                  b.nightLastKnownPlayerXZ = pXZ;
+                  b.nightLastKnownPlayerXZ = mpNightAlertWitnessXZ;
                   b.nightSpotTimer = 0.f;
                   b.nightInvestigateTimer = 0.f;
                   b.chaseUnstuckTimer = 0.f;
@@ -8509,7 +8875,7 @@ struct App {
                 }
                 if (b.nightPhase == 2) continue;
                 b.nightPhase = 2;
-                b.nightLastKnownPlayerXZ = pXZ;
+                b.nightLastKnownPlayerXZ = mpNightAlertWitnessXZ;
                 b.nightSpotTimer = 0.f;
                 b.nightInvestigateTimer = 0.f;
                 b.chaseUnstuckTimer = 0.f;
@@ -9220,15 +9586,14 @@ struct App {
     if (!std::getenv("VULKAN_GAME_MOUSE_WARP_OFF"))
       SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_MODE_WARP, "1");
     SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0)
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER) != 0)
       throw std::runtime_error(std::string("SDL_Init: ") + SDL_GetError());
     if (char* base = SDL_GetBasePath()) {
-      // Installed Windows launches often start outside the install dir; resolve relative assets/* from exe folder.
+      // Shortcuts often start with cwd outside the install folder; match legacy behavior.
       std::error_code ec;
       std::filesystem::current_path(base, ec);
       if (ec)
-        std::cerr << "[vulkan_game] could not chdir to executable folder (assets may still load via full paths): "
-                  << ec.message() << "\n";
+        std::cerr << "[vulkan_game] could not chdir to executable folder: " << ec.message() << "\n";
       SDL_free(base);
     }
     constexpr int kImgWant = IMG_INIT_PNG | IMG_INIT_JPG;
@@ -9249,6 +9614,13 @@ struct App {
       std::cerr << "[vulkan_game] Windowed mode (VULKAN_GAME_WINDOWED). Omit for fullscreen desktop.\n";
     SDL_Vulkan_GetDrawableSize(window, &winW, &winH);
     SDL_RaiseWindow(window);
+    for (int ji = 0; ji < SDL_NumJoysticks(); ++ji) {
+      if (SDL_IsGameController(ji)) {
+        gameController = SDL_GameControllerOpen(ji);
+        if (gameController)
+          break;
+      }
+    }
     migrateLegacySaveIfNeeded();
     refreshTitleMenuContinueState();
     syncInputGrab();
@@ -9699,7 +10071,8 @@ struct App {
 
   void createTextureResources(const char* path, VkImage& outImage, VkDeviceMemory& outMemory,
                               VkImageView& outView, VkSampler& outSampler) {
-    SDL_Surface* loaded = IMG_Load(path);
+    const std::string pathResolved = resolvePortableAssetPath(path);
+    SDL_Surface* loaded = IMG_Load(pathResolved.c_str());
     if (!loaded)
       throw std::runtime_error(std::string("IMG_Load: ") + IMG_GetError());
     SDL_Surface* rgba = SDL_ConvertSurfaceFormat(loaded, SDL_PIXELFORMAT_RGBA32, 0);
@@ -9937,10 +10310,23 @@ struct App {
   }
 
   void createDeliMetalTextureResources() {
-    if (!tryLoadTextureFile(VULKAN_GAME_DELI_METAL_TEXTURE, "assets/textures/deli_metal_brushed.jpg",
+    bool ok = false;
+#if defined(VULKAN_GAME_DELI_METAL_TEXTURE)
+    ok = tryLoadTextureFile(VULKAN_GAME_DELI_METAL_TEXTURE, "assets/textures/deli_metal_brushed.jpg",
                             deliMetalTextureImage, deliMetalTextureMemory, deliMetalTextureView,
-                            deliMetalTextureSampler)) {
-      std::cerr << "[tex] deli metal fallback: brushed grey\n";
+                            deliMetalTextureSampler);
+#endif
+    if (!ok)
+      ok = tryLoadTextureFile(VULKAN_GAME_ASSETS_DIR "/textures/deli_metal_brushed.jpg",
+                              "assets/textures/deli_metal_brushed.jpg", deliMetalTextureImage,
+                              deliMetalTextureMemory, deliMetalTextureView, deliMetalTextureSampler);
+    // Ship folder often has no deli_metal_brushed.jpg — reuse bundled shelf steel so deli counters aren't flat grey.
+    if (!ok)
+      ok = tryLoadTextureFile(VULKAN_GAME_ASSETS_DIR "/textures/shelf_rack_metal_osb.jpg",
+                              "assets/textures/shelf_rack_metal_osb.jpg", deliMetalTextureImage,
+                              deliMetalTextureMemory, deliMetalTextureView, deliMetalTextureSampler);
+    if (!ok) {
+      std::cerr << "[tex] deli metal: no texture candidates loaded — brushed grey placeholder\n";
       createSolidColorTexture2D(132, 136, 141, 255, deliMetalTextureImage, deliMetalTextureMemory,
                                 deliMetalTextureView, deliMetalTextureSampler);
     }
@@ -10048,7 +10434,7 @@ struct App {
         vkFreeMemory(device, s.memory, nullptr);
       s = {};
     };
-    const std::vector<std::string> paths = parseExtraTexturePathsFromEnv();
+    const std::vector<std::string> paths = mergedExtraTexturePathsForLoad();
     extraTexturesLoadedCount = 0;
     for (uint32_t i = 0; i < kMaxExtraTextures; ++i) {
       ExtraTexSlot& slot = extraTexSlots[i];
@@ -10079,72 +10465,96 @@ struct App {
         createTextureResourcesFromRgbaLinear(kBlankPx, 1, 1, hudFontTextureImage, hudFontTextureMemory,
                                              hudFontTextureView, hudFontTextureSampler);
     };
+
+    std::vector<std::string> fontRawCandidates;
 #if defined(VULKAN_GAME_UI_FONT_PATH)
-    try {
-      std::ifstream f(VULKAN_GAME_UI_FONT_PATH, std::ios::binary | std::ios::ate);
-      if (!f)
-        throw std::runtime_error("open font");
-      const std::streamoff sz = f.tellg();
-      if (sz <= 0 || sz > 12 * 1024 * 1024)
-        throw std::runtime_error("bad font size");
-      f.seekg(0);
-      std::vector<unsigned char> ttf(static_cast<size_t>(sz));
-      if (!f.read(reinterpret_cast<char*>(ttf.data()), sz))
-        throw std::runtime_error("read font");
-      std::vector<unsigned char> bitmap(static_cast<size_t>(gHudUiFontAtlasW * gHudUiFontAtlasH));
-      stbtt_pack_context pc{};
-      if (!stbtt_PackBegin(&pc, bitmap.data(), gHudUiFontAtlasW, gHudUiFontAtlasH, 0, 1, nullptr))
-        throw std::runtime_error("PackBegin");
-      // Match shipped Linux-desktop look (smoother than 1×1 atlas sampling).
-      stbtt_PackSetOversampling(&pc, 2, 2);
-      if (!stbtt_PackFontRange(&pc, ttf.data(), 0, gHudUiFontSizePx, kHudFontFirstChar, kHudFontCharCount,
-                               gHudUiFontPacked))
-        throw std::runtime_error("PackFontRange");
-      stbtt_PackEnd(&pc);
-      stbtt_fontinfo finfo{};
-      if (!stbtt_InitFont(&finfo, ttf.data(), stbtt_GetFontOffsetForIndex(ttf.data(), 0)))
-        throw std::runtime_error("InitFont");
-      int asc = 0, desc = 0, lg = 0;
-      stbtt_GetFontVMetrics(&finfo, &asc, &desc, &lg);
-      const float scale = stbtt_ScaleForPixelHeight(&finfo, gHudUiFontSizePx);
-      gHudUiFontLineSkipPx = static_cast<float>(asc - desc + lg) * scale * 1.06f;
-      std::vector<uint8_t> rgba(static_cast<size_t>(gHudUiFontAtlasW * gHudUiFontAtlasH * 4));
-      for (size_t i = 0; i < bitmap.size(); ++i) {
-        const uint8_t a = bitmap[i];
-        rgba[i * 4 + 0] = 255;
-        rgba[i * 4 + 1] = 255;
-        rgba[i * 4 + 2] = 255;
-        rgba[i * 4 + 3] = a;
+    fontRawCandidates.emplace_back(VULKAN_GAME_UI_FONT_PATH);
+#endif
+#if defined(VULKAN_GAME_ASSETS_DIR)
+    fontRawCandidates.emplace_back(std::string(VULKAN_GAME_ASSETS_DIR) + "/fonts/DejaVuSans.ttf");
+#endif
+    fontRawCandidates.emplace_back("assets/fonts/DejaVuSans.ttf");
+
+    std::vector<std::string> fontResolvedUnique;
+    for (std::string& raw : fontRawCandidates) {
+      if (raw.empty())
+        continue;
+      std::string r = resolvePortableAssetPath(raw.c_str());
+      if (r.empty())
+        continue;
+      if (std::find(fontResolvedUnique.begin(), fontResolvedUnique.end(), r) != fontResolvedUnique.end())
+        continue;
+      fontResolvedUnique.emplace_back(std::move(r));
+    }
+
+    for (const std::string& fontLoadPath : fontResolvedUnique) {
+      try {
+        std::ifstream f(fontLoadPath, std::ios::binary | std::ios::ate);
+        if (!f)
+          throw std::runtime_error("open font");
+        const std::streamoff sz = f.tellg();
+        if (sz <= 0 || sz > 12 * 1024 * 1024)
+          throw std::runtime_error("bad font size");
+        f.seekg(0);
+        std::vector<unsigned char> ttf(static_cast<size_t>(sz));
+        if (!f.read(reinterpret_cast<char*>(ttf.data()), sz))
+          throw std::runtime_error("read font");
+        std::vector<unsigned char> bitmap(static_cast<size_t>(gHudUiFontAtlasW * gHudUiFontAtlasH));
+        stbtt_pack_context pc{};
+        if (!stbtt_PackBegin(&pc, bitmap.data(), gHudUiFontAtlasW, gHudUiFontAtlasH, 0, 1, nullptr))
+          throw std::runtime_error("PackBegin");
+        stbtt_PackSetOversampling(&pc, 2, 2);
+        if (!stbtt_PackFontRange(&pc, ttf.data(), 0, gHudUiFontSizePx, kHudFontFirstChar, kHudFontCharCount,
+                                 gHudUiFontPacked))
+          throw std::runtime_error("PackFontRange");
+        stbtt_PackEnd(&pc);
+        stbtt_fontinfo finfo{};
+        if (!stbtt_InitFont(&finfo, ttf.data(), stbtt_GetFontOffsetForIndex(ttf.data(), 0)))
+          throw std::runtime_error("InitFont");
+        int asc = 0, desc = 0, lg = 0;
+        stbtt_GetFontVMetrics(&finfo, &asc, &desc, &lg);
+        const float scale = stbtt_ScaleForPixelHeight(&finfo, gHudUiFontSizePx);
+        gHudUiFontLineSkipPx = static_cast<float>(asc - desc + lg) * scale * 1.06f;
+        std::vector<uint8_t> rgba(static_cast<size_t>(gHudUiFontAtlasW * gHudUiFontAtlasH * 4));
+        for (size_t i = 0; i < bitmap.size(); ++i) {
+          const uint8_t a = bitmap[i];
+          rgba[i * 4 + 0] = 255;
+          rgba[i * 4 + 1] = 255;
+          rgba[i * 4 + 2] = 255;
+          rgba[i * 4 + 3] = a;
+        }
+        createTextureResourcesFromRgbaLinear(rgba.data(), static_cast<uint32_t>(gHudUiFontAtlasW),
+                                             static_cast<uint32_t>(gHudUiFontAtlasH), hudFontTextureImage,
+                                             hudFontTextureMemory, hudFontTextureView, hudFontTextureSampler);
+        vkDestroySampler(device, hudFontTextureSampler, nullptr);
+        VkSamplerCreateInfo si{};
+        si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        si.magFilter = VK_FILTER_LINEAR;
+        si.minFilter = VK_FILTER_LINEAR;
+        si.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.anisotropyEnable = VK_FALSE;
+        si.maxAnisotropy = 1.f;
+        si.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+        si.unnormalizedCoordinates = VK_FALSE;
+        si.compareEnable = VK_FALSE;
+        si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        si.minLod = 0.f;
+        si.maxLod = 0.f;
+        VK_CHECK(vkCreateSampler(device, &si, nullptr, &hudFontTextureSampler), "hudFont sampler");
+        gHudUiFontReady = true;
+        std::cerr << "[hud] TrueType UI font OK (" << fontLoadPath << ")\n";
+        break;
+      } catch (const std::exception& ex) {
+        std::cerr << "[hud] UI font skipped (" << fontLoadPath << "): " << ex.what() << '\n';
       }
-      createTextureResourcesFromRgbaLinear(rgba.data(), static_cast<uint32_t>(gHudUiFontAtlasW),
-                                           static_cast<uint32_t>(gHudUiFontAtlasH), hudFontTextureImage,
-                                           hudFontTextureMemory, hudFontTextureView, hudFontTextureSampler);
-      vkDestroySampler(device, hudFontTextureSampler, nullptr);
-      VkSamplerCreateInfo si{};
-      si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-      si.magFilter = VK_FILTER_LINEAR;
-      si.minFilter = VK_FILTER_LINEAR;
-      si.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-      si.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-      si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-      si.anisotropyEnable = VK_FALSE;
-      si.maxAnisotropy = 1.f;
-      si.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
-      si.unnormalizedCoordinates = VK_FALSE;
-      si.compareEnable = VK_FALSE;
-      si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-      si.minLod = 0.f;
-      si.maxLod = 0.f;
-      VK_CHECK(vkCreateSampler(device, &si, nullptr, &hudFontTextureSampler), "hudFont sampler");
-      gHudUiFontReady = true;
-      std::cerr << "[hud] TrueType UI font OK (" VULKAN_GAME_UI_FONT_PATH ")\n";
-    } catch (const std::exception& ex) {
-      std::cerr << "[hud] UI font disabled (" << ex.what() << ") — using stb_easy_font fallback\n";
+    }
+
+    if (!gHudUiFontReady) {
+      std::cerr << "[hud] UI font unavailable - using stb_easy_font fallback\n";
       ensureFallback();
     }
-#else
-    ensureFallback();
-#endif
   }
 
   void createTitleIkeaLogoTextureResources() {
@@ -10169,24 +10579,30 @@ struct App {
       VK_CHECK(vkCreateSampler(device, &si, nullptr, &titleIkeaLogoSampler), "title ikea logo sampler");
     };
     bool loaded = false;
-    try {
-      createTextureResources(VULKAN_GAME_ASSETS_DIR "/ui/title_ikea_logo.png", titleIkeaLogoImage,
-                             titleIkeaLogoMemory, titleIkeaLogoView, titleIkeaLogoSampler);
-      loaded = true;
-    } catch (const std::exception& ex) {
-      std::cerr << "[ui] title_ikea_logo (" VULKAN_GAME_ASSETS_DIR "/ui/title_ikea_logo.png): " << ex.what()
-                << '\n';
-    }
-    if (!loaded) {
+    const char* const logoCandidates[] = {
+#if defined(VULKAN_GAME_ASSETS_DIR)
+        VULKAN_GAME_ASSETS_DIR "/ui/title_ikea_logo.png",
+#endif
+        "assets/ui/title_ikea_logo.png",
+#if defined(VULKAN_GAME_ASSETS_DIR)
+        VULKAN_GAME_ASSETS_DIR "/ui/ikea_title_logo.png",
+#endif
+        "assets/ui/ikea_title_logo.png"};
+    for (const char* cand : logoCandidates) {
+      if (!cand || !cand[0])
+        continue;
       try {
-        createTextureResources("assets/ui/title_ikea_logo.png", titleIkeaLogoImage, titleIkeaLogoMemory,
-                               titleIkeaLogoView, titleIkeaLogoSampler);
+        createTextureResources(cand, titleIkeaLogoImage, titleIkeaLogoMemory, titleIkeaLogoView,
+                               titleIkeaLogoSampler);
         loaded = true;
+        break;
       } catch (const std::exception& ex) {
-        std::cerr << "[ui] title_ikea_logo (assets/ui/title_ikea_logo.png): " << ex.what() << '\n';
+        std::cerr << "[ui] title ikea logo (" << cand << "): " << ex.what()
+                  << " (install zlib1.dll + libpng next to RetroIkea.exe if PNG fails)\n";
       }
     }
     if (!loaded) {
+      std::cerr << "[ui] title ikea logo: all candidates failed — solid blue placeholder\n";
       createSolidColorTexture2D(0, 81, 186, 255, titleIkeaLogoImage, titleIkeaLogoMemory, titleIkeaLogoView,
                               titleIkeaLogoSampler);
     }
@@ -11711,7 +12127,7 @@ struct App {
 #elif defined(VULKAN_GAME_SHREK_EGG_GLB)
           danceGlb = VULKAN_GAME_SHREK_EGG_GLB;
 #endif
-          std::string danceResolved = danceGlb ? resolvePortableDataFile(danceGlb) : std::string{};
+          std::string danceResolved = danceGlb ? resolvePortableAssetPath(danceGlb) : std::string{};
           bool danceOk =
               !danceResolved.empty() &&
               staff_skin::appendLongestRetargetedClipFromGlb(danceResolved.c_str(), staffRig, true, danceIdx,
@@ -11720,28 +12136,36 @@ struct App {
             danceUsedPath = std::move(danceResolved);
 #if defined(VULKAN_GAME_STAFF_SHREK_PROXIMITY_DANCE_GLB)
           if (!danceOk) {
-            std::string fb = resolvePortableDataFile(kBundledProximityDanceRelative);
-            if (!fb.empty() &&
-                staff_skin::appendLongestRetargetedClipFromGlb(fb.c_str(), staffRig, true, danceIdx,
-                                                                shrekDanceFallbackErr)) {
-              danceOk = true;
-              danceUsedPath = std::move(fb);
-              if (!shrekDanceErr.empty())
-                std::cerr << "[staff] Shrek proximity dance: primary path failed, using bundled next to exe — "
-                          << shrekDanceErr << "\n";
+            static const char* const kProximityDanceFallbackRel[] = {
+                "assets/meshy_reexport/Meshy_AI_Animation_Hip_Hop_Dance_3_withSkin.glb",
+                "assets/meshy_reexport/Meshy_AI_biped_Animation_Hip_Hop_Dance_3_withSkin.glb",
+                kBundledProximityDanceRelative,
+            };
+            for (const char* rel : kProximityDanceFallbackRel) {
+              std::string fb = resolvePortableAssetPath(rel);
+              if (!fb.empty() &&
+                  staff_skin::appendLongestRetargetedClipFromGlb(fb.c_str(), staffRig, true, danceIdx,
+                                                                 shrekDanceFallbackErr)) {
+                danceOk = true;
+                danceUsedPath = std::move(fb);
+                if (!shrekDanceErr.empty())
+                  std::cerr << "[staff] proximity dance: primary path failed, using fallback — "
+                            << shrekDanceErr << "\n";
+                break;
+              }
             }
           }
 #endif
           if (danceOk && !danceUsedPath.empty()) {
             staffClipShrekProximityDance = danceIdx;
-            std::cout << "[staff] Shrek proximity dance clip index " << staffClipShrekProximityDance << " ("
-                      << danceUsedPath << ")\n";
+            std::cout << "[staff] proximity dance clip index " << staffClipShrekProximityDance << " (" << danceUsedPath
+                      << ")\n";
           } else {
             staffClipShrekProximityDance = -1;
             if (!shrekDanceErr.empty())
-              std::cerr << "[staff] Shrek proximity dance clip: " << shrekDanceErr << "\n";
+              std::cerr << "[staff] proximity dance clip: " << shrekDanceErr << "\n";
             if (!shrekDanceFallbackErr.empty())
-              std::cerr << "[staff] Shrek proximity dance bundled fallback: " << shrekDanceFallbackErr << "\n";
+              std::cerr << "[staff] proximity dance fallback attempts: " << shrekDanceFallbackErr << "\n";
           }
         }
 #endif
@@ -11753,6 +12177,10 @@ struct App {
           if (const char* ev = std::getenv("VULKAN_GAME_STAFF_SHREK_DANCE_GLB"))
             if (ev[0])
               danceFallPaths.emplace_back(ev);
+          danceFallPaths.emplace_back(
+              "assets/meshy_reexport/Meshy_AI_Animation_Hip_Hop_Dance_3_withSkin.glb");
+          danceFallPaths.emplace_back(
+              "assets/meshy_reexport/Meshy_AI_biped_Animation_Hip_Hop_Dance_3_withSkin.glb");
 #if defined(VULKAN_GAME_STAFF_SHREK_PROXIMITY_DANCE_GLB)
           danceFallPaths.emplace_back(VULKAN_GAME_STAFF_SHREK_PROXIMITY_DANCE_GLB);
 #endif
@@ -11770,7 +12198,7 @@ struct App {
           for (const std::string& dp : danceFallPaths) {
             int idxRt = -1;
             clipErr.clear();
-            const std::string tryPath = resolvePortableDataFile(dp.c_str());
+            const std::string tryPath = resolvePortableAssetPath(dp.c_str());
             if (tryPath.empty())
               continue;
             if (staff_skin::appendLongestRetargetedClipFromGlb(tryPath.c_str(), staffRig, true, idxRt,
@@ -11886,13 +12314,17 @@ struct App {
 #endif
       std::cout << "[staff] skinned mesh " << VULKAN_GAME_EMPLOYEE_FBX << " bones=" << staffRigBoneCount
                 << " clips=" << staffRig.clips.size() << "\n";
-      if (!staffDiffuseRgba.empty() && staffDiffuseW > 0 && staffDiffuseH > 0) {
+      if (!skipStaffGlbEmbeddedDiffuseAtlas() && !staffDiffuseRgba.empty() && staffDiffuseW > 0 &&
+          staffDiffuseH > 0) {
         createTextureResourcesFromRgbaLinear(staffDiffuseRgba.data(), staffDiffuseW, staffDiffuseH,
                                              staffGlbDiffuseImage, staffGlbDiffuseMemory,
                                              staffGlbDiffuseView, staffGlbDiffuseSampler);
         staffGlbDiffuseActive = 1;
         std::cout << "[staff] embedded diffuse " << staffDiffuseW << "x" << staffDiffuseH << "\n";
-      }
+      } else if (skipStaffGlbEmbeddedDiffuseAtlas())
+        std::cout << "[staff] procedural IKEA uniform (embedded GLB diffuse skipped; unset "
+                     "VULKAN_GAME_STAFF_FORCE_PROCEDURAL_UNIFORM or CMake "
+                     "-DVULKAN_GAME_STAFF_DISABLE_EMBEDDED_GLB_DIFFUSE=OFF to use atlas)\n";
     } else {
       if (trySkinnedGlb)
         std::cerr << "[staff] skinned load failed, trying static mesh: " << empErr << "\n";
@@ -11928,7 +12360,8 @@ struct App {
         vkMapMemory(device, employeeInstanceBufferMemory, 0, empInstSize, 0, &employeeInstanceMapped);
         staffNpcDrawBuild.reserve(kMaxEmployees);
         std::cout << "[staff] mesh (static) " << VULKAN_GAME_EMPLOYEE_FBX << "\n";
-        if (!staffDiffuseRgba.empty() && staffDiffuseW > 0 && staffDiffuseH > 0) {
+        if (!skipStaffGlbEmbeddedDiffuseAtlas() && !staffDiffuseRgba.empty() && staffDiffuseW > 0 &&
+            staffDiffuseH > 0) {
           createTextureResourcesFromRgbaLinear(staffDiffuseRgba.data(), staffDiffuseW, staffDiffuseH,
                                                staffGlbDiffuseImage, staffGlbDiffuseMemory,
                                                staffGlbDiffuseView, staffGlbDiffuseSampler);
@@ -12502,6 +12935,46 @@ struct App {
         }
       }
     }
+    if (!netMp.active || netMp.isHost) {
+      const float rendSqWorld = kDeliFoodRenderDist * kDeliFoodRenderDist;
+      for (size_t wi = 0; wi < worldDroppedFood.size(); ++wi) {
+        const glm::vec3& dp = worldDroppedFood[wi].pos;
+        const float ddx = dp.x - sceneFocusX;
+        const float ddz = dp.z - sceneFocusZ;
+        if (ddx * ddx + ddz * ddz > rendSqWorld)
+          continue;
+        if (worldDroppedFood[wi].item == "MEATBALL") {
+          if (!gDeliMeatballMeshLoaded ||
+              deliMeatballInstanceScratch.size() >= kMaxDeliMeatballInstances)
+            break;
+          glm::mat4 m(1.f);
+          m = glm::translate(m, {dp.x, dp.y, dp.z});
+          m = glm::rotate(
+              m,
+              glm::mix(0.25f, 1.92f,
+                       std::fmod(std::fabs(dp.x) * 21.913f + std::fabs(dp.z) * 15.827f +
+                                     static_cast<float>(wi * 7391),
+                                 5237.f) /
+                           5237.f),
+              {0.f, 1.f, 0.f});
+          deliMeatballInstanceScratch.push_back(std::move(m));
+        } else if (worldDroppedFood[wi].item == "PIZZA SLICE") {
+          if (!gDeliPizzaMeshLoaded || deliPizzaInstanceScratch.size() >= kMaxDeliPizzaInstances)
+            break;
+          glm::mat4 m(1.f);
+          m = glm::translate(m, {dp.x, dp.y, dp.z});
+          m = glm::rotate(
+              m,
+              glm::mix(0.1f, glm::half_pi<float>() * 1.12f,
+                       std::fmod(std::fabs(dp.z) * 19.517f + std::fabs(dp.x) * 12.661f +
+                                     static_cast<float>(wi * 6203),
+                                 7919.f) /
+                           7919.f),
+              {0.f, 1.f, 0.f});
+          deliPizzaInstanceScratch.push_back(std::move(m));
+        }
+      }
+    }
     for (int worldAisle = waMin; worldAisle <= waMax; ++worldAisle) {
       const float aisleCX = (static_cast<float>(worldAisle) + 0.5f) * kShelfAisleModulePitch;
       const float cxLeft = aisleCX - kStoreAisleWidth * 0.5f - kShelfMeshHalfD;
@@ -13050,8 +13523,7 @@ struct App {
             feetY -= kAvatarLedgeHangFeetVisualDown;
         }
         // Skinned avatar uses atan2 vx,vz ≡ atan2(dx,dz) in XZ matching staff NPC convention.
-        // Locomotion: face camera yaw; backpedal (wish/vel backward vs view) rotates body π so footsteps
-        // line up — climb/ledge use geometry-facing (fpLocoAvatarYawFlip is cleared there).
+        // Locomotion: face camera yaw; backpedal uses reversed walk timeline (no π twist). Climbing uses geometry yaw.
         float avYaw;
         if (dropKickActive && glm::length(dropKickDir) > 1e-4f)
           avYaw = std::atan2(dropKickDir.x, dropKickDir.y);
@@ -13192,19 +13664,8 @@ struct App {
           // Keep remote body exactly on sender snapshots (no velocity extrapolation drift).
           const glm::vec3 rcam(R.camX, R.camY, R.camZ);
           const float feetYrRaw = rcam.y - R.eyeHeight;
-          float peerBodyYawFlip = 0.f;
-          if (!(R.emoteFlags & kRetroMpEmoteDeath)) {
-            const glm::vec2 peerFwd(std::cos(R.yaw), std::sin(R.yaw));
-            const glm::vec2 hv(R.horizVelX, R.horizVelZ);
-            const float hvs = glm::length(hv);
-            if (hvs > 0.08f) {
-              const glm::vec2 hvn = hv * (1.f / hvs);
-              if (glm::dot(hvn, peerFwd) < -0.32f)
-                peerBodyYawFlip = glm::pi<float>();
-            }
-          }
-          float avYawPeer =
-              std::atan2(std::cos(R.yaw + peerBodyYawFlip), std::sin(R.yaw + peerBodyYawFlip));
+          const uint8_t animTag = R.emoteReserved1;
+          const uint8_t animTagFrom = R.emoteReserved2;
           const float avPitchPeer =
               std::clamp(-R.pitch * kFpBodyPitchFollow, -kFpBodyPitchMaxTilt, kFpBodyPitchMaxTilt);
           const size_t peerSlot = static_cast<size_t>(kRemotePlayerStaffSlotIndex);
@@ -13212,8 +13673,6 @@ struct App {
           std::memcpy(&phRaw, &R.locoPhaseBits, sizeof(double));
           const bool remoteDeath = (R.emoteFlags & kRetroMpEmoteDeath) != 0u;
           const uint8_t deathAux = R.emoteReserved0;
-          const uint8_t animTag = R.emoteReserved1;
-          const uint8_t animTagFrom = R.emoteReserved2;
           double phToPeer = phRaw;
           int cr = R.avatarClip;
           int c0 = R.blendFromClip;
@@ -13322,6 +13781,10 @@ struct App {
             if (allowPhaseExtrapolation)
               phToPeer += static_cast<double>(netAgeSec);
           }
+          // Peer avatar yaw matches remote view facing (same as single-player locomotion).
+          const float peerBodyYawFlip = 0.f;
+          const float avYawPeer =
+              std::atan2(std::cos(R.yaw + peerBodyYawFlip), std::sin(R.yaw + peerBodyYawFlip));
           const float pqPeer =
               glm::clamp(parkourPs1PresentMix * kPs1PlayerPhaseFromParkourMul, 0.f, 1.f);
           double phToUse = phToPeer;
@@ -13576,9 +14039,11 @@ struct App {
         inventoryMenuVertexBuffer != VK_NULL_HANDLE) {
       const bool invDirty = inventoryMenuVertexCount == 0 ||
                             inventoryMenuCacheRevision != inventoryRevision ||
-                            inventoryMenuCacheScroll != inventoryScrollRow;
+                            inventoryMenuCacheScroll != inventoryScrollRow ||
+                            inventoryMenuCacheSelectedIdx != inventoryUiSelectedStackIdx;
       if (invDirty) {
-        inventoryMenuVertexCache = buildInventoryOverlayVertices(inventoryItems, inventoryScrollRow);
+        inventoryMenuVertexCache =
+            buildInventoryOverlayVertices(inventoryItems, inventoryScrollRow, inventoryUiSelectedStackIdx);
         inventoryMenuVertexCount = static_cast<uint32_t>(inventoryMenuVertexCache.size());
         const VkDeviceSize invBytes = sizeof(Vertex) * static_cast<VkDeviceSize>(inventoryMenuVertexCount);
         if (invBytes > 0 && invBytes <= inventoryMenuVertexBufferBytes)
@@ -13586,6 +14051,7 @@ struct App {
                       static_cast<size_t>(invBytes));
         inventoryMenuCacheRevision = inventoryRevision;
         inventoryMenuCacheScroll = inventoryScrollRow;
+        inventoryMenuCacheSelectedIdx = inventoryUiSelectedStackIdx;
       }
     }
 
@@ -13729,6 +14195,32 @@ struct App {
                          VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushModel),
                          &push);
       vkCmdDraw(cmd, deathMenuVertexCount, 1, 0, 0);
+    } else if (inTitleMenu && titleMenuBrowseServers && titleMenuServerVertexCount > 0 &&
+               titleMenuServerVertexBuffer != VK_NULL_HANDLE) {
+      VkBuffer vbSrv[2] = {titleMenuServerVertexBuffer, identityInstanceBuffer};
+      vkCmdBindVertexBuffers(cmd, 0, 2, vbSrv, bindOffsUi);
+      constexpr float kSlotSlideDur = 0.9f;
+      constexpr float kSlotStartOff = 3.0f;
+      constexpr float kBobAmp = 0.004f;
+      constexpr float kBobHz = 0.6f;
+      auto easeOutExpo = [](float x) { return x >= 1.f ? 1.f : 1.f - std::pow(2.f, -10.f * x); };
+
+      push.model = glm::mat4(1.0f);
+      vkCmdPushConstants(cmd, pipelineLayout,
+                         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushModel),
+                         &push);
+      vkCmdDraw(cmd, std::min(titleMenuServerVertexCount, 6u), 1, 0, 0);
+
+      if (titleMenuServerVertexCount > 6) {
+        float st = glm::clamp(titleMenuSlideTime / kSlotSlideDur, 0.f, 1.f);
+        float slotOff = kSlotStartOff * (1.f - easeOutExpo(st));
+        float bob = kBobAmp * std::sin(titleMenuSlideTime * kBobHz * 6.2832f);
+        push.model = glm::translate(glm::mat4(1.0f), glm::vec3(slotOff, bob, 0.f));
+        vkCmdPushConstants(cmd, pipelineLayout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushModel),
+                           &push);
+        vkCmdDraw(cmd, titleMenuServerVertexCount - 6, 1, 6, 0);
+      }
     } else if (inTitleMenu && titleMenuPickSlot && titleMenuSlotVertexCount > 0 &&
                titleMenuSlotVertexBuffer != VK_NULL_HANDLE) {
       VkBuffer vbSlot[2] = {titleMenuSlotVertexBuffer, identityInstanceBuffer};
@@ -13755,7 +14247,7 @@ struct App {
                            &push);
         vkCmdDraw(cmd, titleMenuSlotVertexCount - 6, 1, 6, 0);
       }
-    } else if (inTitleMenu && !titleMenuPickSlot && titleMenuMainVertexCount > 0 &&
+    } else if (inTitleMenu && !titleMenuPickSlot && !titleMenuBrowseServers && titleMenuMainVertexCount > 0 &&
                titleMenuMainVertexBuffer != VK_NULL_HANDLE) {
       VkBuffer vbTit[2] = {titleMenuMainVertexBuffer, identityInstanceBuffer};
       vkCmdBindVertexBuffers(cmd, 0, 2, vbTit, bindOffsUi);
@@ -14102,6 +14594,47 @@ struct App {
       return ndcY >= (centerY - halfH) && ndcY <= (centerY + halfH);
     };
     if (inTitleMenu) {
+      if (titleMenuBrowseServers) {
+        const UiMenuClickLayout L =
+            computeTitleMenuServerBrowserClickLayout(titleMenuLobbyServers, titleMenuLobbyScroll, titleMenuLobbyStatus);
+        const int shown = lobbyShownServerRows(titleMenuLobbyServers, titleMenuLobbyScroll);
+        const int backRow = 3 + shown;
+        if (rowHit(L, backRow) && mouseButton == SDL_BUTTON_LEFT) {
+          titleMenuBrowseServers = false;
+          titleMenuLobbyScroll = 0;
+          recreateTitleMenuMainGpuMesh();
+          return true;
+        }
+        if (rowHit(L, 2) && mouseButton == SDL_BUTTON_LEFT) {
+          refreshTitleMenuLobbyFetchAndMesh();
+          return true;
+        }
+        const int n = static_cast<int>(titleMenuLobbyServers.size());
+        const int maxScroll = std::max(0, n - kLobbyBrowserVisibleRows);
+        const int scroll = std::clamp(titleMenuLobbyScroll, 0, maxScroll);
+        for (int i = 0; i < shown; ++i) {
+          if (!rowHit(L, 3 + i))
+            continue;
+          if (mouseButton != SDL_BUTTON_LEFT)
+            return false;
+          if (n == 0)
+            return true;
+          const int idx = scroll + i;
+          if (idx < 0 || idx >= n)
+            return true;
+          const LobbyListedServer& sel = titleMenuLobbyServers[static_cast<size_t>(idx)];
+          std::strncpy(titleMenuPendingLobbyJoinHost, sel.host.c_str(), sizeof(titleMenuPendingLobbyJoinHost) - 1);
+          titleMenuPendingLobbyJoinHost[sizeof(titleMenuPendingLobbyJoinHost) - 1] = '\0';
+          titleMenuPendingLobbyJoinPort = sel.port != 0 ? sel.port : kRetroMpDefaultPort;
+          titleMenuPendingLobbyJoin = true;
+          titleMenuBrowseServers = false;
+          titleMenuPickSlot = true;
+          recreateTitleMenuMainGpuMesh();
+          recreateTitleMenuSlotGpuMesh();
+          return true;
+        }
+        return false;
+      }
       if (titleMenuPickSlot) {
         std::array<bool, 4> used{};
         for (int i = 0; i < kGameSaveSlotCount; ++i)
@@ -14109,6 +14642,8 @@ struct App {
         const UiMenuClickLayout L = computeTitleMenuSlotPickerClickLayout(used);
         if (rowHit(L, 6) && mouseButton == SDL_BUTTON_LEFT) {
           titleMenuPickSlot = false;
+          titleMenuPendingLobbyJoin = false;
+          titleMenuPendingLobbyJoinHost[0] = '\0';
           recreateTitleMenuMainGpuMesh();
           return true;
         }
@@ -14139,6 +14674,11 @@ struct App {
           return true;
         }
         if (rowHit(L, 2)) {
+          titleMenuBrowseServers = true;
+          refreshTitleMenuLobbyFetchAndMesh();
+          return true;
+        }
+        if (rowHit(L, 3)) {
           running = false;
           return true;
         }
@@ -14149,6 +14689,11 @@ struct App {
           return true;
         }
         if (rowHit(L, 1)) {
+          titleMenuBrowseServers = true;
+          refreshTitleMenuLobbyFetchAndMesh();
+          return true;
+        }
+        if (rowHit(L, 2)) {
           running = false;
           return true;
         }
@@ -14197,6 +14742,8 @@ struct App {
         mpClientSpawnSynced = false;
         mpClientLastLinkMono = -1.0;
         netMp.startHost(kRetroMpDefaultPort);
+        lobbyHeartbeatSessionId[0] = '\0';
+        lobbyHeartbeatAccumSec = 0.;
         recreatePauseMenuGpuMesh();
         return true;
       }
@@ -14219,6 +14766,8 @@ struct App {
         mpClientSpawnSynced = false;
         mpClientLastLinkMono = -1.0;
         netMp.stop();
+        lobbyHeartbeatSessionId[0] = '\0';
+        lobbyHeartbeatAccumSec = 0.;
         recreatePauseMenuGpuMesh();
         return true;
       }
@@ -14230,8 +14779,10 @@ struct App {
       return false;
     }
     if (showInventoryMenu) {
-      if (mouseButton != SDL_BUTTON_LEFT)
+      if (mouseButton == SDL_BUTTON_LEFT && inventoryDropButtonContainsNdc(ndcX, ndcY)) {
+        (void)tryExecuteInventoryFoodDrop();
         return true;
+      }
       constexpr float listHalfW = 0.64f;
       constexpr float listTopY = 0.42f;
       constexpr float listBotY = -0.50f;
@@ -14252,6 +14803,19 @@ struct App {
       if (idx < 0 || idx >= static_cast<int>(stacks.size()))
         return true;
       const std::string& item = stacks[static_cast<size_t>(idx)].first;
+      const bool shiftDrop =
+          mouseButton == SDL_BUTTON_LEFT && (SDL_GetModState() & KMOD_SHIFT);
+      const bool middleDrop = mouseButton == SDL_BUTTON_MIDDLE;
+      if (shiftDrop || middleDrop) {
+        (void)tryDropInventoryStackByIndex(idx);
+        return true;
+      }
+      if (mouseButton == SDL_BUTTON_RIGHT) {
+        inventoryUiSelectedStackIdx = idx;
+        return true;
+      }
+      if (mouseButton != SDL_BUTTON_LEFT)
+        return true;
       if (item == "PIZZA SLICE" || item == "MEATBALL") {
         if (playerHunger >= (kPlayerHungerMax - 1e-3f))
           return true;
@@ -14264,6 +14828,7 @@ struct App {
                                                    kVisibleRows);
           inventoryScrollRow = std::clamp(inventoryScrollRow, 0, newMaxScroll);
           inventoryMenuCacheScroll = -1;
+          clampInventoryUiSelectedStackIdx();
         }
       }
       return true;
@@ -14415,12 +14980,64 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     return static_cast<int>(buildInventoryStacks(inventoryItems).size());
   }
 
+  void clampInventoryUiSelectedStackIdx() {
+    const int nRows = inventoryStackRowCount();
+    if (inventoryUiSelectedStackIdx < 0 || inventoryUiSelectedStackIdx >= nRows)
+      inventoryUiSelectedStackIdx = -1;
+  }
+
+  bool tryDropInventoryStackByIndex(int stackIdx) {
+    if (stackIdx < 0)
+      return false;
+    if (netMp.active && !netMp.isHost)
+      return false;
+    const auto stacks = buildInventoryStacks(inventoryItems);
+    if (stackIdx >= static_cast<int>(stacks.size()))
+      return false;
+    const std::string& itemName = stacks[static_cast<size_t>(stackIdx)].first;
+    auto it = std::find(inventoryItems.begin(), inventoryItems.end(), itemName);
+    if (it == inventoryItems.end())
+      return false;
+    inventoryItems.erase(it);
+    ++inventoryRevision;
+    inventoryUiSelectedStackIdx = -1;
+    {
+      constexpr int kVisibleRowsInv = 8;
+      const int newMaxScroll = std::max(0, static_cast<int>(buildInventoryStacks(inventoryItems).size()) -
+                                               kVisibleRowsInv);
+      inventoryScrollRow = std::clamp(inventoryScrollRow, 0, newMaxScroll);
+      inventoryMenuCacheScroll = -1;
+    }
+    clampInventoryUiSelectedStackIdx();
+
+    const glm::vec2 fwd(std::cos(yaw), std::sin(yaw));
+    constexpr float kDropForwardDist = 0.48f;
+    WorldDroppedFood drop{};
+    drop.item = itemName;
+    drop.pos.x = camPos.x + fwd.x * kDropForwardDist;
+    drop.pos.z = camPos.z + fwd.y * kDropForwardDist;
+    if (itemName == "MEATBALL")
+      drop.pos.y = kGroundY + 0.086f;
+    else if (itemName == "PIZZA SLICE")
+      drop.pos.y = kGroundY + 0.042f;
+    else
+      drop.pos.y = kGroundY + 0.055f;
+    worldDroppedFood.push_back(std::move(drop));
+    return true;
+  }
+
+  bool tryExecuteInventoryFoodDrop() {
+    if (inventoryUiSelectedStackIdx < 0)
+      return false;
+    return tryDropInventoryStackByIndex(inventoryUiSelectedStackIdx);
+  }
+
   bool tryPickupNearestDeliPizzaSlice() {
     constexpr float kPickupRadius = kDeliFoodPickupRadius;
     int waMin, waMax, wlMin, wlMax;
     shelfGridWindowForRange(camPos.x, camPos.z, kPickupRadius + 1.0f, waMin, waMax, wlMin, wlMax);
-    bool found = false;
-    float bestD2 = kPickupRadius * kPickupRadius;
+    bool foundDeli = false;
+    float bestDeliD2 = kPickupRadius * kPickupRadius;
     int bestWa = 0;
     int bestWl = 0;
     for (int wa = waMin; wa <= waMax; ++wa) {
@@ -14438,16 +15055,40 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
         const float dx = cx - camPos.x;
         const float dz = cz - camPos.z;
         const float d2 = dx * dx + dz * dz;
-        if (d2 <= bestD2) {
-          bestD2 = d2;
+        if (d2 <= bestDeliD2) {
+          bestDeliD2 = d2;
           bestWa = wa;
           bestWl = wl;
-          found = true;
+          foundDeli = true;
         }
       }
     }
-    if (!found)
+    size_t bestDropIdx = std::numeric_limits<size_t>::max();
+    float bestDropD2 = kPickupRadius * kPickupRadius;
+    if (!netMp.active || netMp.isHost) {
+      for (size_t i = 0; i < worldDroppedFood.size(); ++i) {
+        const float dx = worldDroppedFood[i].pos.x - camPos.x;
+        const float dz = worldDroppedFood[i].pos.z - camPos.z;
+        const float d2 = dx * dx + dz * dz;
+        if (d2 <= bestDropD2) {
+          bestDropD2 = d2;
+          bestDropIdx = i;
+        }
+      }
+    }
+    const bool haveDrop = bestDropIdx < worldDroppedFood.size();
+    if (!foundDeli && !haveDrop)
       return false;
+    const bool preferDrop = haveDrop && (!foundDeli || bestDropD2 < bestDeliD2 - 1e-6f);
+    if (preferDrop) {
+      WorldDroppedFood picked = worldDroppedFood[bestDropIdx];
+      worldDroppedFood.erase(worldDroppedFood.begin() + static_cast<std::ptrdiff_t>(bestDropIdx));
+      inventoryItems.emplace_back(std::move(picked.item));
+      ++inventoryRevision;
+      const int maxScroll = std::max(0, inventoryStackRowCount() - 8);
+      inventoryScrollRow = std::clamp(inventoryScrollRow, 0, maxScroll);
+      return true;
+    }
 
     const uint64_t k = deliPizzaSlotKey(bestWa, bestWl);
     const bool meatballCounter = deliCounterUsesMeatballs(bestWa, bestWl);
@@ -14531,6 +15172,15 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
           return true;
       }
     }
+    if ((!netMp.active || netMp.isHost)) {
+      constexpr float kr2Nearby = kDeliFoodPickupRadius * kDeliFoodPickupRadius;
+      for (const WorldDroppedFood& d : worldDroppedFood) {
+        const float dx = d.pos.x - camPos.x;
+        const float dz = d.pos.z - camPos.z;
+        if (dx * dx + dz * dz <= kr2Nearby)
+          return true;
+      }
+    }
     return false;
   }
 
@@ -14539,6 +15189,21 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       running = false;
     if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_RESIZED)
       framebufferResized = true;
+    if (e.type == SDL_CONTROLLERDEVICEADDED) {
+      if (!gameController && SDL_IsGameController(e.cdevice.which))
+        gameController = SDL_GameControllerOpen(e.cdevice.which);
+      return;
+    }
+    if (e.type == SDL_CONTROLLERDEVICEREMOVED) {
+      if (gameController) {
+        SDL_Joystick* j = SDL_GameControllerGetJoystick(gameController);
+        if (j && SDL_JoystickInstanceID(j) == static_cast<SDL_JoystickID>(e.cdevice.which)) {
+          SDL_GameControllerClose(gameController);
+          gameController = nullptr;
+        }
+      }
+      return;
+    }
     if (inLoadingScreen)
       return;
     if (e.type == SDL_TEXTINPUT && showPauseMenu && pauseMenuMpIpFocused) {
@@ -14557,6 +15222,17 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     }
     if (e.type == SDL_KEYDOWN && showPauseMenu && !pauseMenuMpIpFocused) {
       const SDL_Keycode sym = e.key.keysym.sym;
+      if (sym == SDLK_o && e.key.repeat == 0) {
+        (void)SDL_OpenURL("https://tailscale.com/kb/1017/install/");
+        return;
+      }
+      if (sym == SDLK_c && e.key.repeat == 0 && netMp.active && netMp.isHost && netMp.publicHostUtf8[0] != '\0') {
+        char clip[128];
+        std::snprintf(clip, sizeof clip, "%s:%u", netMp.publicHostUtf8, static_cast<unsigned>(kRetroMpDefaultPort));
+        if (SDL_SetClipboardText(clip) == 0)
+          std::fprintf(stderr, "[mp] Copied join address %s (paste to friend on your tailnet)\n", clip);
+        return;
+      }
       if ((sym == SDLK_i || sym == SDLK_F2) && e.key.repeat == 0) {
         pauseMenuMpIpFocused = true;
         // Default loopback value is convenient for local testing but annoying when typing a real host.
@@ -14596,6 +15272,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       if (sym == SDLK_ESCAPE && e.key.repeat == 0) {
         pauseMenuMpIpFocused = false;
         SDL_StopTextInput();
+        recreatePauseMenuGpuMesh();
         return;
       }
       if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) {
@@ -14616,7 +15293,9 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       }
       return;
     }
-    if (inIntroSplash && (e.type == SDL_KEYDOWN || e.type == SDL_MOUSEBUTTONDOWN)) {
+    if (inIntroSplash && (e.type == SDL_KEYDOWN || e.type == SDL_MOUSEBUTTONDOWN ||
+                          (e.type == SDL_CONTROLLERBUTTONDOWN &&
+                           e.cbutton.button == SDL_CONTROLLER_BUTTON_A))) {
       inIntroSplash = false;
       inTitleMenu = true;
       titleMenuSceneTime = 0.f;
@@ -14633,6 +15312,14 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       syncInputGrab();
       return;
     }
+    if (e.type == SDL_CONTROLLERBUTTONDOWN && showControlsOverlay &&
+        (e.cbutton.button == SDL_CONTROLLER_BUTTON_A || e.cbutton.button == SDL_CONTROLLER_BUTTON_B)) {
+      showControlsOverlay = false;
+      audioSetStoreDayNightCyclePaused(false);
+      mouseGrab = true;
+      syncInputGrab();
+      return;
+    }
     if (e.type == SDL_MOUSEBUTTONDOWN &&
         (e.button.button == SDL_BUTTON_LEFT || e.button.button == SDL_BUTTON_RIGHT)) {
       const int mx = static_cast<int>(e.button.x);
@@ -14642,6 +15329,65 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       if (tryHandleMenuClick(ndcX, ndcY, e.button.button))
         return;
     }
+    if (e.type == SDL_CONTROLLERBUTTONDOWN && e.cbutton.button == SDL_CONTROLLER_BUTTON_BACK &&
+        !inTitleMenu && !showControlsOverlay && !playerDeathShowMenu && !inIntroSplash &&
+        !inLoadingScreen && !playerDeathActive && !showPauseMenu) {
+      showInventoryMenu = !showInventoryMenu;
+      if (showInventoryMenu) {
+        audioSetStoreDayNightCyclePaused(false);
+        mouseGrab = false;
+      } else {
+        inventoryUiSelectedStackIdx = -1;
+        audioSetStoreDayNightCyclePaused(false);
+        mouseGrab = true;
+      }
+      syncInputGrab();
+      return;
+    }
+    if (e.type == SDL_CONTROLLERBUTTONDOWN && e.cbutton.button == SDL_CONTROLLER_BUTTON_START) {
+      if (showControlsOverlay) {
+        showControlsOverlay = false;
+        audioSetStoreDayNightCyclePaused(false);
+        mouseGrab = true;
+        syncInputGrab();
+        return;
+      }
+      if (showPauseMenu && !pauseMenuMpIpFocused) {
+        pauseMenuMpIpFocused = false;
+        SDL_StopTextInput();
+        showPauseMenu = false;
+        audioSetStoreDayNightCyclePaused(false);
+        mouseGrab = true;
+        syncInputGrab();
+        return;
+      }
+      if (showInventoryMenu) {
+        showInventoryMenu = false;
+        inventoryUiSelectedStackIdx = -1;
+        audioSetStoreDayNightCyclePaused(false);
+        mouseGrab = true;
+        syncInputGrab();
+        return;
+      }
+      if (!playerDeathActive && !inTitleMenu && !inIntroSplash && !inLoadingScreen) {
+        showPauseMenu = !showPauseMenu;
+        if (showPauseMenu) {
+          pauseMenuMpIpFocused = false;
+          audioSetStoreDayNightCyclePaused(false);
+          mouseGrab = false;
+          syncInputGrab();
+          gameSaveWrite();
+          recreatePauseMenuGpuMesh();
+        } else {
+          pauseMenuMpIpFocused = false;
+          SDL_StopTextInput();
+          audioSetStoreDayNightCyclePaused(false);
+          mouseGrab = true;
+          syncInputGrab();
+        }
+      }
+      return;
+    }
     if (e.type == SDL_KEYDOWN) {
       const int sc = static_cast<int>(e.key.keysym.scancode);
       if (sc >= 0 && sc < SDL_NUM_SCANCODES)
@@ -14650,10 +15396,18 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
           !showInventoryMenu && !inTitleMenu)
         pendingSlideCrouchEdge = true;
     }
+    if (e.type == SDL_CONTROLLERBUTTONDOWN && e.cbutton.button == SDL_CONTROLLER_BUTTON_B &&
+        !playerDeathActive && !showPauseMenu && !showInventoryMenu && !inTitleMenu)
+      pendingSlideCrouchEdge = true;
     if (e.type == SDL_KEYUP) {
       const int sc = static_cast<int>(e.key.keysym.scancode);
       if (sc >= 0 && sc < SDL_NUM_SCANCODES)
         scancodeDown[static_cast<size_t>(sc)] = false;
+    }
+    if (e.type == SDL_MOUSEWHEEL && inTitleMenu && titleMenuBrowseServers) {
+      titleMenuLobbyScroll -= static_cast<int>(e.wheel.y);
+      rebuildTitleMenuServerUiMesh();
+      return;
     }
     if (e.type == SDL_MOUSEWHEEL && showInventoryMenu) {
       inventoryScrollRow = std::max(0, inventoryScrollRow - e.wheel.y);
@@ -14699,9 +15453,25 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     if (e.type == SDL_KEYDOWN && e.key.repeat == 0) {
       const SDL_Keycode sym = e.key.keysym.sym;
       if (inTitleMenu) {
+        if (titleMenuBrowseServers) {
+          if (sym == SDLK_ESCAPE) {
+            titleMenuBrowseServers = false;
+            titleMenuLobbyScroll = 0;
+            recreateTitleMenuMainGpuMesh();
+            return;
+          }
+          if (sym == SDLK_F5 || sym == SDLK_r) {
+            refreshTitleMenuLobbyFetchAndMesh();
+            return;
+          }
+          return;
+        }
         if (titleMenuPickSlot) {
           if (sym == SDLK_ESCAPE) {
             titleMenuPickSlot = false;
+            titleMenuPendingLobbyJoin = false;
+            titleMenuPendingLobbyJoinHost[0] = '\0';
+            recreateTitleMenuMainGpuMesh();
             return;
           }
           int slotChoice = -1;
@@ -14762,6 +15532,11 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
         return;
       }
       if (showInventoryMenu) {
+        if (sym == SDLK_g && e.key.repeat == 0) {
+          (void)tryExecuteInventoryFoodDrop();
+          inventoryMenuCacheScroll = -1;
+          return;
+        }
         if (sym == SDLK_UP)
           inventoryScrollRow = std::max(0, inventoryScrollRow - 1);
         else if (sym == SDLK_DOWN)
@@ -14772,6 +15547,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
           inventoryScrollRow += 6;
         else if (sym == SDLK_TAB || sym == SDLK_ESCAPE) {
           showInventoryMenu = false;
+          inventoryUiSelectedStackIdx = -1;
           audioSetStoreDayNightCyclePaused(false);
           mouseGrab = true;
           syncInputGrab();
@@ -14795,6 +15571,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
           audioSetStoreDayNightCyclePaused(false);
           mouseGrab = false;
         } else {
+          inventoryUiSelectedStackIdx = -1;
           audioSetStoreDayNightCyclePaused(false);
           mouseGrab = true;
         }
@@ -17111,7 +17888,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
   }
 
   template <typename DownFn>
-  void syncPlayerAvatarClip(bool groundedEnd, DownFn down) {
+  void syncPlayerAvatarClip(bool groundedEnd, DownFn dm, float gpStickLX = 0.f, float gpStickLY = 0.f) {
     if (!staffSkinnedActive || staffRig.clips.empty()) {
       playerAvatarClip = 0;
       return;
@@ -17140,14 +17917,16 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     if (sp < 0.035f)
       playerWalkReverseHold = false;
     // Match gameplay: C held = crouch immediately (don’t wait for eyeHeight lerp); also low ceiling / lerped crouch.
-    const bool crouchHeldRaw = down(SDL_SCANCODE_C);
+    const bool crouchHeldRaw = dm(SDL_SCANCODE_C);
     const bool crouchAnim = crouchHeldRaw || eyeHeight < (kEyeHeight - 0.12f);
-    const bool runGroundedAnim = groundedEnd && inputSprintHeld(down) && !crouchAnim && !slideActive &&
+    const bool runGroundedAnim = groundedEnd && inputSprintHeld(dm) && !crouchAnim && !slideActive &&
                                !playerDanceEmoteActive &&
-                               !playerSprintBackwardBlocked(down, yaw, horizVel);
+                               !playerSprintBackwardBlocked(dm, yaw, horizVel, gpStickLX, gpStickLY);
 
     const glm::vec2 f(std::cos(yaw), std::sin(yaw));
     const glm::vec2 r(std::cos(yaw + glm::half_pi<float>()), std::sin(yaw + glm::half_pi<float>()));
+    const float locomotionVelFwd = glm::dot(horizVel, f);
+    const bool locomotionVelocityAllowsSprintAnim = locomotionVelFwd > kLocomotionSprintMinVelFwd;
 
     if (ledgeHangActive) {
       playerWalkReverseHold = false;
@@ -17290,8 +18069,10 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       playerWalkReverseHold = false;
       const bool movingGap =
           wasLoco ? (sp > kLocoStaySpeed) : (sp > std::min(kLocoEnterSpeed, 0.064f));
-      const bool runAirSmall = inputSprintHeld(down) && !crouchAnim && !slideActive &&
-                             !playerSprintBackwardBlocked(down, yaw, horizVel);
+      const bool runAirSmall =
+          inputSprintHeld(dm) && !crouchAnim && !slideActive &&
+          !playerSprintBackwardBlocked(dm, yaw, horizVel, gpStickLX, gpStickLY) &&
+          locomotionVelocityAllowsSprintAnim;
       if (runAirSmall && movingGap && avClipSprint >= 0) {
         playerWalkAnimReverse = false;
         playerWalkReverseHold = false;
@@ -17364,35 +18145,30 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       }
     }
 
-    if (runGroundedAnim && moving && avClipSprint >= 0) {
+    if (runGroundedAnim && moving && avClipSprint >= 0 && locomotionVelocityAllowsSprintAnim) {
       playerWalkAnimReverse = false;
       playerWalkReverseHold = false;
       playerAvatarClip = avClipSprint;
       return;
     }
     if (moving && avClipWalk >= 0) {
-      if (!fpLocoBackwardBodyFlip) {
-        // Camera-forward mesh: scrub walk backward by reversing timeline.
-        constexpr float kWalkBackEnter = -0.09f;
-        constexpr float kWalkBackExit = 0.04f;
-        const float fd = glm::dot(horizVel, f);
-        if (playerWalkReverseHold) {
-          if (fd > kWalkBackExit)
-            playerWalkReverseHold = false;
-        } else {
-          if (fd < kWalkBackEnter)
-            playerWalkReverseHold = true;
-        }
-        playerWalkAnimReverse = playerWalkReverseHold;
+      // Forward-facing rig: scrub walk backward by reversing timeline.
+      constexpr float kWalkBackEnter = -0.09f;
+      constexpr float kWalkBackExit = 0.04f;
+      const float fd = glm::dot(horizVel, f);
+      if (playerWalkReverseHold) {
+        if (fd > kWalkBackExit)
+          playerWalkReverseHold = false;
       } else {
-        // Body yaw is flipped π for backpedal; walk clip plays forward in mesh space.
-        playerWalkAnimReverse = false;
-        playerWalkReverseHold = false;
+        if (fd < kWalkBackEnter)
+          playerWalkReverseHold = true;
       }
+      playerWalkAnimReverse = playerWalkReverseHold;
       playerAvatarClip = avClipWalk;
       return;
     }
-    if (moving && avClipSprint >= 0 && !playerSprintBackwardBlocked(down, yaw, horizVel)) {
+    if (moving && avClipSprint >= 0 && !playerSprintBackwardBlocked(dm, yaw, horizVel, gpStickLX, gpStickLY) &&
+        locomotionVelocityAllowsSprintAnim) {
       playerWalkAnimReverse = false;
       playerWalkReverseHold = false;
       playerAvatarClip = avClipSprint;
@@ -17467,7 +18243,10 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       return;
     showPauseMenu = false;
     showInventoryMenu = false;
-    audioSetStoreDayNightCyclePaused(true);
+    // Solo: pause store day/night + ambience (death menu). Linked MP: keep the world clock advancing so alive
+    // peers—and this instance after respawn—stay in sync with blackouts/music phase; snaps still carry timestamps.
+    if (!netMp.active || netMp.peerHostUtf8[0] == '\0')
+      audioSetStoreDayNightCyclePaused(true);
     playerDeathActive = true;
     playerDeathShowMenu = false;
     playerHealth = 0.f;
@@ -17610,6 +18389,23 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       playerFallLastGroundedSupportY = std::isfinite(supGlue) ? supGlue : supY;
     }
     playerFallChainMaxFeetY = std::numeric_limits<float>::quiet_NaN();
+    // Client: adopt host store timelines so respawn matches blackout/music phase alive players still hear.
+    if (netMp.active && !netMp.isHost && netMp.remoteValid(3.f)) {
+      const RetroMpWirePacket& R = netMp.lastRemote;
+      AudioStoreCycleSaveState netAudio{};
+      netAudio.version = R.audioVersion;
+      netAudio.storePhase = R.audioStorePhase;
+      netAudio.flags = R.audioFlags;
+      netAudio.storeCursorFrames = R.audioStoreCursorFrames;
+      netAudio.horrorCursorFrames = R.audioHorrorCursorFrames;
+      netAudio.chaseCursorFrames = R.audioChaseCursorFrames;
+      netAudio.shrekCursorFrames = R.audioShrekCursorFrames;
+      netAudio.blackoutRemainingMs = R.audioBlackoutRemainingMs;
+      netAudio.dayRestoreRemainingMs = R.audioDayRestoreRemainingMs;
+      netAudio.storeDayMusicTrackIdx = R.audioStoreDayMusicTrackIdx;
+      if (netAudio.version != 0)
+        audioRestoreStoreCycleSaveState(netAudio);
+    }
     audioSetStoreDayNightCyclePaused(false);
     mouseGrab = true;
     syncInputGrab();
@@ -17651,9 +18447,11 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     deliPizzaReplenishTimerBySlot.clear();
     deliMeatballsBySlot.clear();
     deliMeatballReplenishTimerBySlot.clear();
+    worldDroppedFood.clear();
     playerHunger = kPlayerHungerMax;
     ++inventoryRevision;
     inventoryScrollRow = 0;
+    inventoryUiSelectedStackIdx = -1;
     inventoryMenuCacheScroll = -1;
     const std::string path = gameSaveInventorySlotPath(slot);
     if (path.empty())
@@ -18001,6 +18799,47 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
                       titleMenuSlotVertexBufferMemory, titleMenuSlotVertexCount);
   }
 
+  void ensureLobbyHeartbeatSessionId() {
+    if (lobbyHeartbeatSessionId[0] != '\0')
+      return;
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<unsigned> d(0, 15);
+    for (size_t i = 0; i < 32; ++i)
+      lobbyHeartbeatSessionId[i] = "0123456789abcdef"[d(gen)];
+    lobbyHeartbeatSessionId[32] = '\0';
+  }
+
+  void refreshTitleMenuLobbyFetchAndMesh() {
+    titleMenuLobbyStatus.clear();
+    const char* url = lobbyEnvUrl();
+    if (!url[0]) {
+      titleMenuLobbyServers.clear();
+      titleMenuLobbyStatus = "Set env RETRO_IKEA_LOBBY_URL to lobby origin";
+    } else {
+      std::string err;
+      if (!lobbyFetchServerList(url, titleMenuLobbyServers, err))
+        titleMenuLobbyStatus = err.empty() ? "Could not reach lobby" : err;
+      else if (titleMenuLobbyServers.empty())
+        titleMenuLobbyStatus = "No servers — host from pause menu";
+      else
+        titleMenuLobbyStatus = std::to_string(titleMenuLobbyServers.size()) + " server(s)";
+    }
+    const int n = static_cast<int>(titleMenuLobbyServers.size());
+    const int maxScroll = std::max(0, n - kLobbyBrowserVisibleRows);
+    titleMenuLobbyScroll = std::clamp(titleMenuLobbyScroll, 0, maxScroll);
+    uploadUiMeshToGpu(buildTitleMenuServerBrowserVertices(titleMenuLobbyServers, titleMenuLobbyScroll, titleMenuLobbyStatus),
+                      titleMenuServerVertexBuffer, titleMenuServerVertexBufferMemory, titleMenuServerVertexCount);
+  }
+
+  void rebuildTitleMenuServerUiMesh() {
+    const int n = static_cast<int>(titleMenuLobbyServers.size());
+    const int maxScroll = std::max(0, n - kLobbyBrowserVisibleRows);
+    titleMenuLobbyScroll = std::clamp(titleMenuLobbyScroll, 0, maxScroll);
+    uploadUiMeshToGpu(buildTitleMenuServerBrowserVertices(titleMenuLobbyServers, titleMenuLobbyScroll, titleMenuLobbyStatus),
+                      titleMenuServerVertexBuffer, titleMenuServerVertexBufferMemory, titleMenuServerVertexCount);
+  }
+
   const char* pauseMenuMpStatusCstr() const {
     static thread_local char st[192];
     if (!netMp.active)
@@ -18009,9 +18848,16 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       if (netMp.remoteValid(3.f) && netMp.peerHostUtf8[0] != '\0')
         std::snprintf(st, sizeof st, "HOST LINKED %s:%u", netMp.peerHostUtf8,
                       static_cast<unsigned>(netMp.peerPort));
-      else if (netMp.publicHostUtf8[0] != '\0')
-        std::snprintf(st, sizeof st, "HOST WAITING %s:%u", netMp.publicHostUtf8,
-                      static_cast<unsigned>(kRetroMpDefaultPort));
+      else if (netMp.publicHostUtf8[0] != '\0') {
+        int ipa = -1;
+        int ipb = -1;
+        const bool tsHint = std::sscanf(netMp.publicHostUtf8, "%d.%d", &ipa, &ipb) == 2 && ipa == 100 &&
+                           ipb >= 64 && ipb <= 127;
+        std::snprintf(st, sizeof st,
+                      tsHint ? "HOST WAITING TS %s:%u"
+                             : "HOST WAITING %s:%u",
+                      netMp.publicHostUtf8, static_cast<unsigned>(kRetroMpDefaultPort));
+      }
       else
         std::snprintf(st, sizeof st, "HOST WAITING UDP %u", static_cast<unsigned>(kRetroMpDefaultPort));
     } else {
@@ -18026,6 +18872,8 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
   }
 
   void recreatePauseMenuGpuMesh() {
+    if (netMp.active && netMp.isHost)
+      netMp.refreshAnnounceJoinIpv4();
     char hostB[96];
     std::snprintf(hostB, sizeof hostB, "HOST SESSION (UDP %u)", static_cast<unsigned>(kRetroMpDefaultPort));
     char ipL[128];
@@ -18049,6 +18897,13 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       titleMenuSlotVertexBufferMemory = VK_NULL_HANDLE;
       titleMenuSlotVertexCount = 0;
     }
+    if (titleMenuServerVertexBuffer != VK_NULL_HANDLE) {
+      vkDestroyBuffer(device, titleMenuServerVertexBuffer, nullptr);
+      vkFreeMemory(device, titleMenuServerVertexBufferMemory, nullptr);
+      titleMenuServerVertexBuffer = VK_NULL_HANDLE;
+      titleMenuServerVertexBufferMemory = VK_NULL_HANDLE;
+      titleMenuServerVertexCount = 0;
+    }
   }
 
   void ensureYellowMenuCursor() {
@@ -18058,12 +18913,17 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     // Note: Microsoft Learn’s CreateCursor sample AND/XOR arrays are a *yin-yang* demo — not IDC_ARROW.
     SDL_Surface* raw = nullptr;
 #if defined(VULKAN_GAME_ASSETS_DIR)
-    raw = IMG_Load(VULKAN_GAME_ASSETS_DIR "/ui/yellow_win_arrow.png");
+    {
+      const std::string yArrow =
+          resolvePortableAssetPath(VULKAN_GAME_ASSETS_DIR "/ui/yellow_win_arrow.png");
+      raw = IMG_Load(yArrow.c_str());
+    }
 #endif
     if (!raw)
-      raw = IMG_Load("assets/ui/yellow_win_arrow.png");
+      raw = IMG_Load(resolvePortableAssetPath("assets/ui/yellow_win_arrow.png").c_str());
     if (!raw) {
-      std::cerr << "[ui] yellow_win_arrow.png missing — menu uses default cursor (" << IMG_GetError() << ")\n";
+      std::cerr << "[ui] yellow_win_arrow.png missing - menu uses default cursor (" << IMG_GetError()
+                << ")\n";
       return;
     }
     SDL_Surface* conv = SDL_ConvertSurfaceFormat(raw, SDL_PIXELFORMAT_RGBA8888, 0);
@@ -18095,11 +18955,17 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
   void returnToTitleMenuFromGame() {
     showPauseMenu = false;
     showInventoryMenu = false;
+    inventoryUiSelectedStackIdx = -1;
+    worldDroppedFood.clear();
     inTitleMenu = true;
     titleMenuSceneTime = 0.f;
     titleMenuSlideTime = 0.f;
     titleMenuSlideWasSlot = false;
     titleMenuPickSlot = false;
+    titleMenuBrowseServers = false;
+    titleMenuPendingLobbyJoin = false;
+    titleMenuPendingLobbyJoinHost[0] = '\0';
+    titleMenuLobbyScroll = 0;
     playerDeathActive = false;
     playerDeathShowMenu = false;
     playerHealth = kPlayerHealthMax;
@@ -18133,10 +18999,12 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     deliPizzaReplenishTimerBySlot.clear();
     deliMeatballsBySlot.clear();
     deliMeatballReplenishTimerBySlot.clear();
+    worldDroppedFood.clear();
     mpClientDeliLocalTakePizza.clear();
     mpClientDeliLocalTakeMeat.clear();
     ++inventoryRevision;
     inventoryScrollRow = 0;
+    inventoryUiSelectedStackIdx = -1;
     inventoryMenuCacheScroll = -1;
     velY = 0.f;
     horizVel = glm::vec2(0.f);
@@ -18225,6 +19093,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     loadingScreenIsNewSave = !saveSlotFileLooksValid(gameSaveSlotPath(slot));
     inTitleMenu = false;
     titleMenuPickSlot = false;
+    titleMenuBrowseServers = false;
     audioSetTitleMenuMusicActive(false);
     audioSetLoadingScreenActive(true);
     syncInputGrab();
@@ -18256,6 +19125,13 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     inLoadingScreen = false;
     mouseGrab = true;
     syncInputGrab();
+    if (titleMenuPendingLobbyJoin && titleMenuPendingLobbyJoinHost[0] != '\0') {
+      mpClientSpawnSynced = false;
+      mpClientLastLinkMono = -1.0;
+      netMp.startJoin(titleMenuPendingLobbyJoinHost, titleMenuPendingLobbyJoinPort);
+      titleMenuPendingLobbyJoin = false;
+      titleMenuPendingLobbyJoinHost[0] = '\0';
+    }
     gameSaveWrite();
     refreshWindowTitleWithHealth();
     if (wasNewSave)
@@ -18329,9 +19205,21 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     if (!std::isfinite(dt) || dt < 1e-5f)
       dt = 1.f / static_cast<float>(kTargetFps);
     fpLocoAvatarYawFlip = 0.f;
-    fpLocoBackwardBodyFlip = false;
     const bool uiMenuFreeze = (showControlsOverlay || inTitleMenu) && !playerDeathActive;
     netMp.pollReceive(dt);
+    if (const char* lobbyUrl = lobbyEnvUrl(); lobbyUrl[0] && netMp.active && netMp.isHost &&
+                                            netMp.publicHostUtf8[0] != '\0' && !inTitleMenu) {
+      lobbyHeartbeatAccumSec += static_cast<double>(dt);
+      constexpr double kLobbyHeartbeatSec = 20.0;
+      if (lobbyHeartbeatAccumSec >= kLobbyHeartbeatSec) {
+        lobbyHeartbeatAccumSec = 0.;
+        ensureLobbyHeartbeatSessionId();
+        std::string hbErr;
+        (void)lobbyRegisterHeartbeat(lobbyUrl, lobbyHeartbeatSessionId, netMp.publicHostUtf8, kRetroMpDefaultPort,
+                                     "RetroIkea", hbErr);
+      }
+    } else if (!netMp.active || !netMp.isHost)
+      lobbyHeartbeatAccumSec = 0.;
     if (netMp.active && netMp.consumeRemoteDeathRetry()) {
       // Peer pressed RETRY: respawn locally only if we're still in death flow (don't re-roll spawn if alive).
       if (playerDeathActive || playerDeathShowMenu)
@@ -18516,7 +19404,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       else if (isGrounded())
         playerFallAnimTime = 0.f;
     }
-    if (!playerDeathActive && !inTitleMenu && !inLoadingScreen) {
+    if ((!playerDeathActive || (netMp.active && netMp.isHost)) && !inTitleMenu && !inLoadingScreen) {
       staffSimTime += dt;
       const bool hostOwnsWorld = !netMp.active || netMp.isHost;
       if (hostOwnsWorld && netMp.active && netMp.isHost && netMp.peerHostUtf8[0] != '\0')
@@ -18575,9 +19463,10 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       audioSetLowHealthHeartbeat(playerHealth > 0.f && playerHealth < kPlayerHealthMercyCap);
       tickPlayerDeathScene(dt);
       titleMenuSceneTime += dt;
-      if (titleMenuSlideWasSlot != titleMenuPickSlot) {
+      const bool titleSubUi = titleMenuPickSlot || titleMenuBrowseServers;
+      if (titleMenuSlideWasSlot != titleSubUi) {
         titleMenuSlideTime = 0.f;
-        titleMenuSlideWasSlot = titleMenuPickSlot;
+        titleMenuSlideWasSlot = titleSubUi;
       }
       titleMenuSlideTime += dt;
       staffSimTime += dt;
@@ -18606,12 +19495,82 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     }
     SDL_PumpEvents();
     const Uint8* keys = SDL_GetKeyboardState(nullptr);
-    const auto down = [keys, this](SDL_Scancode sc) -> bool {
+
+    float gpLX = 0.f;
+    float gpLY = 0.f;
+    float gpRX = 0.f;
+    float gpRY = 0.f;
+    bool gpA = false;
+    bool gpB = false;
+    bool gpYBtn = false;
+    bool gpSprintHeldPad = false;
+    if (gameController) {
+      gpA = SDL_GameControllerGetButton(gameController, SDL_CONTROLLER_BUTTON_A) != 0;
+      gpB = SDL_GameControllerGetButton(gameController, SDL_CONTROLLER_BUTTON_B) != 0;
+      gpYBtn = SDL_GameControllerGetButton(gameController, SDL_CONTROLLER_BUTTON_Y) != 0;
+      gpSprintHeldPad =
+          SDL_GameControllerGetButton(gameController, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0 ||
+          SDL_GameControllerGetAxis(gameController, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 12000;
+      Sint16 lax = SDL_GameControllerGetAxis(gameController, SDL_CONTROLLER_AXIS_LEFTX);
+      Sint16 lay = SDL_GameControllerGetAxis(gameController, SDL_CONTROLLER_AXIS_LEFTY);
+      gpLX = lax / 32768.f;
+      gpLY = lay / 32768.f;
+      gamepadRadialDeadzone(gpLX, gpLY, 0.15f);
+      Sint16 rax = SDL_GameControllerGetAxis(gameController, SDL_CONTROLLER_AXIS_RIGHTX);
+      Sint16 ray = SDL_GameControllerGetAxis(gameController, SDL_CONTROLLER_AXIS_RIGHTY);
+      gpRX = rax / 32768.f;
+      gpRY = ray / 32768.f;
+      gamepadRadialDeadzone(gpRX, gpRY, 0.15f);
+    }
+
+    const auto down = [keys, this, gpA, gpB, gpYBtn, gpSprintHeldPad](SDL_Scancode sc) -> bool {
+      if (sc == SDL_SCANCODE_SPACE && gpA)
+        return true;
+      if (sc == SDL_SCANCODE_C && gpB)
+        return true;
+      if ((sc == SDL_SCANCODE_LSHIFT || sc == SDL_SCANCODE_RSHIFT) && gpSprintHeldPad)
+        return true;
+      if (sc == SDL_SCANCODE_X && gpYBtn)
+        return true;
       const int i = static_cast<int>(sc);
       if (i < 0 || i >= SDL_NUM_SCANCODES)
         return keys[sc] != 0;
       return keys[sc] != 0 || scancodeDown[static_cast<size_t>(sc)];
     };
+
+    const auto downMove = [down, gpLX, gpLY](SDL_Scancode sc) -> bool {
+      if (sc == SDL_SCANCODE_W || sc == SDL_SCANCODE_UP || sc == SDL_SCANCODE_Z)
+        return down(SDL_SCANCODE_W) || down(SDL_SCANCODE_UP) || down(SDL_SCANCODE_Z) || (gpLY < -0.35f);
+      if (sc == SDL_SCANCODE_S || sc == SDL_SCANCODE_DOWN)
+        return down(SDL_SCANCODE_S) || down(SDL_SCANCODE_DOWN) || (gpLY > 0.35f);
+      if (sc == SDL_SCANCODE_A || sc == SDL_SCANCODE_LEFT)
+        return down(SDL_SCANCODE_A) || down(SDL_SCANCODE_LEFT) || (gpLX < -0.35f);
+      if (sc == SDL_SCANCODE_D || sc == SDL_SCANCODE_RIGHT)
+        return down(SDL_SCANCODE_D) || down(SDL_SCANCODE_RIGHT) || (gpLX > 0.35f);
+      return down(sc);
+    };
+
+    if (gameController && !showControlsOverlay && !showPauseMenu && !showInventoryMenu && !inTitleMenu &&
+        !playerDeathActive) {
+      const Sint16 rtAx = SDL_GameControllerGetAxis(gameController, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
+      const bool rtHeld = rtAx > 10000;
+      if (rtHeld && !gpRtPickupHeldPrev)
+        (void)tryPickupNearestDeliPizzaSlice();
+      gpRtPickupHeldPrev = rtHeld;
+
+      const bool rbHeld =
+          SDL_GameControllerGetButton(gameController, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) != 0;
+      if (mouseGrab && rbHeld && !gpRbShoveHeldPrev)
+        pendingStaffShoveLmb = true;
+      gpRbShoveHeldPrev = rbHeld;
+
+      const bool rstickHeld =
+          SDL_GameControllerGetButton(gameController, SDL_CONTROLLER_BUTTON_RIGHTSTICK) != 0;
+      if (mouseGrab && rstickHeld && !gpRStickKickHeldPrev)
+        pendingPlayerKick = true;
+      gpRStickKickHeldPrev = rstickHeld;
+    }
+
     int mx = 0, my = 0;
     if (mouseGrab && !showControlsOverlay && !showPauseMenu && !showInventoryMenu && !inTitleMenu) {
       SDL_GetRelativeMouseState(&mx, &my);
@@ -18623,6 +19582,12 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
         !inTitleMenu) {
       yaw += static_cast<float>(mx) * sens;
       pitch -= static_cast<float>(my) * sens;
+      if (gameController && (std::fabs(gpRX) > 1e-5f || std::fabs(gpRY) > 1e-5f)) {
+        constexpr float kGpYawRadPerSec = 2.65f;
+        constexpr float kGpPitchRadPerSec = 2.15f;
+        yaw += gpRX * kGpYawRadPerSec * dt;
+        pitch -= gpRY * kGpPitchRadPerSec * dt;
+      }
       // Keyboard look if the mouse is ignored (Wayland / bad relative-mode drivers).
       const float lk = 2.4f * dt;
       if (down(SDL_SCANCODE_J))
@@ -18681,11 +19646,11 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     const float feetBeforeCrouch = camPos.y - eyeHeight;
     const float supStart = playerTerrainSupportY(camPos.x, camPos.z, feetBeforeCrouch);
     const bool groundedStart = isGroundedUsingSupport(supStart);
-    const bool crouchHeldRaw = down(SDL_SCANCODE_C);
+    const bool crouchHeldRaw = down(SDL_SCANCODE_C) || gpB;
     const bool slideEdge = pendingSlideCrouchEdge;
     pendingSlideCrouchEdge = false;
     const bool slideInput =
-        slideEdge && crouchHeldRaw && inputForward(down) && inputSprintHeld(down);
+        slideEdge && crouchHeldRaw && inputForward(downMove) && inputSprintHeld(down);
     if (slideCooldownTimer > 0.f)
       slideCooldownTimer -= dt;
     if (wallRunCooldownTimer > 0.f)
@@ -18737,7 +19702,8 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     } else
       coyoteTime -= dt;
 
-    if (!playerDeathActive && down(SDL_SCANCODE_SPACE) && !spaceWasDown)
+    const bool jumpHeld = down(SDL_SCANCODE_SPACE) || gpA;
+    if (!playerDeathActive && jumpHeld && !spaceWasDown)
       jumpBuffer = kJumpBufferTime;
     else
       jumpBuffer -= dt;
@@ -18784,7 +19750,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
           ledgeHangApproachVel = glm::vec2(0.f);
         }
       }
-      if (ledgeHangActive && down(SDL_SCANCODE_SPACE) && inputBack(down) && ledgeHangGrabTimer <= 0.f) {
+      if (ledgeHangActive && jumpHeld && inputBack(downMove) && ledgeHangGrabTimer <= 0.f) {
         ledgeHangActive = false;
         ledgeHangFeetYCaptured = false;
         velY = kLedgeHangJumpAwayVelY;
@@ -18792,7 +19758,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
           horizVel = glm::normalize(ledgeHangExitHoriz) * kLedgeHangJumpAwaySpeed;
         jumpBuffer = 0.f;
         coyoteTime = 0.f;
-      } else if (ledgeHangActive && down(SDL_SCANCODE_SPACE) && ledgeHangGrabTimer <= 0.f) {
+      } else if (ledgeHangActive && jumpHeld && ledgeHangGrabTimer <= 0.f) {
         ledgeHangActive = false;
         ledgeHangFeetYCaptured = false;
         ledgeClimbStartCam = ledgeHangCamPos;
@@ -18810,8 +19776,8 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
         if (glm::length(ledgeHangExitHoriz) > 1e-4f)
           horizVel = -glm::normalize(ledgeHangExitHoriz) * 1.6f;
       } else if (ledgeHangActive && ledgeHangGrabTimer <= 0.f) {
-        const bool strafeL = inputStrafeLeft(down);
-        const bool strafeR = inputStrafeRight(down);
+        const bool strafeL = inputStrafeLeft(downMove);
+        const bool strafeR = inputStrafeRight(downMove);
         // A / strafe-left → +dir → Meshy left climb (ledge_shimmy_left); D → right climb.
         // Only treat as shimmy when the deck clamp actually moves the hang point — at the strafe AABB edge,
         // hold strafe without advancing shimmy clip/phase (no treadmill against the limit).
@@ -18890,12 +19856,12 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       }
     }
     if (ladderClimbActive && avClipLedgeClimb >= 0) {
-      if (down(SDL_SCANCODE_X) || down(SDL_SCANCODE_SPACE)) {
+      if (down(SDL_SCANCODE_X) || jumpHeld) {
         ladderClimbActive = false;
         ladderClimbT = 0.f;
         ladderClimbApproachVel = glm::vec2(0.f);
       } else
-        advanceLadderClimb(dt, inputForward(down), inputBack(down));
+        advanceLadderClimb(dt, inputForward(downMove), inputBack(downMove));
     }
 
     if (ledgeClimbT < 0.f && !ledgeHangActive && !ladderClimbActive) {
@@ -18912,47 +19878,30 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     if (!playerDeathActive) {
     glm::vec3 rightDir{std::cos(yaw + glm::half_pi<float>()), 0,
                          std::sin(yaw + glm::half_pi<float>())};
-    if (inputForward(down))
+    if (inputForward(downMove))
       wish += glm::vec2(forward.x, forward.z);
-    if (inputBack(down))
+    if (inputBack(downMove))
       wish -= glm::vec2(forward.x, forward.z);
-    if (inputStrafeLeft(down))
+    if (inputStrafeLeft(downMove))
       wish -= glm::vec2(rightDir.x, rightDir.z);
-    if (inputStrafeRight(down))
+    if (inputStrafeRight(downMove))
       wish += glm::vec2(rightDir.x, rightDir.z);
+    {
+      const glm::vec2 stickWish =
+          glm::vec2(forward.x, forward.z) * (-gpLY) + glm::vec2(rightDir.x, rightDir.z) * gpLX;
+      wish += stickWish;
+    }
     hasWishInput = glm::length(wish) > 1e-4f;
-    const bool wishStrafeOnly = !inputForward(down) && !inputBack(down) &&
-                                (inputStrafeLeft(down) || inputStrafeRight(down));
+    const bool wishStrafeOnly = !inputForward(downMove) && !inputBack(downMove) &&
+                                (inputStrafeLeft(downMove) || inputStrafeRight(downMove));
     if (playerDanceEmoteActive && !playerDeathActive &&
         ((!wishStrafeOnly && hasWishInput) || slideActive ||
-         (playerDanceEmoteStopGraceRemain <= 0.f &&
-          (down(SDL_SCANCODE_SPACE) || crouchHeldRaw)))) {
+         (playerDanceEmoteStopGraceRemain <= 0.f && (jumpHeld || crouchHeldRaw)))) {
       playerDanceEmoteActive = false;
       playerDanceEmoteStopGraceRemain = 0.f;
     }
     if (hasWishInput)
       wish = glm::normalize(wish);
-    {
-      const glm::vec2 camF(std::cos(yaw), std::sin(yaw));
-      bool showBackBody = false;
-      // Dance uses a fixed facing clip — don't π-flip from S/backpedal (looks broken); ledge/shimmy use
-      // geometry yaw above, not this path (those states skip this locomotion block).
-      if (!playerDeathActive && !playerDanceEmoteActive) {
-        if (slideActive && glm::length(slideDir) > 1e-4f) {
-          const glm::vec2 sd = glm::normalize(slideDir);
-          if (glm::dot(sd, camF) < -0.045f)
-            showBackBody = true;
-        } else if (hasWishInput && glm::dot(wish, camF) < -1e-3f)
-          showBackBody = true;
-        else if (!hasWishInput && glm::length(horizVel) > 0.09f) {
-          const glm::vec2 hv = horizVel * (1.f / glm::length(horizVel));
-          if (glm::dot(hv, camF) < -0.32f)
-            showBackBody = true;
-        }
-      }
-      fpLocoBackwardBodyFlip = showBackBody;
-      fpLocoAvatarYawFlip = showBackBody ? glm::pi<float>() : 0.f;
-    }
     if (!playerDeathActive && !slideActive && groundedStart && slideCooldownTimer <= 0.f && slideInput) {
       glm::vec2 startDir = horizVel;
       if (glm::length(startDir) < 0.2f)
@@ -18995,7 +19944,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     const bool crouchedMove = eyeHeight < (kEyeHeight - 0.12f);
     runGrounded = groundedStart && inputSprintHeld(down) && !crouchedMove && !slideActive &&
                   !playerDanceEmoteActive &&
-                  !playerSprintBackwardBlocked(down, yaw, horizVel);
+                  !playerSprintBackwardBlocked(downMove, yaw, horizVel, gpLX, gpLY);
     const bool airSmallGapSlow = !groundedStart && playerAirWalkSmallGap;
     const float accel =
         groundedStart ? kWalkAccel * (runGrounded ? kSprintAccelMult : 1.f)
@@ -19079,9 +20028,9 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     // Do not cancel slide when groundedMove flickers false on shelf decks (thin probes / sub-steps);
     // slide ends via clip/timer, jump, or slide-stop logic below.
 
-    if (spaceWasDown && !down(SDL_SCANCODE_SPACE) && velY > 0.2f)
+    if (spaceWasDown && !jumpHeld && velY > 0.2f)
       velY *= kJumpCutMult;
-    spaceWasDown = down(SDL_SCANCODE_SPACE);
+    spaceWasDown = jumpHeld;
 
     velY -= kGravity * dt;
     if (dropKickActive) {
@@ -19096,8 +20045,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     bool vaultAssistThisFrame = false;
     glm::vec3 mantleProbeEnd{};
     const bool canSquatHere = groundedMove && velY <= 0.2f && !slideActive;
-    const bool mantleProbe = canSquatHere && (down(SDL_SCANCODE_SPACE) || playerJumpSquatCharging ||
-                                                jumpBuffer > 1e-5f);
+    const bool mantleProbe = canSquatHere && (jumpHeld || playerJumpSquatCharging || jumpBuffer > 1e-5f);
     const bool squatFarTarget = mantleProbe && playerJumpSquatTargetIsFar(mantleProbeEnd);
 
     auto applyJumpCommon_ = [&]() {
@@ -19238,7 +20186,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     }
 
     // Commit jump-squat on Space release even if mantle probe flickers this frame.
-    if (playerJumpSquatCharging && canSquatHere && !down(SDL_SCANCODE_SPACE)) {
+    if (playerJumpSquatCharging && canSquatHere && !jumpHeld) {
       const float uEase = 1.f - std::pow(1.f - playerJumpSquatCharge, 2.05f);
       float vJump = kJumpVel * glm::mix(kJumpSquatVelMinMul, kJumpSquatVelMaxMul, uEase);
       if (playerDepthJumpWindowRemain > 0.f) {
@@ -19258,7 +20206,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       if (!canSquatHere) {
         playerJumpSquatCharging = false;
         playerJumpSquatCharge = 0.f;
-      } else if (squatFarTarget && down(SDL_SCANCODE_SPACE)) {
+      } else if (squatFarTarget && jumpHeld) {
         if (!playerJumpSquatCharging)
           playerJumpSquatCharge = 0.f;
         playerJumpSquatCharging = true;
@@ -19269,7 +20217,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
         playerJumpSquatCharge = 0.f;
       }
     }
-    const bool blockInstantJumpForSquat = squatFarTarget && canSquatHere && down(SDL_SCANCODE_SPACE);
+    const bool blockInstantJumpForSquat = squatFarTarget && canSquatHere && jumpHeld;
     // Walking off a deck: horizontal move can leave groundedMove false while coyote is still hot — that
     // fired a full jump and blocked small-gap walk. Skip coyote jump this tick when the next deck is a
     // short hop ahead (same fix as mantle skip).
@@ -19319,7 +20267,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       }
       if (playerJumpRepeatWindowRem > 1e-4f && !vaultAssist) {
         horizVel *= kJumpRepeatCarryMul;
-        if (inputForward(down))
+        if (inputForward(downMove))
           horizVel *= kJumpRepeatForwardMul;
       }
       applyJumpCommon_();
@@ -19974,10 +20922,12 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
 
     audioSetSlide(slideActive);
 
-    const float runTarget =
-        (groundedEnd && inputSprintHeld(down) && sp > 0.2f && !playerSprintBackwardBlocked(down, yaw, horizVel))
-            ? std::clamp(sp / kSprintSpeed, 0.f, 1.f)
-            : 0.f;
+    const glm::vec2 runBobFwd(std::cos(yaw), std::sin(yaw));
+    const bool runBobVelFwdOk = glm::dot(horizVel, runBobFwd) > kLocomotionSprintMinVelFwd;
+    const float runTarget = (groundedEnd && inputSprintHeld(down) && sp > 0.2f &&
+                             !playerSprintBackwardBlocked(downMove, yaw, horizVel, gpLX, gpLY) && runBobVelFwdOk)
+                                ? std::clamp(sp / kSprintSpeed, 0.f, 1.f)
+                                : 0.f;
     const float runBlendRate = runTarget > runAnimBlend ? kRunAnimBlendInRate : kRunAnimBlendOutRate;
     runAnimBlend = glm::mix(runAnimBlend, runTarget, 1.f - std::exp(-dt * runBlendRate));
 
@@ -19986,10 +20936,11 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     idleAnimBlend = glm::mix(idleAnimBlend, idleTarget, 1.f - std::exp(-dt * kIdleAnimBlendRate));
 
     float strafe = 0.f;
-    if (inputStrafeLeft(down))
+    if (inputStrafeLeft(downMove))
       strafe -= 1.f;
-    if (inputStrafeRight(down))
+    if (inputStrafeRight(downMove))
       strafe += 1.f;
+    strafe = std::clamp(strafe + gpLX, -1.f, 1.f);
     const float moveBlend = std::clamp(sp / std::max(kMaxSpeed, 0.01f), 0.f, 1.f);
     const float runRollScale = glm::mix(1.f, kRunRollScale, runAnimBlend);
     const float targetRoll =
@@ -20091,7 +21042,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     if (kPlayerLedgeMantleEnabled) {
       // Ledge grab after full head/camera update so rays match drawFrame (bob, sway, roll, mouse roll, pos).
       // Let wall climb auto-chain into the existing mantle once the probe can see a valid top edge.
-      const bool mantleInput = wallClimbActive || jumpBuffer > 0.f || down(SDL_SCANCODE_SPACE);
+      const bool mantleInput = wallClimbActive || jumpBuffer > 0.f || jumpHeld;
       float mantleMoveBoost = 0.f, mantleExtraFall = 0.f;
       mantleLedgeMovementAid(horizVel, groundedEnd, mantleMoveBoost, mantleExtraFall);
       const float runTEffMantle = glm::min(1.f, mantleRunT(horizVel) + mantleMoveBoost);
@@ -20121,7 +21072,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
         glm::mix(avatarLocoGroundedSmoothed, groundedEnd ? 1.f : 0.f, 1.f - std::exp(-dt * 17.f));
     // Must use real groundedEnd for clip selection — groundedLocoClip stays “sticky” in air and was
     // letting sprint/walk/crouch branches win over pre-fall / jump mid / small-gap air walk.
-    syncPlayerAvatarClip(groundedEnd, down);
+    syncPlayerAvatarClip(groundedEnd, downMove, gpLX, gpLY);
     if (playerAvatarClip != clipBeforeSync) {
       if (avatarClipsAllowCrossfade(clipBeforeSync, playerAvatarClip)) {
         playerAvatarBlendFromClip = clipBeforeSync;
@@ -20332,7 +21283,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       const int clipBeforeSyncGh = playerAvatarClip;
       avatarLocoGroundedSmoothed =
           glm::mix(avatarLocoGroundedSmoothed, groundedHangPath ? 1.f : 0.f, 1.f - std::exp(-dt * 17.f));
-      syncPlayerAvatarClip(groundedHangPath, down);
+      syncPlayerAvatarClip(groundedHangPath, downMove, gpLX, gpLY);
       if (playerAvatarClip != clipBeforeSyncGh) {
         if (avatarClipsAllowCrossfade(clipBeforeSyncGh, playerAvatarClip)) {
           playerAvatarBlendFromClip = clipBeforeSyncGh;
@@ -20898,6 +21849,10 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       SDL_DestroyWindow(window);
       window = nullptr;
     }
+    if (gameController) {
+      SDL_GameControllerClose(gameController);
+      gameController = nullptr;
+    }
     IMG_Quit();
     SDL_Quit();
   }
@@ -20919,7 +21874,7 @@ int main(int argc, char** argv) {
     }
     app.initVulkan();
     std::fprintf(stderr,
-                 "[retro-ikea] v%s — built %s %s — if fixes are missing, confirm this stamp changed after rebuild.\n",
+                 "[retro-ikea] v%s - built %s %s - if fixes are missing, confirm this stamp changed after rebuild.\n",
                  VULKAN_GAME_VERSION_STRING, __DATE__, __TIME__);
 
     auto last = std::chrono::steady_clock::now();

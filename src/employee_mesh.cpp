@@ -1,4 +1,5 @@
 #include "employee_mesh.hpp"
+#include "portable_path.hpp"
 
 #include <assimp/Importer.hpp>
 #include <assimp/material.h>
@@ -297,8 +298,9 @@ bool loadFbx(const char* path, float targetHeightMeters, std::vector<LoadedVerte
   if (pathLooksLikeGltf(path))
     aiFlags |= aiProcess_PreTransformVertices;
 
+  const std::string resolved = resolvePortableAssetPath(path);
   Assimp::Importer importer;
-  const aiScene* scene = importer.ReadFile(path, aiFlags);
+  const aiScene* scene = importer.ReadFile(resolved.c_str(), aiFlags);
   if (!scene || !scene->mRootNode ||
       (scene->mFlags & AI_SCENE_FLAGS_INCOMPLETE) != 0) {
     errOut = importer.GetErrorString();

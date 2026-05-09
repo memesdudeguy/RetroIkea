@@ -1,4 +1,5 @@
 #include "staff_skin.hpp"
+#include "portable_path.hpp"
 
 #include <assimp/Importer.hpp>
 #include <assimp/material.h>
@@ -515,11 +516,12 @@ bool loadSkinnedIdleGlb(const char* path, float targetHeightMeters, std::vector<
   outRig = Rig{};
   errOut.clear();
 
+  const std::string resolvedIdle = resolvePortableAssetPath(path);
   Assimp::Importer importer;
   const unsigned flags = aiProcess_Triangulate | aiProcess_GenSmoothNormals | aiProcess_LimitBoneWeights |
                          aiProcess_ImproveCacheLocality | aiProcess_RemoveRedundantMaterials |
                          aiProcess_ValidateDataStructure;
-  const aiScene* scene = importer.ReadFile(path, flags);
+  const aiScene* scene = importer.ReadFile(resolvedIdle.c_str(), flags);
   if (!scene || !scene->mRootNode || (scene->mFlags & AI_SCENE_FLAGS_INCOMPLETE) != 0) {
     errOut = importer.GetErrorString();
     return false;
@@ -725,9 +727,14 @@ bool loadSkinnedIdleGlb(const char* path, float targetHeightMeters, std::vector<
 
   if (outDiffuseRgba && outDiffuseW && outDiffuseH) {
     std::string dir;
-    const char* sl = std::strrchr(path, '/');
+    const char* const pathForDir = resolvedIdle.c_str();
+    const char* sl = std::strrchr(pathForDir, '/');
+#ifdef _WIN32
+    if (!sl)
+      sl = std::strrchr(pathForDir, '\\');
+#endif
     if (sl)
-      dir.assign(path, sl - path + 1);
+      dir.assign(pathForDir, static_cast<size_t>(sl - pathForDir) + 1u);
     *outDiffuseW = 0;
     *outDiffuseH = 0;
     outDiffuseRgba->clear();
@@ -746,10 +753,11 @@ bool appendLongestRetargetedClipFromGlb(const char* path, Rig& rig, bool freeRoo
                                         std::string& errOut) {
   errOut.clear();
   outClipIndex = -1;
+  const std::string resolvedLong = resolvePortableAssetPath(path);
   Assimp::Importer importer;
   const unsigned flags =
       aiProcess_Triangulate | aiProcess_RemoveRedundantMaterials | aiProcess_ValidateDataStructure;
-  const aiScene* scene = importer.ReadFile(path, flags);
+  const aiScene* scene = importer.ReadFile(resolvedLong.c_str(), flags);
   if (!scene) {
     errOut = importer.GetErrorString();
     return false;
@@ -797,10 +805,11 @@ bool appendLongestRetargetedClipFromGlb(const char* path, Rig& rig, bool freeRoo
 
 bool appendAnimationFromGlb(const char* path, Rig& rig, std::string& errOut) {
   errOut.clear();
+  const std::string resolvedAnim = resolvePortableAssetPath(path);
   Assimp::Importer importer;
   const unsigned flags =
       aiProcess_Triangulate | aiProcess_RemoveRedundantMaterials | aiProcess_ValidateDataStructure;
-  const aiScene* scene = importer.ReadFile(path, flags);
+  const aiScene* scene = importer.ReadFile(resolvedAnim.c_str(), flags);
   if (!scene) {
     errOut = importer.GetErrorString();
     return false;

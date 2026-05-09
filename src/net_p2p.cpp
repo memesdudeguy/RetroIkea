@@ -6,6 +6,7 @@
 #include <cstring>
 #include <cstdio>
 #include <string>
+#include <vector>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -13,10 +14,13 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "iphlpapi.lib")
 using SockT = SOCKET;
 constexpr SockT kSockInvalid = INVALID_SOCKET;
 #else
+#include <ifaddrs.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -48,6 +52,196 @@ static bool setNonBlocking(SockT s) {
     return false;
   return fcntl(s, F_SETFL, fl | O_NONBLOCK) == 0;
 #endif
+}
+
+static bool ipv4BytesAreTailscaleCgnat(const uint8_t* o) {
+  return o != nullptr && o[0] == 100u && o[1] >= 64u && o[1] <= 127u;
+}
+
+static FILE* retroMpPopenRead(const char* cmd) {
+#ifdef _WIN32
+  return _popen(cmd, "r");
+#else
+  return popen(cmd, "r");
+#endif
+}
+
+static int retroMpPclose(FILE* f) {
+  if (!f)
+    return -1;
+#ifdef _WIN32
+  return _pclose(f);
+#else
+  return pclose(f);
+#endif
+}
+
+static bool tailscaleIpv4FromCli(char* out, size_t outCap) {
+  out[0] = '\0';
+  if (!out || outCap < sizeof("100.64.255.255"))
+    return false;
+#ifdef _WIN32
+  static const char* const kCli[] = {
+      "\"C:\\Program Files\\Tailscale\\tailscale.exe\" ip -4",
+      "\"C:\\Program Files (x86)\\Tailscale\\tailscale.exe\" ip -4",
+      "tailscale ip -4"};
+#else
+  static const char* const kCli[] = {"tailscale ip -4"};
+#endif
+  for (const char* cmd : kCli) {
+    FILE* f = retroMpPopenRead(cmd);
+    if (!f)
+      continue;
+    std::vector<char> line(128);
+    if (!std::fgets(line.data(), static_cast<int>(line.size()), f)) {
+      retroMpPclose(f);
+      continue;
+    }
+    retroMpPclose(f);
+    char* nl = std::strchr(line.data(), '\r');
+    if (!nl)
+      nl = std::strchr(line.data(), '\n');
+    if (nl)
+      *nl = '\0';
+    char tokBuf[INET_ADDRSTRLEN]{};
+    const char* first = line.data();
+    while (*first == ' ' || *first == '\t')
+      ++first;
+    // First token only (handles multiple IPs on separate lines elsewhere).
+    {
+      std::size_t i = 0;
+      while (first[i] && first[i] != ' ' && first[i] != '\t' &&
+             first[i] != ',' && i + 1 < sizeof(tokBuf))
+        ++i;
+      if (i == 0)
+        continue;
+      std::memcpy(tokBuf, first, i);
+      tokBuf[i] = '\0';
+    }
+    in_addr a4{};
+    if (inet_pton(AF_INET, tokBuf, &a4) != 1)
+      continue;
+    const auto* oct = reinterpret_cast<const uint8_t*>(&a4);
+    if (!ipv4BytesAreTailscaleCgnat(oct))
+      continue;
+    char norm[INET_ADDRSTRLEN]{};
+    if (inet_ntop(AF_INET, &a4, norm, sizeof(norm)) == nullptr)
+      continue;
+    std::strncpy(out, norm, outCap - 1);
+    out[outCap - 1] = '\0';
+    return true;
+  }
+  return false;
+}
+
+#ifdef _WIN32
+static bool tailscaleIpv4FromWinAdapters(char* out, size_t outCap) {
+  out[0] = '\0';
+  if (!out || outCap < 8)
+    return false;
+  ULONG sz = static_cast<ULONG>(16u * 1024u);
+  std::vector<uint8_t> buf(sz);
+  PIP_ADAPTER_ADDRESSES aa = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
+
+  ULONG err = GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                                                GAA_FLAG_SKIP_DNS_SERVER,
+                                   nullptr, aa, &sz);
+  if (err == ERROR_BUFFER_OVERFLOW) {
+    buf.resize(sz);
+    aa = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
+    err = GetAdaptersAddresses(AF_INET,
+                               GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+                               nullptr, aa, &sz);
+  }
+  if (err != NO_ERROR || aa == nullptr)
+    return false;
+
+  char preferred[INET_ADDRSTRLEN]{};
+  char fallback[INET_ADDRSTRLEN]{};
+
+  for (PIP_ADAPTER_ADDRESSES a = aa; a != nullptr; a = a->Next) {
+    const bool tailName =
+        (a->FriendlyName && wcsstr(a->FriendlyName, L"Tailscale") != nullptr) ||
+        (a->Description && wcsstr(a->Description, L"Tailscale") != nullptr);
+    for (PIP_ADAPTER_UNICAST_ADDRESS u = a->FirstUnicastAddress; u != nullptr; u = u->Next) {
+      if (u->Address.lpSockaddr == nullptr ||
+          static_cast<size_t>(u->Address.lpSockaddr->sa_family) != AF_INET)
+        continue;
+      const auto* sin = reinterpret_cast<const sockaddr_in*>(u->Address.lpSockaddr);
+      const auto* oc = reinterpret_cast<const uint8_t*>(&sin->sin_addr);
+      if (!ipv4BytesAreTailscaleCgnat(oc))
+        continue;
+      char nb[INET_ADDRSTRLEN]{};
+      if (inet_ntop(AF_INET, &sin->sin_addr, nb, sizeof(nb)) == nullptr)
+        continue;
+      if (tailName) {
+        std::memcpy(preferred, nb, sizeof(preferred));
+        break;
+      }
+      if (fallback[0] == '\0')
+        std::memcpy(fallback, nb, sizeof(fallback));
+    }
+    if (preferred[0] != '\0')
+      break;
+  }
+
+  const char* pick = preferred[0] != '\0' ? preferred : (fallback[0] != '\0' ? fallback : nullptr);
+  if (pick == nullptr)
+    return false;
+  std::strncpy(out, pick, outCap - 1);
+  out[outCap - 1] = '\0';
+  return true;
+}
+#else
+static bool tailscaleIpv4FromUnixIfaddrs(char* out, size_t outCap) {
+  out[0] = '\0';
+  if (!out || outCap < 8)
+    return false;
+  ifaddrs* ifap = nullptr;
+  if (getifaddrs(&ifap) != 0 || ifap == nullptr)
+    return false;
+  char preferred[INET_ADDRSTRLEN]{};
+  char fallback[INET_ADDRSTRLEN]{};
+
+  for (ifaddrs* ifa = ifap; ifa != nullptr; ifa = ifa->ifa_next) {
+    if (!ifa->ifa_addr || static_cast<size_t>(ifa->ifa_addr->sa_family) != AF_INET)
+      continue;
+    const char* n = ifa->ifa_name;
+    if (!n || std::strcmp(n, "lo") == 0)
+      continue;
+    const auto* sin = reinterpret_cast<const sockaddr_in*>(ifa->ifa_addr);
+    const auto* oc = reinterpret_cast<const uint8_t*>(&sin->sin_addr);
+    if (!ipv4BytesAreTailscaleCgnat(oc))
+      continue;
+    char nb[INET_ADDRSTRLEN]{};
+    if (inet_ntop(AF_INET, &sin->sin_addr, nb, sizeof(nb)) == nullptr)
+      continue;
+    if (strstr(n, "tailscale") != nullptr) {
+      std::memcpy(preferred, nb, sizeof(preferred));
+      break;
+    }
+    if (fallback[0] == '\0')
+      std::memcpy(fallback, nb, sizeof(fallback));
+  }
+  freeifaddrs(ifap);
+  const char* pick = preferred[0] != '\0' ? preferred : (fallback[0] != '\0' ? fallback : nullptr);
+  if (pick == nullptr)
+    return false;
+  std::strncpy(out, pick, outCap - 1);
+  out[outCap - 1] = '\0';
+  return true;
+}
+#endif
+
+static bool tryAnnounceTailscaleIpv4(char* out, size_t outCap) {
+#ifdef _WIN32
+  if (tailscaleIpv4FromWinAdapters(out, outCap))
+    return true;
+#else
+  if (tailscaleIpv4FromUnixIfaddrs(out, outCap))
+    return true;
+#endif
+  return tailscaleIpv4FromCli(out, outCap);
 }
 
 static bool fetchPublicIpv4(char* out, size_t outCap) {
@@ -147,6 +341,16 @@ void RetroMpSession::shutdown() {
   std::memset(publicHostUtf8, 0, sizeof(publicHostUtf8));
 }
 
+void RetroMpSession::refreshAnnounceJoinIpv4() {
+  if (!active || !isHost)
+    return;
+  char ts[INET_ADDRSTRLEN]{};
+  if (!tryAnnounceTailscaleIpv4(ts, sizeof(ts)) || ts[0] == '\0')
+    return;
+  std::strncpy(publicHostUtf8, ts, sizeof(publicHostUtf8) - 1);
+  publicHostUtf8[sizeof(publicHostUtf8) - 1] = '\0';
+}
+
 static bool ensureWsa() {
 #ifdef _WIN32
   static bool wsaStarted = false;
@@ -214,8 +418,12 @@ bool RetroMpSession::startHost(uint16_t port) {
   bindPort = port;
   peerPort = port;
   std::fprintf(stderr, "[mp] Hosting UDP :%u (wait for client packets)\n", static_cast<unsigned>(port));
-  if (fetchPublicIpv4(publicHostUtf8, sizeof(publicHostUtf8)))
-    std::fprintf(stderr, "[mp] Public join IP %s:%u\n", publicHostUtf8, static_cast<unsigned>(port));
+  publicHostUtf8[0] = '\0';
+  if (tryAnnounceTailscaleIpv4(publicHostUtf8, sizeof(publicHostUtf8)))
+    std::fprintf(stderr, "[mp] Tailscale join IP (share with friend) %s:%u\n", publicHostUtf8,
+                 static_cast<unsigned>(port));
+  else if (fetchPublicIpv4(publicHostUtf8, sizeof(publicHostUtf8)))
+    std::fprintf(stderr, "[mp] Public WAN join hint %s:%u\n", publicHostUtf8, static_cast<unsigned>(port));
   return true;
 }
 

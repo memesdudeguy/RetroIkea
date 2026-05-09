@@ -8,3 +8,5 @@
 
 # Windows installer output (large; attach via GitHub Releases instead)
 packaging/*.exe
+# Bundled third-party installers (download via packaging/build-installer.sh)
+packaging/third_party/tailscale-setup-amd64.exe

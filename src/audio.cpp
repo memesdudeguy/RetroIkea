@@ -1,9 +1,8 @@
 #include "audio.hpp"
+#include "portable_path.hpp"
 
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
-#include <SDL2/SDL_filesystem.h>
-
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -17,16 +16,21 @@
 
 namespace fs = std::filesystem;
 
+static void pushUniqueResolved(std::vector<std::string>& out, const std::string& logical) {
+  std::string r = resolvePortableAssetPath(logical.c_str());
+  if (r.empty())
+    return;
+  if (std::find(out.begin(), out.end(), r) != out.end())
+    return;
+  out.emplace_back(std::move(r));
+}
+
 static std::vector<std::string> makeAssetAudioCandidates(const char* filename) {
   std::vector<std::string> out;
 #ifdef VULKAN_GAME_ASSETS_DIR
-  out.emplace_back(std::string(VULKAN_GAME_ASSETS_DIR) + "/audio/" + filename);
+  pushUniqueResolved(out, std::string(VULKAN_GAME_ASSETS_DIR) + "/audio/" + filename);
 #endif
-  if (char* base = SDL_GetBasePath()) {
-    out.emplace_back(std::string(base) + "assets/audio/" + filename);
-    SDL_free(base);
-  }
-  out.emplace_back(std::string("assets/audio/") + filename);
+  pushUniqueResolved(out, std::string("assets/audio/") + filename);
   return out;
 }
 

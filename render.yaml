@@ -1,0 +1,13 @@
+# Render Blueprint: deploy the FastAPI lobby from repo root → New Blueprint → paste this file.
+# After deploy, set in-game: RETRO_IKEA_LOBBY_URL=https://<your-service>.onrender.com
+services:
+  - type: web
+    name: retro-ikea-lobby
+    runtime: python
+    rootDir: server
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: LOBBY_TTL_SEC
+        value: "90"

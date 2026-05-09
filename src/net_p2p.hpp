@@ -202,6 +202,10 @@ struct RetroMpSession {
 
   void shutdown();
 
+  // Host: re-scan Tailscale-style CGNAT IPv4 (100.64–100.127.x.x) without hitting WAN check-ip again.
+  // Call when pause menu opens so a late Tailscale handshake updates HOST WAITING.
+  void refreshAnnounceJoinIpv4();
+
   // Runtime (pause menu / CLI). stop() clears session; host binds UDP port; join binds ephemeral port.
   bool startHost(uint16_t port = kRetroMpDefaultPort);
   bool startJoin(const char* ipv4, uint16_t port = kRetroMpDefaultPort);

@@ -21,6 +21,18 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(glm)
 
 FetchContent_Declare(
+  cpphttplib
+  GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
+  GIT_TAG v0.18.3
+)
+FetchContent_MakeAvailable(cpphttplib)
+
+set(RP3D_COMPILE_TESTBED OFF CACHE BOOL "RetroIkea: skip ReactPhysics3D OpenGL testbed" FORCE)
+set(RP3D_COMPILE_TESTS OFF CACHE BOOL "RetroIkea: skip ReactPhysics3D unit tests" FORCE)
+add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/build_rp3d_fetch"
+                 "${CMAKE_CURRENT_BINARY_DIR}/reactphysics3d_build" EXCLUDE_FROM_ALL)
+
+FetchContent_Declare(
   vulkan_headers
   GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
   GIT_TAG v1.4.341
@@ -40,10 +52,18 @@ FetchContent_Declare(
   GIT_REPOSITORY https://github.com/assimp/assimp.git
   GIT_TAG v5.4.3
 )
-# MinGW Windows builds: link Assimp statically so libassimp-5.dll is not required at runtime.
+# MinGW Windows: default static Assimp (single exe-friendly). Optionally full dynamic/runtime DLLs beside RetroIkea.exe.
+option(VULKAN_GAME_WINDOWS_ALL_DYNAMIC
+  "MinGW cross-compile: shared libAssimp + dynamic libgcc/libstdc++/winpthread (copy DLLs next to RetroIkea.exe). Use a fresh build dir when toggling."
+  OFF)
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING)
-  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-  message(STATUS "vulkan_game: Windows cross-build — BUILD_SHARED_LIBS=OFF for static Assimp")
+  if(VULKAN_GAME_WINDOWS_ALL_DYNAMIC)
+    set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
+    message(STATUS "vulkan_game: Windows cross-build — BUILD_SHARED_LIBS=ON (dynamic Assimp DLL)")
+  else()
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    message(STATUS "vulkan_game: Windows cross-build — BUILD_SHARED_LIBS=OFF for static Assimp")
+  endif()
 endif()
 FetchContent_MakeAvailable(assimp)
 
@@ -59,6 +79,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING)
       "$ENV{VULKAN_SDK}/Bin"
       "$ENV{VULKAN_SDK}/bin")
   endif()
+  list(APPEND _VULKAN_CROSS_HINTS
+    "/usr/x86_64-w64-mingw32/lib"
+    "/usr/i686-w64-mingw32/lib")
   set(_VULKAN_CROSS_LIB_RESOLVED "${VULKAN_CROSS_LIBRARY}")
   if(NOT _VULKAN_CROSS_LIB_RESOLVED)
     find_library(_VULKAN_CROSS_LIB_RESOLVED NAMES vulkan-1 vulkan HINTS ${_VULKAN_CROSS_HINTS})
@@ -110,9 +133,34 @@ find_program(GLSL_COMPILER glslc
 if(NOT GLSL_COMPILER)
   message(FATAL_ERROR "glslc not found. Install Vulkan SDK or set GLSL_COMPILER to the glslc path.")
 endif()
-set(VULKAN_GAME_ASSETS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/assets")
-set(VULKAN_GAME_MESHY_REEXPORT_DIR "${VULKAN_GAME_ASSETS_DIR}/meshy_reexport")
-set(SHADER_DIR ${VULKAN_GAME_ASSETS_DIR}/shaders)
+set(VULKAN_GAME_ASSETS_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/assets")
+set(VULKAN_GAME_ASSETS_DIR "${VULKAN_GAME_ASSETS_SOURCE_DIR}")
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING)
+  # Runtime on installed Windows should resolve assets relative to RetroIkea.exe.
+  set(VULKAN_GAME_ASSETS_DIR "assets")
+endif()
+set(VULKAN_GAME_MESHY_REEXPORT_DIR "${VULKAN_GAME_ASSETS_SOURCE_DIR}/meshy_reexport")
+set(SHADER_DIR ${VULKAN_GAME_ASSETS_SOURCE_DIR}/shaders)
+set(VULKAN_GAME_SHADER_RUNTIME_DIR "${CMAKE_CURRENT_BINARY_DIR}")
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING)
+  # Installed Windows layout keeps compiled SPIR-V under {app}\assets\shaders.
+  set(VULKAN_GAME_SHADER_RUNTIME_DIR "assets/shaders")
+endif()
+
+# Cross builds from Linux otherwise embed /home/.../RetroIkea/... into the .exe; the retail install only has
+# portable paths next to RetroIkea.exe. Map any path under CMAKE_CURRENT_SOURCE_DIR to a repo-relative path.
+function(vulkan_portable_data_path out_var path_in)
+  set(_result "${path_in}")
+  if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING AND path_in)
+    get_filename_component(_abs "${path_in}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    file(RELATIVE_PATH _rel "${CMAKE_CURRENT_SOURCE_DIR}" "${_abs}")
+    if(NOT _rel MATCHES "^\\.\\.")
+      string(REPLACE "\\" "/" _result "${_rel}")
+    endif()
+  endif()
+  set(${out_var} "${_result}" PARENT_SCOPE)
+endfunction()
+
 set(SHADER_SOURCES ${SHADER_DIR}/shader.vert ${SHADER_DIR}/shader.frag ${SHADER_DIR}/shader_staff.vert
                    ${SHADER_DIR}/post.vert ${SHADER_DIR}/post.frag)
 
@@ -135,6 +183,10 @@ add_executable(vulkan_game
   src/audio.cpp
   src/employee_mesh.cpp
   src/staff_skin.cpp
+  src/staff_rp3d_ragdoll.cpp
+  src/net_p2p.cpp
+  src/lobby_http.cpp
+  src/portable_path.cpp
 )
 
 if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Windows")
@@ -142,17 +194,29 @@ if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Windows")
 endif()
 
 add_dependencies(vulkan_game shaders)
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING)
+  add_custom_command(TARGET vulkan_game POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:vulkan_game>/assets/shaders"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SPV_OUTPUTS} "$<TARGET_FILE_DIR:vulkan_game>/assets/shaders"
+    COMMENT "Copy SPIR-V shaders next to RetroIkea.exe for installer/runtime")
+endif()
 
 target_include_directories(vulkan_game PRIVATE
   ${CMAKE_CURRENT_BINARY_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party
   ${glm_SOURCE_DIR}
+  ${cpphttplib_SOURCE_DIR}
 )
+
+find_package(OpenSSL QUIET)
+if(OpenSSL_FOUND)
+  target_compile_definitions(vulkan_game PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
+endif()
 
 # All shipped art/audio under vulkan_game/assets/ (see assets/models, assets/audio, assets/textures).
 # Prefer compressed loop when present (see scripts/shrink_audio_assets.sh); else ship WAV.
-if(EXISTS "${VULKAN_GAME_ASSETS_DIR}/audio/store_ambient_loop.mp3")
+if(EXISTS "${VULKAN_GAME_ASSETS_SOURCE_DIR}/audio/store_ambient_loop.mp3")
   set(STORE_AMBIENT_WAV "${VULKAN_GAME_ASSETS_DIR}/audio/store_ambient_loop.mp3")
 else()
   set(STORE_AMBIENT_WAV "${VULKAN_GAME_ASSETS_DIR}/audio/store_ambient_loop.wav")
@@ -162,7 +226,13 @@ set(HORROR_AMBIENT_MP3 "${VULKAN_GAME_ASSETS_DIR}/audio/horror_ambient.mp3")
 set(CHASE_MUSIC_MP3 "${VULKAN_GAME_ASSETS_DIR}/audio/chase_music.mp3")
 set(LIGHT_SWITCH_ON_SFX "${VULKAN_GAME_ASSETS_DIR}/audio/light_switch_on.mp3")
 set(STAFF_SPOTTED_SFX "${VULKAN_GAME_ASSETS_DIR}/audio/staff_spotted.mp3")
-set(STAFF_CHASE_VO_SFX "${VULKAN_GAME_ASSETS_DIR}/audio/staff_chase_vo.mp3")
+# Chase / “store is closed, get out” VO: `store_closed_chase_vo.mp3` (e.g. from `ffmpeg -i store-closed.m4a …`).
+# Miniaudio’s stock decoders handle MP3/WAV/FLAC, not M4A/AAC directly.
+if(EXISTS "${VULKAN_GAME_ASSETS_SOURCE_DIR}/audio/store_closed_chase_vo.mp3")
+  set(STAFF_CHASE_VO_SFX "${VULKAN_GAME_ASSETS_DIR}/audio/store_closed_chase_vo.mp3")
+else()
+  set(STAFF_CHASE_VO_SFX "${VULKAN_GAME_ASSETS_DIR}/audio/staff_chase_vo.mp3")
+endif()
 
 # Staff / player Meshy rig clips (GLB names are short; same skeleton across clips).
 set(VULKAN_GAME_STAFF_MODEL_DIR "${VULKAN_GAME_ASSETS_DIR}/models/character")
@@ -178,15 +248,19 @@ set(VULKAN_GAME_MESHY_SLIDE_LIGHT_GLB "${VULKAN_GAME_STAFF_MODEL_DIR}/slide_ligh
 set(VULKAN_GAME_MESHY_STEP_PUSH_GLB "${VULKAN_GAME_STAFF_MODEL_DIR}/step_push.glb")
 set(VULKAN_GAME_MESHY_CROUCH_IDLE_BOW_GLB "${VULKAN_GAME_STAFF_MODEL_DIR}/crouch_idle_bow.glb")
 set(VULKAN_GAME_MESHY_SLOW_LADDER_CLIMB_GLB "${VULKAN_GAME_STAFF_MODEL_DIR}/ledge_ladder_climb.glb")
-# Optional: full slow ladder clip from Meshy (same rig); prefer in-repo reexport, then Downloads.
-set(_MESHY_SLOW_LADDER_EXT "/home/memesdudeguy/Downloads/Meshy_AI_biped/Meshy_AI_biped_Animation_Slow_Ladder_Climb_withSkin.glb")
+# Optional Meshy slow-ladder clip: prefer bundled reexport; optional user path.
+set(VULKAN_GAME_MESHY_SLOW_LADDER_EXT_PATH "" CACHE FILEPATH "Optional external slow-ladder Meshy GLB")
 set(_MESHY_SLOW_LADDER_REEXPORT "${VULKAN_GAME_MESHY_REEXPORT_DIR}/Meshy_AI_biped_Animation_Slow_Ladder_Climb_withSkin.glb")
 if(EXISTS "${_MESHY_SLOW_LADDER_REEXPORT}")
   set(VULKAN_GAME_MESHY_SLOW_LADDER_CLIMB_GLB "${_MESHY_SLOW_LADDER_REEXPORT}")
+elseif(VULKAN_GAME_MESHY_SLOW_LADDER_EXT_PATH AND EXISTS "${VULKAN_GAME_MESHY_SLOW_LADDER_EXT_PATH}")
+  set(VULKAN_GAME_MESHY_SLOW_LADDER_CLIMB_GLB "${VULKAN_GAME_MESHY_SLOW_LADDER_EXT_PATH}")
+endif()
+vulkan_portable_data_path(VULKAN_GAME_MESHY_SLOW_LADDER_CLIMB_GLB "${VULKAN_GAME_MESHY_SLOW_LADDER_CLIMB_GLB}")
+if(EXISTS "${_MESHY_SLOW_LADDER_REEXPORT}")
   message(STATUS "vulkan_game: using Meshy slow ladder GLB (meshy_reexport): ${VULKAN_GAME_MESHY_SLOW_LADDER_CLIMB_GLB}")
-elseif(EXISTS "${_MESHY_SLOW_LADDER_EXT}")
-  set(VULKAN_GAME_MESHY_SLOW_LADDER_CLIMB_GLB "${_MESHY_SLOW_LADDER_EXT}")
-  message(STATUS "vulkan_game: using Meshy slow ladder GLB: ${VULKAN_GAME_MESHY_SLOW_LADDER_CLIMB_GLB}")
+elseif(VULKAN_GAME_MESHY_SLOW_LADDER_EXT_PATH AND EXISTS "${VULKAN_GAME_MESHY_SLOW_LADDER_EXT_PATH}")
+  message(STATUS "vulkan_game: using external Meshy slow ladder GLB: ${VULKAN_GAME_MESHY_SLOW_LADDER_CLIMB_GLB}")
 endif()
 set(VULKAN_GAME_MESHY_LEDGE_GRAB_WALL_GLB "${VULKAN_GAME_STAFF_MODEL_DIR}/ledge_grab_wall.glb")
 set(VULKAN_GAME_MESHY_SHIMMY_LEFT_GLB "${VULKAN_GAME_STAFF_MODEL_DIR}/ledge_shimmy_left.glb")
@@ -199,10 +273,12 @@ set(VULKAN_GAME_MESHY_FALL_GLB "${VULKAN_GAME_STAFF_MODEL_DIR}/fall_knockdown.gl
 set(VULKAN_GAME_MESHY_STANDUP_GLB "${VULKAN_GAME_STAFF_MODEL_DIR}/stand_up.glb")
 set(VULKAN_GAME_MESHY_LAND_GLB "${VULKAN_GAME_STAFF_MODEL_DIR}/land_hit_reaction.glb")
 set(VULKAN_GAME_MESHY_HAIR_GLB "${VULKAN_GAME_STAFF_MODEL_DIR}/hair_shove_reaction.glb")
-if(EXISTS "${VULKAN_GAME_MESHY_IDLE_GLB}")
-  set(VULKAN_GAME_EMPLOYEE_FBX "${VULKAN_GAME_MESHY_IDLE_GLB}")
-  message(STATUS "vulkan_game staff mesh: ${VULKAN_GAME_MESHY_IDLE_GLB}")
-elseif(EXISTS "${VULKAN_GAME_ASSETS_DIR}/models/character_base.glb")
+# EXISTS must use VULKAN_GAME_ASSETS_SOURCE_DIR: when cross-compiling, VULKAN_GAME_ASSETS_DIR is the
+# portable prefix "assets" only — CMake would resolve EXISTS "assets/..." against the build dir and miss idle.glb.
+if(EXISTS "${VULKAN_GAME_ASSETS_SOURCE_DIR}/models/character/idle.glb")
+  set(VULKAN_GAME_EMPLOYEE_FBX "${VULKAN_GAME_ASSETS_DIR}/models/character/idle.glb")
+  message(STATUS "vulkan_game staff mesh: ${VULKAN_GAME_ASSETS_DIR}/models/character/idle.glb")
+elseif(EXISTS "${VULKAN_GAME_ASSETS_SOURCE_DIR}/models/character_base.glb")
   set(VULKAN_GAME_EMPLOYEE_FBX "${VULKAN_GAME_ASSETS_DIR}/models/character_base.glb")
   message(STATUS "vulkan_game staff mesh: fallback ${VULKAN_GAME_EMPLOYEE_FBX}")
 else()
@@ -212,7 +288,7 @@ endif()
 
 target_compile_definitions(vulkan_game PRIVATE
   "VULKAN_GAME_VERSION_STRING=\"${PROJECT_VERSION}\""
-  SHADER_DIR="${CMAKE_CURRENT_BINARY_DIR}"
+  SHADER_DIR="${VULKAN_GAME_SHADER_RUNTIME_DIR}"
   "VULKAN_GAME_ASSETS_DIR=\"${VULKAN_GAME_ASSETS_DIR}\""
   "VULKAN_GAME_STORE_AMBIENT_WAV=\"${STORE_AMBIENT_WAV}\""
   "VULKAN_GAME_POWER_SWITCH_SFX=\"${POWER_SWITCH_SFX}\""
@@ -248,16 +324,18 @@ target_compile_definitions(vulkan_game PRIVATE
   "VULKAN_GAME_PIZZA_SLICE_GLB=\"${VULKAN_GAME_ASSETS_DIR}/models/pizza_slice.glb\""
 )
 
-# Title screen loop (default: New_Project.wav in assets or ~/Downloads).
+# Title screen loop (prefer bundled assets; fallback to external Downloads only if missing).
 set(_VULK_TITLE_MENU_WAV "")
-if(EXISTS "${VULKAN_GAME_ASSETS_DIR}/audio/New_Project.wav")
+if(EXISTS "${VULKAN_GAME_ASSETS_SOURCE_DIR}/audio/New_Project.wav")
   set(_VULK_TITLE_MENU_WAV "${VULKAN_GAME_ASSETS_DIR}/audio/New_Project.wav")
+elseif(EXISTS "${VULKAN_GAME_ASSETS_SOURCE_DIR}/audio/the_epic_vista.mp3")
+  set(_VULK_TITLE_MENU_WAV "${VULKAN_GAME_ASSETS_DIR}/audio/the_epic_vista.mp3")
+elseif(EXISTS "${VULKAN_GAME_ASSETS_SOURCE_DIR}/audio/the_long_hall.wav")
+  set(_VULK_TITLE_MENU_WAV "${VULKAN_GAME_ASSETS_DIR}/audio/the_long_hall.wav")
 elseif(DEFINED ENV{HOME} AND EXISTS "$ENV{HOME}/Downloads/New_Project.wav")
   set(_VULK_TITLE_MENU_WAV "$ENV{HOME}/Downloads/New_Project.wav")
 elseif(DEFINED ENV{USERPROFILE} AND EXISTS "$ENV{USERPROFILE}/Downloads/New_Project.wav")
   set(_VULK_TITLE_MENU_WAV "$ENV{USERPROFILE}/Downloads/New_Project.wav")
-elseif(EXISTS "${VULKAN_GAME_ASSETS_DIR}/audio/the_long_hall.wav")
-  set(_VULK_TITLE_MENU_WAV "${VULKAN_GAME_ASSETS_DIR}/audio/the_long_hall.wav")
 elseif(DEFINED ENV{HOME} AND EXISTS "$ENV{HOME}/Downloads/the_long_hall.wav")
   set(_VULK_TITLE_MENU_WAV "$ENV{HOME}/Downloads/the_long_hall.wav")
 elseif(DEFINED ENV{USERPROFILE} AND EXISTS "$ENV{USERPROFILE}/Downloads/the_long_hall.wav")
@@ -275,8 +353,8 @@ if(EXISTS "${VULKAN_GAME_MESHY_HAIR_GLB}")
   message(STATUS "vulkan_game: optional staff hair-shove GLB: ${VULKAN_GAME_MESHY_HAIR_GLB}")
 endif()
 
-# Staff / player dance near Shrek: retargeted onto idle rig from a Meshy hip-hop GLB (same clip for both).
-# Prefer Meshy_AI_Animation_Hip_Hop_Dance_3_withSkin.glb in Downloads; fallback: bundled proximity_dance.glb.
+# Staff / player H-key proximity dance: retarget Meshy hip-hop onto the idle rig; bundled proximity_dance.glb is fallback only.
+# Cross-compiling Windows maps the chosen GLB under the repo to a portable path next to RetroIkea.exe when possible.
 set(VULKAN_GAME_STAFF_SHREK_DANCE_GLB_PATH "" CACHE FILEPATH "GLB for staff/player proximity dance (override search path)")
 set(_VULK_STAFF_DANCE_FN "proximity_dance.glb")
 set(_VULK_STAFF_DANCE_SEARCH "")
@@ -286,7 +364,6 @@ endif()
 list(APPEND _VULK_STAFF_DANCE_SEARCH
   "${VULKAN_GAME_MESHY_REEXPORT_DIR}/Meshy_AI_Animation_Hip_Hop_Dance_3_withSkin.glb"
   "${VULKAN_GAME_MESHY_REEXPORT_DIR}/Meshy_AI_biped_Animation_Hip_Hop_Dance_3_withSkin.glb")
-# Hip-hop source (user-requested) before bundled character/proximity_dance.glb so staff + H emote match this motion.
 list(APPEND _VULK_STAFF_DANCE_SEARCH "${CMAKE_CURRENT_SOURCE_DIR}/../Meshy_AI_Animation_Hip_Hop_Dance_3_withSkin.glb")
 if(DEFINED ENV{HOME})
   list(APPEND _VULK_STAFF_DANCE_SEARCH "$ENV{HOME}/Downloads/Meshy_AI_Animation_Hip_Hop_Dance_3_withSkin.glb")
@@ -294,6 +371,7 @@ endif()
 if(DEFINED ENV{USERPROFILE})
   list(APPEND _VULK_STAFF_DANCE_SEARCH "$ENV{USERPROFILE}/Downloads/Meshy_AI_Animation_Hip_Hop_Dance_3_withSkin.glb")
 endif()
+list(APPEND _VULK_STAFF_DANCE_SEARCH "${VULKAN_GAME_ASSETS_SOURCE_DIR}/models/character/${_VULK_STAFF_DANCE_FN}")
 list(APPEND _VULK_STAFF_DANCE_SEARCH "${VULKAN_GAME_STAFF_MODEL_DIR}/${_VULK_STAFF_DANCE_FN}")
 list(APPEND _VULK_STAFF_DANCE_SEARCH "${CMAKE_CURRENT_SOURCE_DIR}/../Downloads/${_VULK_STAFF_DANCE_FN}")
 if(DEFINED ENV{HOME})
@@ -310,9 +388,10 @@ foreach(_p IN LISTS _VULK_STAFF_DANCE_SEARCH)
   endif()
 endforeach()
 if(VULKAN_GAME_STAFF_SHREK_DANCE_GLB_CAND)
+  vulkan_portable_data_path(_vulk_staff_dance_rt "${VULKAN_GAME_STAFF_SHREK_DANCE_GLB_CAND}")
   target_compile_definitions(vulkan_game PRIVATE
-    "VULKAN_GAME_STAFF_SHREK_PROXIMITY_DANCE_GLB=\"${VULKAN_GAME_STAFF_SHREK_DANCE_GLB_CAND}\"")
-  message(STATUS "vulkan_game: staff Shrek proximity dance GLB: ${VULKAN_GAME_STAFF_SHREK_DANCE_GLB_CAND}")
+    "VULKAN_GAME_STAFF_SHREK_PROXIMITY_DANCE_GLB=\"${_vulk_staff_dance_rt}\"")
+  message(STATUS "vulkan_game: staff proximity dance GLB: ${_vulk_staff_dance_rt}")
 endif()
 
 # Rare easter egg: optional GLB + optional dance bed (MP3).
@@ -344,15 +423,16 @@ foreach(_p IN LISTS _VULK_SHREK_SEARCH)
   endif()
 endforeach()
 if(VULKAN_GAME_SHREK_EGG_GLB_CAND)
+  vulkan_portable_data_path(_vulk_shrek_egg_rt "${VULKAN_GAME_SHREK_EGG_GLB_CAND}")
   target_compile_definitions(vulkan_game PRIVATE
-    "VULKAN_GAME_SHREK_EGG_GLB=\"${VULKAN_GAME_SHREK_EGG_GLB_CAND}\"")
-  message(STATUS "vulkan_game: Shrek easter egg GLB enabled: ${VULKAN_GAME_SHREK_EGG_GLB_CAND}")
+    "VULKAN_GAME_SHREK_EGG_GLB=\"${_vulk_shrek_egg_rt}\"")
+  message(STATUS "vulkan_game: Shrek easter egg GLB enabled: ${_vulk_shrek_egg_rt}")
 else()
   message(STATUS "vulkan_game: Shrek GLB not found — ]/F10 spawn off. Add assets/models/character/proximity_dance.glb or set VULKAN_GAME_SHREK_EGG_GLB_PATH.")
 endif()
 set(_VULK_SHREK_MP3_FN "shrek_all_star.mp3")
 set(_VULK_SHREK_MP3_SEARCH
-  "${VULKAN_GAME_ASSETS_DIR}/audio/${_VULK_SHREK_MP3_FN}"
+  "${VULKAN_GAME_ASSETS_SOURCE_DIR}/audio/${_VULK_SHREK_MP3_FN}"
   "${CMAKE_CURRENT_SOURCE_DIR}/../All Star Low quality.mp3")
 if(DEFINED ENV{HOME})
   list(APPEND _VULK_SHREK_MP3_SEARCH "$ENV{HOME}/Downloads/All Star Low quality.mp3")
@@ -368,26 +448,23 @@ foreach(_p IN LISTS _VULK_SHREK_MP3_SEARCH)
   endif()
 endforeach()
 if(VULKAN_GAME_SHREK_EGG_MP3_CAND)
+  set(_VULK_SHREK_MP3_RUNTIME "${VULKAN_GAME_SHREK_EGG_MP3_CAND}")
+  if(VULKAN_GAME_SHREK_EGG_MP3_CAND STREQUAL "${VULKAN_GAME_ASSETS_SOURCE_DIR}/audio/${_VULK_SHREK_MP3_FN}")
+    set(_VULK_SHREK_MP3_RUNTIME "${VULKAN_GAME_ASSETS_DIR}/audio/${_VULK_SHREK_MP3_FN}")
+  endif()
   target_compile_definitions(vulkan_game PRIVATE
-    "VULKAN_GAME_SHREK_EGG_MUSIC=\"${VULKAN_GAME_SHREK_EGG_MP3_CAND}\"")
-  message(STATUS "vulkan_game: Shrek easter egg music: ${VULKAN_GAME_SHREK_EGG_MP3_CAND}")
+    "VULKAN_GAME_SHREK_EGG_MUSIC=\"${_VULK_SHREK_MP3_RUNTIME}\"")
+  message(STATUS "vulkan_game: Shrek easter egg music: ${_VULK_SHREK_MP3_RUNTIME}")
 endif()
 
 # Optional deli prop: meatballs GLB for pickup/eat (same interaction flow as pizza).
-set(VULKAN_GAME_DELI_MEATBALL_GLB_PATH "/home/memesdudeguy/Downloads/Meshy_AI_sweetish_meat_balls_o_0404203406_texture.glb"
-    CACHE FILEPATH "Path to deli meatballs GLB")
+set(VULKAN_GAME_DELI_MEATBALL_GLB_PATH "" CACHE FILEPATH "Path to deli meatballs GLB (optional)")
 set(_VULK_DELI_MEATBALL_FN "Meshy_AI_sweetish_meat_balls_o_0404203406_texture.glb")
 set(_VULK_DELI_MEATBALL_SEARCH "")
 if(VULKAN_GAME_DELI_MEATBALL_GLB_PATH)
   list(APPEND _VULK_DELI_MEATBALL_SEARCH "${VULKAN_GAME_DELI_MEATBALL_GLB_PATH}")
 endif()
 list(APPEND _VULK_DELI_MEATBALL_SEARCH "${VULKAN_GAME_MESHY_REEXPORT_DIR}/${_VULK_DELI_MEATBALL_FN}")
-if(DEFINED ENV{HOME})
-  list(APPEND _VULK_DELI_MEATBALL_SEARCH "$ENV{HOME}/Downloads/${_VULK_DELI_MEATBALL_FN}")
-endif()
-if(DEFINED ENV{USERPROFILE})
-  list(APPEND _VULK_DELI_MEATBALL_SEARCH "$ENV{USERPROFILE}/Downloads/${_VULK_DELI_MEATBALL_FN}")
-endif()
 set(VULKAN_GAME_DELI_MEATBALL_GLB_CAND "")
 foreach(_p IN LISTS _VULK_DELI_MEATBALL_SEARCH)
   if(EXISTS "${_p}")
@@ -396,15 +473,16 @@ foreach(_p IN LISTS _VULK_DELI_MEATBALL_SEARCH)
   endif()
 endforeach()
 if(VULKAN_GAME_DELI_MEATBALL_GLB_CAND)
+  vulkan_portable_data_path(_vulk_deli_mb_rt "${VULKAN_GAME_DELI_MEATBALL_GLB_CAND}")
   target_compile_definitions(vulkan_game PRIVATE
-    "VULKAN_GAME_DELI_MEATBALL_GLB=\"${VULKAN_GAME_DELI_MEATBALL_GLB_CAND}\"")
-  message(STATUS "vulkan_game: deli meatballs GLB: ${VULKAN_GAME_DELI_MEATBALL_GLB_CAND}")
+    "VULKAN_GAME_DELI_MEATBALL_GLB=\"${_vulk_deli_mb_rt}\"")
+  message(STATUS "vulkan_game: deli meatballs GLB: ${_vulk_deli_mb_rt}")
 else()
-  message(STATUS "vulkan_game: deli meatballs GLB not found — set VULKAN_GAME_DELI_MEATBALL_GLB_PATH or place ${_VULK_DELI_MEATBALL_FN} in Downloads.")
+  message(STATUS "vulkan_game: deli meatballs GLB not found — add ${_VULK_DELI_MEATBALL_FN} to assets/meshy_reexport or set VULKAN_GAME_DELI_MEATBALL_GLB_PATH.")
 endif()
 
-# Box cutter + rusty pipe on shelf decks (off by default). Enable with -DVULKAN_GAME_SHELF_DECK_PROPS=ON.
-option(VULKAN_GAME_SHELF_DECK_PROPS "Instanced box cutter and rusty pipe on shelf decks" OFF)
+# Box cutter + rusty pipe on shelf decks (enabled by default when bundled assets are present).
+set(VULKAN_GAME_SHELF_DECK_PROPS ON CACHE BOOL "Instanced box cutter and rusty pipe on shelf decks" FORCE)
 
 # Optional shelf prop: Meshy box cutter GLB (rarer spawn than ladders in-game).
 set(VULKAN_GAME_SHELF_BOX_CUTTER_GLB_PATH "" CACHE FILEPATH "Path to box cutter GLB for shelf instancing")
@@ -431,9 +509,10 @@ foreach(_p IN LISTS _VULK_BOXCUT_SEARCH)
   endif()
 endforeach()
 if(VULKAN_GAME_SHELF_DECK_PROPS AND VULKAN_GAME_SHELF_BOX_CUTTER_GLB_CAND)
+  vulkan_portable_data_path(_vulk_box_rt "${VULKAN_GAME_SHELF_BOX_CUTTER_GLB_CAND}")
   target_compile_definitions(vulkan_game PRIVATE
-    "VULKAN_GAME_SHELF_BOX_CUTTER_GLB=\"${VULKAN_GAME_SHELF_BOX_CUTTER_GLB_CAND}\"")
-  message(STATUS "vulkan_game: shelf box cutter GLB: ${VULKAN_GAME_SHELF_BOX_CUTTER_GLB_CAND}")
+    "VULKAN_GAME_SHELF_BOX_CUTTER_GLB=\"${_vulk_box_rt}\"")
+  message(STATUS "vulkan_game: shelf box cutter GLB: ${_vulk_box_rt}")
 elseif(VULKAN_GAME_SHELF_BOX_CUTTER_GLB_CAND)
   message(STATUS "vulkan_game: shelf box cutter GLB found but disabled (set VULKAN_GAME_SHELF_DECK_PROPS=ON to enable).")
 else()
@@ -465,51 +544,77 @@ foreach(_p IN LISTS _VULK_PIPE_SEARCH)
   endif()
 endforeach()
 if(VULKAN_GAME_SHELF_DECK_PROPS AND VULKAN_GAME_SHELF_RUSTY_PIPE_GLB_CAND)
+  vulkan_portable_data_path(_vulk_pipe_rt "${VULKAN_GAME_SHELF_RUSTY_PIPE_GLB_CAND}")
   target_compile_definitions(vulkan_game PRIVATE
-    "VULKAN_GAME_SHELF_RUSTY_PIPE_GLB=\"${VULKAN_GAME_SHELF_RUSTY_PIPE_GLB_CAND}\"")
-  message(STATUS "vulkan_game: shelf rusty pipe GLB: ${VULKAN_GAME_SHELF_RUSTY_PIPE_GLB_CAND}")
+    "VULKAN_GAME_SHELF_RUSTY_PIPE_GLB=\"${_vulk_pipe_rt}\"")
+  message(STATUS "vulkan_game: shelf rusty pipe GLB: ${_vulk_pipe_rt}")
 elseif(VULKAN_GAME_SHELF_RUSTY_PIPE_GLB_CAND)
   message(STATUS "vulkan_game: shelf rusty pipe GLB found but disabled (set VULKAN_GAME_SHELF_DECK_PROPS=ON to enable).")
 else()
   message(STATUS "vulkan_game: shelf rusty pipe GLB not found — optional prop disabled (set VULKAN_GAME_SHELF_RUSTY_PIPE_GLB_PATH or place ${_VULK_PIPE_FN} in Downloads).")
 endif()
 
-set(VULKAN_GAME_HEARTBEAT_MP3_CAND "${VULKAN_GAME_ASSETS_DIR}/audio/ui_low_health_heartbeat.mp3")
+set(VULKAN_GAME_HEARTBEAT_MP3_CAND "${VULKAN_GAME_ASSETS_SOURCE_DIR}/audio/ui_low_health_heartbeat.mp3")
 if(NOT EXISTS "${VULKAN_GAME_HEARTBEAT_MP3_CAND}")
   set(VULKAN_GAME_HEARTBEAT_MP3_CAND "${CMAKE_CURRENT_SOURCE_DIR}/../brvhrtz-heartbeat-02-225103.mp3")
 endif()
 if(EXISTS "${VULKAN_GAME_HEARTBEAT_MP3_CAND}")
+  set(_VULK_HEARTBEAT_MP3_RUNTIME "${VULKAN_GAME_HEARTBEAT_MP3_CAND}")
+  if(VULKAN_GAME_HEARTBEAT_MP3_CAND STREQUAL "${VULKAN_GAME_ASSETS_SOURCE_DIR}/audio/ui_low_health_heartbeat.mp3")
+    set(_VULK_HEARTBEAT_MP3_RUNTIME "${VULKAN_GAME_ASSETS_DIR}/audio/ui_low_health_heartbeat.mp3")
+  endif()
   target_compile_definitions(vulkan_game PRIVATE
-    "VULKAN_GAME_HEARTBEAT_MP3=\"${VULKAN_GAME_HEARTBEAT_MP3_CAND}\"")
-  message(STATUS "vulkan_game: low-health heartbeat MP3: ${VULKAN_GAME_HEARTBEAT_MP3_CAND}")
+    "VULKAN_GAME_HEARTBEAT_MP3=\"${_VULK_HEARTBEAT_MP3_RUNTIME}\"")
+  message(STATUS "vulkan_game: low-health heartbeat MP3: ${_VULK_HEARTBEAT_MP3_RUNTIME}")
 endif()
 
-set(VULKAN_GAME_BIG_FALL_MP3_CAND "${VULKAN_GAME_ASSETS_DIR}/audio/sfx_big_fall_impact.mp3")
+set(VULKAN_GAME_BIG_FALL_MP3_CAND "${VULKAN_GAME_ASSETS_SOURCE_DIR}/audio/sfx_big_fall_impact.mp3")
 if(NOT EXISTS "${VULKAN_GAME_BIG_FALL_MP3_CAND}")
   set(VULKAN_GAME_BIG_FALL_MP3_CAND "${CMAKE_CURRENT_SOURCE_DIR}/../universfield-falling-game-character-352287.mp3")
 endif()
 if(EXISTS "${VULKAN_GAME_BIG_FALL_MP3_CAND}")
+  set(_VULK_BIG_FALL_MP3_RUNTIME "${VULKAN_GAME_BIG_FALL_MP3_CAND}")
+  if(VULKAN_GAME_BIG_FALL_MP3_CAND STREQUAL "${VULKAN_GAME_ASSETS_SOURCE_DIR}/audio/sfx_big_fall_impact.mp3")
+    set(_VULK_BIG_FALL_MP3_RUNTIME "${VULKAN_GAME_ASSETS_DIR}/audio/sfx_big_fall_impact.mp3")
+  endif()
   target_compile_definitions(vulkan_game PRIVATE
-    "VULKAN_GAME_BIG_FALL_MP3=\"${VULKAN_GAME_BIG_FALL_MP3_CAND}\"")
-  message(STATUS "vulkan_game: big fall impact MP3: ${VULKAN_GAME_BIG_FALL_MP3_CAND}")
+    "VULKAN_GAME_BIG_FALL_MP3=\"${_VULK_BIG_FALL_MP3_RUNTIME}\"")
+  message(STATUS "vulkan_game: big fall impact MP3: ${_VULK_BIG_FALL_MP3_RUNTIME}")
 endif()
 
 # Optional runtime images: VULKAN_GAME_EXTRA_TEXTURES="a.png:b.png" (up to 16), optional
 # VULKAN_GAME_EXTRA_BLEND=0..255 blends extraTex[0] onto default ground triplanar (default 0).
 # Staff mesh: first three extras map to pants / shirt / skin when set; VULKAN_GAME_STAFF_TEX_BLEND=0..255 (default 255).
+# Optional auto-load textures: assets/textures/staff_pants.png | staff_shirt.png | staff_skin.png (when present).
+# Runtime: env VULKAN_GAME_STAFF_FORCE_PROCEDURAL_UNIFORM=1 uses yellow/blue IKEA shader instead of atlas from idle GLB.
+option(VULKAN_GAME_STAFF_DISABLE_EMBEDDED_GLB_DIFFUSE
+  "Use procedural IKEA staff uniform instead of embedded idle.glb diffuse (same as forcing env at runtime)"
+  OFF)
 # No default staff photo textures — NPCs use procedural uniform in shader.frag (empEmployee*).
 # HUD TrueType font (crisp text vs stb_easy_font). Ship DejaVuSans.ttf under assets/fonts/ for all platforms.
-set(VULKAN_GAME_UI_FONT "${VULKAN_GAME_ASSETS_DIR}/fonts/DejaVuSans.ttf")
-if(EXISTS "${VULKAN_GAME_UI_FONT}")
-  target_compile_definitions(vulkan_game PRIVATE "VULKAN_GAME_UI_FONT_PATH=\"${VULKAN_GAME_UI_FONT}\"")
+# EXISTS must use VULKAN_GAME_ASSETS_SOURCE_DIR: on Windows installs VULKAN_GAME_ASSETS_DIR is only "assets"
+# — CMake would look in the build dir and skip the compile definition despite the file being shipped.
+if(EXISTS "${VULKAN_GAME_ASSETS_SOURCE_DIR}/fonts/DejaVuSans.ttf")
+  target_compile_definitions(vulkan_game PRIVATE
+    "VULKAN_GAME_UI_FONT_PATH=\"${VULKAN_GAME_ASSETS_DIR}/fonts/DejaVuSans.ttf\"")
+  message(STATUS "vulkan_game: HUD UI font enabled: ${VULKAN_GAME_ASSETS_DIR}/fonts/DejaVuSans.ttf")
+endif()
+if(VULKAN_GAME_STAFF_DISABLE_EMBEDDED_GLB_DIFFUSE)
+  target_compile_definitions(vulkan_game PRIVATE VULKAN_GAME_STAFF_DISABLE_EMBEDDED_DIFFUSE=1)
+  message(STATUS "vulkan_game: staff procedural uniform (embedded GLB diffuse disabled at build time)")
 endif()
 
 # Scene textures load from disk at runtime under VULKAN_GAME_ASSETS_DIR (see main.cpp create*TextureResources).
-# Optional override for deli brushed-metal (default: assets/textures/deli_metal_brushed.jpg).
+# Optional override for deli brushed-metal. Default prefers shipped files under assets/textures/ (deli_metal_brushed
+# is optional; shelf_rack_metal_osb.jpg is bundled and reads well as brushed steel on counters).
 set(VULKAN_GAME_DELI_METAL_TEXTURE_PATH "" CACHE FILEPATH
-  "Path to deli counter brushed-metal image (empty: use assets/textures/deli_metal_brushed.jpg)")
+  "Path to deli counter brushed-metal image (empty: pick from assets/textures/)")
 if(VULKAN_GAME_DELI_METAL_TEXTURE_PATH)
   set(VULKAN_GAME_DELI_METAL_TEXTURE "${VULKAN_GAME_DELI_METAL_TEXTURE_PATH}")
+elseif(EXISTS "${VULKAN_GAME_ASSETS_SOURCE_DIR}/textures/deli_metal_brushed.jpg")
+  set(VULKAN_GAME_DELI_METAL_TEXTURE "${VULKAN_GAME_ASSETS_DIR}/textures/deli_metal_brushed.jpg")
+elseif(EXISTS "${VULKAN_GAME_ASSETS_SOURCE_DIR}/textures/shelf_rack_metal_osb.jpg")
+  set(VULKAN_GAME_DELI_METAL_TEXTURE "${VULKAN_GAME_ASSETS_DIR}/textures/shelf_rack_metal_osb.jpg")
 else()
   set(VULKAN_GAME_DELI_METAL_TEXTURE "${VULKAN_GAME_ASSETS_DIR}/textures/deli_metal_brushed.jpg")
 endif()
@@ -545,12 +650,64 @@ target_link_libraries(vulkan_game PRIVATE
   SDL2::SDL2
   ${_VULKAN_GAME_SDL2_IMAGE_LINK_TARGET}
   assimp::assimp
+  ReactPhysics3D::reactphysics3d
   Threads::Threads
   ${CMAKE_DL_LIBS}
 )
+if(OpenSSL_FOUND)
+  target_link_libraries(vulkan_game PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()
+if(WIN32)
+  # crypt32: cpp-httplib HTTPS (OpenSSL) certificate loading uses Cert* APIs on Windows.
+  target_link_libraries(vulkan_game PRIVATE ws2_32 iphlpapi crypt32)
+endif()
 
-# MinGW: embed libgcc/libstdc++/winpthread so the .exe runs without MinGW DLLs next to it (Wine/real Windows).
-if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING AND NOT MSVC)
+# Arch MinGW SDL2_image static lib links IMG_webp.o; add WebP import libs for undefined WebP* / WebPDemux* symbols.
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING AND
+    EXISTS "/usr/x86_64-w64-mingw32/lib/libwebp.dll.a")
+  target_link_libraries(vulkan_game PRIVATE
+    /usr/x86_64-w64-mingw32/lib/libwebp.dll.a
+    /usr/x86_64-w64-mingw32/lib/libwebpdemux.dll.a)
+endif()
+# Ship SDL2_image codec DLLs next to the .exe (PNG/JPEG/TIFF load at runtime via dlopen-style deps).
+# WebP is explicit above; without zlib + libpng, IMG_Load of title/menu PNGs fails → solid IKEA-blue fallback UI.
+# Inno Setup copies these from build-win-mingw next to RetroIkea.exe.
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING AND
+    EXISTS "/usr/x86_64-w64-mingw32/bin/libwebp.dll")
+  add_custom_command(TARGET vulkan_game POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      /usr/x86_64-w64-mingw32/bin/libwebp.dll
+      /usr/x86_64-w64-mingw32/bin/libwebpdemux.dll
+      /usr/x86_64-w64-mingw32/bin/libsharpyuv.dll
+      /usr/x86_64-w64-mingw32/bin/libssp-0.dll
+      $<TARGET_FILE_DIR:vulkan_game>
+    COMMENT "Copy MinGW WebP (and dependency) DLLs next to RetroIkea.exe")
+endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING AND EXISTS "/usr/x86_64-w64-mingw32/bin/zlib1.dll")
+  add_custom_command(TARGET vulkan_game POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      /usr/x86_64-w64-mingw32/bin/zlib1.dll
+      $<TARGET_FILE_DIR:vulkan_game>
+    COMMENT "Copy zlib for SDL_image PNG/TIFF")
+endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING AND EXISTS "/usr/x86_64-w64-mingw32/bin/libpng16-16.dll")
+  add_custom_command(TARGET vulkan_game POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      /usr/x86_64-w64-mingw32/bin/libpng16-16.dll
+      $<TARGET_FILE_DIR:vulkan_game>
+    COMMENT "Copy libpng for SDL_image PNG")
+endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING AND EXISTS "/usr/x86_64-w64-mingw32/bin/libjpeg-8.dll")
+  add_custom_command(TARGET vulkan_game POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      /usr/x86_64-w64-mingw32/bin/libjpeg-8.dll
+      $<TARGET_FILE_DIR:vulkan_game>
+    COMMENT "Copy libjpeg for SDL_image JPG")
+endif()
+
+# MinGW default: embed libgcc/libstdc++/winpthread. VULKAN_GAME_WINDOWS_ALL_DYNAMIC ships those DLLs instead.
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING AND NOT MSVC AND
+   NOT VULKAN_GAME_WINDOWS_ALL_DYNAMIC)
   target_link_options(vulkan_game PRIVATE
     -static-libgcc
     -static-libstdc++
@@ -559,6 +716,28 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING AND NOT MSVC)
     -Wl,-Bdynamic
   )
 endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING AND VULKAN_GAME_WINDOWS_ALL_DYNAMIC)
+  add_custom_command(
+    TARGET vulkan_game POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:assimp::assimp>
+            $<TARGET_FILE_DIR:vulkan_game>
+    COMMENT "Copy libAssimp DLL next to RetroIkea.exe (VULKAN_GAME_WINDOWS_ALL_DYNAMIC)")
+endif()
+foreach(
+  _dyn
+  libgcc_s_seh-1.dll
+  libstdc++-6.dll
+  libwinpthread-1.dll)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING AND VULKAN_GAME_WINDOWS_ALL_DYNAMIC
+     AND EXISTS "/usr/x86_64-w64-mingw32/bin/${_dyn}")
+    add_custom_command(
+      TARGET vulkan_game POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different /usr/x86_64-w64-mingw32/bin/${_dyn}
+              $<TARGET_FILE_DIR:vulkan_game>
+      COMMENT "Copy ${_dyn} (dynamic MinGW runtime)")
+  endif()
+endforeach()
 
 if(MSVC)
   target_compile_options(vulkan_game PRIVATE /W4 /permissive-)

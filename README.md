@@ -47,7 +47,16 @@ With [Inno Setup](https://jrsoftware.org/isinfo.php) 6 installed:
 iscc packaging/windows_setup.iss
 ```
 
-Produces `packaging/RetroIkea.exe` (installer) that installs `RetroIkea.exe` and the `assets` folder. That file is not committed here (it is large); upload it as a [GitHub Release](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository) asset instead.
+Produces `packaging/RetroIkea-Beta-Setup.exe` (installer) that installs `RetroIkea.exe` and the `assets` folder. That file is not committed here (it is large); upload it as a [GitHub Release](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository) asset instead.
+
+## Online lobby (browser server list)
+
+The game can list public hosts via a small HTTP API in [`server/`](server/). Set the environment variable **`RETRO_IKEA_LOBBY_URL`** to the deployed service origin with **no trailing slash** (for example `https://retro-ikea-lobby.onrender.com`).
+
+- **Run locally:** see [`server/README.md`](server/README.md).
+- **Host on Render:** connect this GitHub repo in [Render](https://render.com) and use **Blueprint** → paste [`render.yaml`](render.yaml) at the repo root, or create a **Web Service** with root directory `server`, build `pip install -r requirements.txt`, start `uvicorn main:app --host 0.0.0.0 --port $PORT`.
+
+GitHub hosts **source only** for the lobby; the Python process must run on a platform like Render, Railway, or Fly.io.
 
 ## Push this repo to GitHub
 
@@ -81,7 +90,7 @@ wine "$HOME/.wine/drive_c/Program Files (x86)/Inno Setup 6/ISCC.exe" \
   "Z:\\home\\$(whoami)\\Downloads\\retro ikea\\packaging\\windows_setup.iss"
 ```
 
-Adjust the `Z:\\...` path if your clone lives elsewhere. Output: `packaging/RetroIkea.exe` (see `OutputBaseFilename` in `packaging/windows_setup.iss`).
+Adjust the `Z:\\...` path if your clone lives elsewhere. Output: `packaging/RetroIkea-Beta-Setup.exe` (see `OutputBaseFilename` in `packaging/windows_setup.iss`).
 
 ## License
 
