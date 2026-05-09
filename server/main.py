@@ -10,6 +10,7 @@ import time
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 TTL_SEC = float(os.environ.get("LOBBY_TTL_SEC", "90"))
@@ -39,6 +40,26 @@ class RegisterBody(BaseModel):
     host: str = Field(..., min_length=3, max_length=63)
     port: int = Field(27341, ge=1, le=65535)
     name: str = Field("", max_length=48)
+
+
+@app.get("/", response_class=HTMLResponse)
+def root_landing() -> str:
+    """Browser sanity check: visiting the host root is not an API error."""
+    return """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/><title>RetroIkea lobby</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#0e1624;color:#e8f1ff;max-width:42rem;margin:2rem auto;padding:0 1rem;line-height:1.5}
+a{color:#7eb8ff} code{background:#1a2838;padding:.1rem .35rem;border-radius:4px}
+h1{font-weight:600;font-size:1.25rem;color:#fff;border-bottom:2px solid #0058AB;padding-bottom:.35rem}
+</style></head><body>
+<h1>RetroIkea lobby</h1>
+<p>This service lists hosts for the game. Set <code>RETRO_IKEA_LOBBY_URL</code> to this site’s origin (no trailing slash).</p>
+<ul>
+<li><a href="/docs">OpenAPI docs</a></li>
+<li><a href="/healthz">Health</a> — <code>GET /healthz</code></li>
+<li><a href="/api/v1/servers">Live servers JSON</a> — <code>GET /api/v1/servers</code></li>
+</ul>
+</body></html>"""
 
 
 @app.get("/healthz")
