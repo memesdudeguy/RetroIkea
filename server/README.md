@@ -15,6 +15,8 @@ Point the game at `http://127.0.0.1:8765`.
 
 ## API
 
+- `GET /` — tiny HTML landing page (open in a browser to verify deploy)
+- `GET /docs` — Swagger UI (FastAPI)
 - `GET /api/v1/servers` — JSON array: `{ id, host, port, name }[]`
 - `POST /api/v1/servers/register` — JSON `{ id, host, port, name }` (repeat to refresh TTL)
 - `DELETE /api/v1/servers/{id}` — optional unregister when host stops
