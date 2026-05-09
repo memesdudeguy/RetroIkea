@@ -704,6 +704,18 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING AND EXISTS "/us
       $<TARGET_FILE_DIR:vulkan_game>
     COMMENT "Copy libjpeg for SDL_image JPG")
 endif()
+# Lobby HTTPS (cpp-httplib + OpenSSL): loader needs these next to RetroIkea.exe on Windows.
+# Copy whenever MinGW OpenSSL DLLs exist (do not gate on OpenSSL_FOUND — stale cache could skip).
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING AND
+    EXISTS "/usr/x86_64-w64-mingw32/bin/libssl-3-x64.dll" AND
+    EXISTS "/usr/x86_64-w64-mingw32/bin/libcrypto-3-x64.dll")
+  add_custom_command(TARGET vulkan_game POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      /usr/x86_64-w64-mingw32/bin/libssl-3-x64.dll
+      /usr/x86_64-w64-mingw32/bin/libcrypto-3-x64.dll
+      $<TARGET_FILE_DIR:vulkan_game>
+    COMMENT "Copy OpenSSL DLLs for HTTPS lobby client")
+endif()
 
 # MinGW default: embed libgcc/libstdc++/winpthread. VULKAN_GAME_WINDOWS_ALL_DYNAMIC ships those DLLs instead.
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING AND NOT MSVC AND

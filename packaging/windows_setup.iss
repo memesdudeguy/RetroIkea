@@ -1,5 +1,5 @@
 #define MyAppName "retro ikea"
-#define MyAppVersion "Beta 3"
+#define MyAppVersion "Beta 4"
 #define MyAppPublisher "NightShift"
 #define MyAppExeName "RetroIkea.exe"
 
@@ -55,6 +55,9 @@ Source: "{#RetroIkeaRepoRoot}\build-win-mingw\libssp-0.dll"; DestDir: "{app}"; F
 Source: "{#RetroIkeaRepoRoot}\build-win-mingw\zlib1.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#RetroIkeaRepoRoot}\build-win-mingw\libpng16-16.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#RetroIkeaRepoRoot}\build-win-mingw\libjpeg-8.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+; OpenSSL (HTTPS lobby URL); match MinGW-w64 package names on your cross-build host.
+Source: "{#RetroIkeaRepoRoot}\build-win-mingw\libssl-3-x64.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#RetroIkeaRepoRoot}\build-win-mingw\libcrypto-3-x64.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 ; When built with -DVULKAN_GAME_WINDOWS_ALL_DYNAMIC=ON (shared Assimp + dynamic MinGW C++ runtime).
 Source: "{#RetroIkeaRepoRoot}\build-win-mingw\libassimp-5.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#RetroIkeaRepoRoot}\build-win-mingw\libgcc_s_seh-1.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist

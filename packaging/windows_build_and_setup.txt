@@ -69,6 +69,10 @@ Notes
 - SDL2_image loads PNG/JPEG via zlib/libpng/libjpeg DLLs next to RetroIkea.exe (CMake copies them
   from the MinGW sysroot into build-win-mingw/; Inno Setup lists them in windows_setup.iss).
   Without them, UI PNGs fall back to solid blue placeholders.
+- **OpenSSL:** If the game exits immediately on launch (no window), the HTTPS lobby client may be
+  missing **libssl** / **libcrypto** DLLs next to RetroIkea.exe. CMake copies `libssl-3-x64.dll` and
+  `libcrypto-3-x64.dll` from the MinGW sysroot when OpenSSL is enabled; rebuild and reinstall, or
+  copy those two DLLs next to the exe manually.
 
 Fully dynamic Windows cross-build (optional)
 -------------------------------------------
