@@ -20,6 +20,8 @@ static constexpr uint32_t kRetroMpWorldMagic = 0x52495753u; // 'RIWS'
 static constexpr uint32_t kRetroMpDeliPickupMagic = 0x524B4450u; // 'RKDP'
 // Client → host: melee vs staff (shove / kick / drop-kick hit).
 static constexpr uint32_t kRetroMpStaffMeleeMagic = 0x524B4D43u; // 'RKMC'
+// Client → host: dropped food add/remove request.
+static constexpr uint32_t kRetroMpFoodActionMagic = 0x524B4641u; // 'RKFA'
 // Either peer → other: player chose RETRY after death (keep both sessions in sync).
 static constexpr uint32_t kRetroMpDeathRetryMagic = 0x524B4452u; // 'RKDR'
 static constexpr uint8_t kRetroMpDeliPickupPizza = 0;
@@ -27,9 +29,12 @@ static constexpr uint8_t kRetroMpDeliPickupMeat = 1;
 static constexpr uint8_t kRetroMpStaffMeleeShove = 0;
 static constexpr uint8_t kRetroMpStaffMeleeKick = 1;
 static constexpr uint8_t kRetroMpStaffMeleeDropKick = 2;
+static constexpr uint8_t kRetroMpFoodActionDrop = 0;
+static constexpr uint8_t kRetroMpFoodActionPickup = 1;
 // Fit in typical LAN MTU with room below 1500-byte IP datagram.
 static constexpr int kRetroMpWorldMaxStaff = 26;
 static constexpr int kRetroMpWorldMaxDeli = 15;
+static constexpr int kRetroMpWorldMaxDroppedFood = 6;
 static constexpr uint16_t kRetroMpDefaultPort = 27341;
 // Bit flags in RetroMpWirePacket::emoteFlags (receiver maps to local clip indices).
 static constexpr uint8_t kRetroMpEmoteDance = 1u << 0;
@@ -106,7 +111,8 @@ struct RetroMpWorldHeader {
   uint32_t seq = 0;
   uint8_t staffCount = 0;
   uint8_t deliCount = 0;
-  uint8_t reserved[2]{};
+  uint8_t droppedFoodCount = 0;
+  uint8_t reserved = 0;
 };
 
 struct RetroMpStaffWire {
@@ -131,6 +137,15 @@ struct RetroMpDeliWire {
   uint16_t pizzaReplenishCs = 0; // centiseconds; 0 = no timer
   uint16_t meatReplenishCs = 0;
 };
+
+struct RetroMpDroppedFoodWire {
+  uint32_t dropId = 0;
+  float posX = 0.f;
+  float posY = 0.f;
+  float posZ = 0.f;
+  uint8_t foodKind = kRetroMpDeliPickupPizza;
+  uint8_t reserved[3]{};
+};
 #pragma pack(pop)
 
 #pragma pack(push, 1)
@@ -145,6 +160,23 @@ struct RetroMpDeliPickupPacket {
 };
 #pragma pack(pop)
 static_assert(sizeof(RetroMpDeliPickupPacket) == 32, "RetroMpDeliPickupPacket size");
+
+#pragma pack(push, 1)
+struct RetroMpFoodActionPacket {
+  uint32_t magic = kRetroMpFoodActionMagic;
+  uint32_t seq = 0;
+  uint32_t dropId = 0;
+  uint8_t action = kRetroMpFoodActionDrop;
+  uint8_t foodKind = kRetroMpDeliPickupPizza;
+  uint8_t pad[2]{};
+  float posX = 0.f;
+  float posY = 0.f;
+  float posZ = 0.f;
+  float camX = 0.f;
+  float camZ = 0.f;
+};
+#pragma pack(pop)
+static_assert(sizeof(RetroMpFoodActionPacket) == 36, "RetroMpFoodActionPacket size");
 
 #pragma pack(push, 1)
 struct RetroMpStaffMeleePacket {
@@ -172,6 +204,7 @@ static_assert(sizeof(RetroMpDeathRetryPacket) == 8, "RetroMpDeathRetryPacket siz
 static_assert(sizeof(RetroMpWorldHeader) == 12, "RetroMpWorldHeader size");
 static_assert(sizeof(RetroMpStaffWire) == 36, "RetroMpStaffWire size");
 static_assert(sizeof(RetroMpDeliWire) == 14, "RetroMpDeliWire size");
+static_assert(sizeof(RetroMpDroppedFoodWire) == 20, "RetroMpDroppedFoodWire size");
 
 struct RetroMpSession {
   bool active = false;
@@ -191,6 +224,7 @@ struct RetroMpSession {
   std::vector<uint8_t> lastWorldPacket;
   std::deque<RetroMpDeliPickupPacket> hostDeliPickupQueue;
   std::deque<RetroMpStaffMeleePacket> hostStaffMeleeQueue;
+  std::deque<RetroMpFoodActionPacket> hostFoodActionQueue;
   bool remoteDeathRetryPending = false;
   uint32_t deathRetrySendSeq = 0;
 
@@ -229,6 +263,7 @@ struct RetroMpSession {
   // Client → host RPCs (joining peer only).
   void sendDeliPickupRequest(const RetroMpDeliPickupPacket& p);
   void sendStaffMeleeRequest(const RetroMpStaffMeleePacket& p);
+  void sendFoodActionRequest(const RetroMpFoodActionPacket& p);
 
   void sendDeathRetry();
 

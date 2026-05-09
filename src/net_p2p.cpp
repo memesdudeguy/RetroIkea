@@ -54,8 +54,43 @@ static bool setNonBlocking(SockT s) {
 #endif
 }
 
+static bool envFlagEnabled(const char* name) {
+  const char* v = std::getenv(name);
+  return v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T');
+}
+
+static void tuneUdpLowLatency(SockT s) {
+  int one = 1;
+  int buf = 256 * 1024;
+#ifdef _WIN32
+  setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&one), sizeof(one));
+  setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&buf), sizeof(buf));
+  setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&buf), sizeof(buf));
+  int tos = 0x10; // IPTOS_LOWDELAY; keep literal for MinGW headers that omit it.
+  setsockopt(s, IPPROTO_IP, IP_TOS, reinterpret_cast<const char*>(&tos), sizeof(tos));
+#else
+  setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  setsockopt(s, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
+  setsockopt(s, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
+  int tos = 0x10;
+  setsockopt(s, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+#endif
+}
+
 static bool ipv4BytesAreTailscaleCgnat(const uint8_t* o) {
   return o != nullptr && o[0] == 100u && o[1] >= 64u && o[1] <= 127u;
+}
+
+static bool ipv4BytesArePrivateLan(const uint8_t* o) {
+  if (!o)
+    return false;
+  if (o[0] == 10u)
+    return true;
+  if (o[0] == 172u && o[1] >= 16u && o[1] <= 31u)
+    return true;
+  if (o[0] == 192u && o[1] == 168u)
+    return true;
+  return false;
 }
 
 static FILE* retroMpPopenRead(const char* cmd) {
@@ -244,6 +279,86 @@ static bool tryAnnounceTailscaleIpv4(char* out, size_t outCap) {
   return tailscaleIpv4FromCli(out, outCap);
 }
 
+#ifdef _WIN32
+static bool privateLanIpv4FromWinAdapters(char* out, size_t outCap) {
+  out[0] = '\0';
+  if (!out || outCap < 8)
+    return false;
+  ULONG sz = static_cast<ULONG>(16u * 1024u);
+  std::vector<uint8_t> buf(sz);
+  PIP_ADAPTER_ADDRESSES aa = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
+  ULONG err = GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                                                GAA_FLAG_SKIP_DNS_SERVER,
+                                   nullptr, aa, &sz);
+  if (err == ERROR_BUFFER_OVERFLOW) {
+    buf.resize(sz);
+    aa = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
+    err = GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                                            GAA_FLAG_SKIP_DNS_SERVER,
+                               nullptr, aa, &sz);
+  }
+  if (err != NO_ERROR || aa == nullptr)
+    return false;
+  for (PIP_ADAPTER_ADDRESSES a = aa; a != nullptr; a = a->Next) {
+    for (PIP_ADAPTER_UNICAST_ADDRESS u = a->FirstUnicastAddress; u != nullptr; u = u->Next) {
+      if (!u->Address.lpSockaddr || u->Address.lpSockaddr->sa_family != AF_INET)
+        continue;
+      const auto* sin = reinterpret_cast<const sockaddr_in*>(u->Address.lpSockaddr);
+      const auto* oc = reinterpret_cast<const uint8_t*>(&sin->sin_addr);
+      if (!ipv4BytesArePrivateLan(oc))
+        continue;
+      char nb[INET_ADDRSTRLEN]{};
+      if (inet_ntop(AF_INET, &sin->sin_addr, nb, sizeof(nb)) == nullptr)
+        continue;
+      std::strncpy(out, nb, outCap - 1);
+      out[outCap - 1] = '\0';
+      return true;
+    }
+  }
+  return false;
+}
+#else
+static bool privateLanIpv4FromUnixIfaddrs(char* out, size_t outCap) {
+  out[0] = '\0';
+  if (!out || outCap < 8)
+    return false;
+  ifaddrs* ifap = nullptr;
+  if (getifaddrs(&ifap) != 0 || ifap == nullptr)
+    return false;
+  bool ok = false;
+  for (ifaddrs* ifa = ifap; ifa != nullptr && !ok; ifa = ifa->ifa_next) {
+    if (!ifa->ifa_addr || static_cast<size_t>(ifa->ifa_addr->sa_family) != AF_INET)
+      continue;
+    const char* n = ifa->ifa_name;
+    if (!n || std::strcmp(n, "lo") == 0)
+      continue;
+    const auto* sin = reinterpret_cast<const sockaddr_in*>(ifa->ifa_addr);
+    const auto* oc = reinterpret_cast<const uint8_t*>(&sin->sin_addr);
+    if (!ipv4BytesArePrivateLan(oc))
+      continue;
+    char nb[INET_ADDRSTRLEN]{};
+    if (inet_ntop(AF_INET, &sin->sin_addr, nb, sizeof(nb)) == nullptr)
+      continue;
+    std::strncpy(out, nb, outCap - 1);
+    out[outCap - 1] = '\0';
+    ok = true;
+  }
+  freeifaddrs(ifap);
+  return ok;
+}
+#endif
+
+static bool tryAnnounceDirectIpv4(char* out, size_t outCap) {
+#ifdef _WIN32
+  if (privateLanIpv4FromWinAdapters(out, outCap))
+    return true;
+#else
+  if (privateLanIpv4FromUnixIfaddrs(out, outCap))
+    return true;
+#endif
+  return tryAnnounceTailscaleIpv4(out, outCap);
+}
+
 static bool fetchPublicIpv4(char* out, size_t outCap) {
   if (!out || outCap < 8)
     return false;
@@ -335,6 +450,7 @@ void RetroMpSession::shutdown() {
   lastWorldPacket.clear();
   hostDeliPickupQueue.clear();
   hostStaffMeleeQueue.clear();
+  hostFoodActionQueue.clear();
   remoteDeathRetryPending = false;
   deathRetrySendSeq = 0;
   std::memset(peerHostUtf8, 0, sizeof(peerHostUtf8));
@@ -344,10 +460,10 @@ void RetroMpSession::shutdown() {
 void RetroMpSession::refreshAnnounceJoinIpv4() {
   if (!active || !isHost)
     return;
-  char ts[INET_ADDRSTRLEN]{};
-  if (!tryAnnounceTailscaleIpv4(ts, sizeof(ts)) || ts[0] == '\0')
+  char ip[INET_ADDRSTRLEN]{};
+  if (!tryAnnounceDirectIpv4(ip, sizeof(ip)) || ip[0] == '\0')
     return;
-  std::strncpy(publicHostUtf8, ts, sizeof(publicHostUtf8) - 1);
+  std::strncpy(publicHostUtf8, ip, sizeof(publicHostUtf8) - 1);
   publicHostUtf8[sizeof(publicHostUtf8) - 1] = '\0';
 }
 
@@ -376,6 +492,7 @@ bool RetroMpSession::startHost(uint16_t port) {
     std::fprintf(stderr, "[mp] socket() failed.\n");
     return false;
   }
+  tuneUdpLowLatency(s);
 #ifdef _WIN32
   sock = static_cast<uint64_t>(s);
 #else
@@ -419,11 +536,13 @@ bool RetroMpSession::startHost(uint16_t port) {
   peerPort = port;
   std::fprintf(stderr, "[mp] Hosting UDP :%u (wait for client packets)\n", static_cast<unsigned>(port));
   publicHostUtf8[0] = '\0';
-  if (tryAnnounceTailscaleIpv4(publicHostUtf8, sizeof(publicHostUtf8)))
-    std::fprintf(stderr, "[mp] Tailscale join IP (share with friend) %s:%u\n", publicHostUtf8,
+  if (tryAnnounceDirectIpv4(publicHostUtf8, sizeof(publicHostUtf8)))
+    std::fprintf(stderr, "[mp] Direct join IP %s:%u\n", publicHostUtf8,
                  static_cast<unsigned>(port));
-  else if (fetchPublicIpv4(publicHostUtf8, sizeof(publicHostUtf8)))
+  else if (envFlagEnabled("VULKAN_GAME_MP_WAN_HINT") && fetchPublicIpv4(publicHostUtf8, sizeof(publicHostUtf8)))
     std::fprintf(stderr, "[mp] Public WAN join hint %s:%u\n", publicHostUtf8, static_cast<unsigned>(port));
+  else
+    std::fprintf(stderr, "[mp] Direct IP hint unavailable; enter this PC's LAN/Tailscale IP on the client.\n");
   return true;
 }
 
@@ -441,6 +560,7 @@ bool RetroMpSession::startJoin(const char* ipv4, uint16_t port) {
     std::fprintf(stderr, "[mp] socket() failed.\n");
     return false;
   }
+  tuneUdpLowLatency(s);
 #ifdef _WIN32
   sock = static_cast<uint64_t>(s);
 #else
@@ -503,6 +623,19 @@ static bool parseU16(const char* s, uint16_t& out) {
   return true;
 }
 
+static void parseJoinHostPortInPlace(char* host, size_t hostCap, uint16_t& port) {
+  if (!host || hostCap == 0)
+    return;
+  char* colon = std::strrchr(host, ':');
+  if (!colon || colon == host)
+    return;
+  uint16_t parsed = port;
+  if (!parseU16(colon + 1, parsed) || parsed == 0)
+    return;
+  *colon = '\0';
+  port = parsed;
+}
+
 bool RetroMpSession::initFromArgs(int argc, char** argv) {
   shutdown();
 
@@ -525,6 +658,7 @@ bool RetroMpSession::initFromArgs(int argc, char** argv) {
     } else if (std::strcmp(argv[i], "--mp-join") == 0 && i + 1 < argc) {
       wantJoin = true;
       std::strncpy(joinIp, argv[++i], sizeof(joinIp) - 1);
+      parseJoinHostPortInPlace(joinIp, sizeof(joinIp), joinPort);
       if (i + 1 < argc && argv[i + 1][0] != '-') {
         uint16_t p = joinPort;
         if (parseU16(argv[i + 1], p)) {
@@ -543,6 +677,7 @@ bool RetroMpSession::initFromArgs(int argc, char** argv) {
     if (e[0] != '\0') {
       wantJoin = true;
       std::strncpy(joinIp, e, sizeof(joinIp) - 1);
+      parseJoinHostPortInPlace(joinIp, sizeof(joinIp), joinPort);
     }
   }
   if (const char* e = std::getenv("VULKAN_GAME_MP_PORT")) {
@@ -635,6 +770,17 @@ void RetroMpSession::pollReceive(float /*wallDt*/) {
           hostStaffMeleeQueue.push_back(p);
           while (hostStaffMeleeQueue.size() > 64u)
             hostStaffMeleeQueue.pop_front();
+        }
+      }
+    } else if (mag == kRetroMpFoodActionMagic) {
+      if (isHost &&
+          static_cast<size_t>(r) == sizeof(RetroMpFoodActionPacket)) {
+        RetroMpFoodActionPacket p{};
+        std::memcpy(&p, dgram, sizeof(p));
+        if (p.magic == kRetroMpFoodActionMagic) {
+          hostFoodActionQueue.push_back(p);
+          while (hostFoodActionQueue.size() > 64u)
+            hostFoodActionQueue.pop_front();
         }
       }
     } else if (mag == kRetroMpDeathRetryMagic) {
@@ -773,6 +919,27 @@ void RetroMpSession::sendStaffMeleeRequest(const RetroMpStaffMeleePacket& p) {
     return;
   RetroMpStaffMeleePacket out = p;
   out.magic = kRetroMpStaffMeleeMagic;
+
+  sockaddr_in to{};
+  to.sin_family = AF_INET;
+  to.sin_port = htons(peerPort);
+  if (inet_pton(AF_INET, peerHostUtf8, &to.sin_addr) != 1)
+    return;
+
+#ifdef _WIN32
+  ::sendto(static_cast<SOCKET>(sock), reinterpret_cast<const char*>(&out), sizeof(out), 0,
+           reinterpret_cast<sockaddr*>(&to), sizeof(to));
+#else
+  ::sendto(sock, reinterpret_cast<const char*>(&out), sizeof(out), 0,
+           reinterpret_cast<sockaddr*>(&to), sizeof(to));
+#endif
+}
+
+void RetroMpSession::sendFoodActionRequest(const RetroMpFoodActionPacket& p) {
+  if (!active || isHost || peerHostUtf8[0] == '\0')
+    return;
+  RetroMpFoodActionPacket out = p;
+  out.magic = kRetroMpFoodActionMagic;
 
   sockaddr_in to{};
   to.sin_family = AF_INET;

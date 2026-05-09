@@ -5058,7 +5058,7 @@ static std::vector<Vertex> buildDeathMenuOverlayVertices() {
 static std::string pauseMenuBuildSubString(const char* hostBtnLine, const char* ipLine) {
   return std::string("RESUME\nEXIT\n") + hostBtnLine + "\nJOIN AT IP\nSTOP MULTIPLAYER\n" + ipLine +
          "\n(press I to edit, Enter to join)\n"
-         "WAN: TAILSCALE + YOUR 100.x HOST IP  |  C COPY JOIN LINE  |  O TAILSCALE HELP";
+         "DIRECT IP: LAN OR TAILSCALE  |  C COPY JOIN LINE  |  O TAILSCALE HELP";
 }
 
 static bool parseJoinTargetIpPort(const char* raw, char* outIp, size_t outIpCap, uint16_t& outPort) {
@@ -5217,7 +5217,16 @@ static std::vector<Vertex> buildPauseMenuOverlayVertices(const char* mpStatusLin
 struct WorldDroppedFood {
   glm::vec3 pos{0.f};
   std::string item;
+  uint32_t id = 0;
 };
+
+static uint8_t droppedFoodKindForItem(const std::string& item) {
+  return item == "MEATBALL" ? kRetroMpDeliPickupMeat : kRetroMpDeliPickupPizza;
+}
+
+static const char* droppedFoodItemForKind(uint8_t kind) {
+  return kind == kRetroMpDeliPickupMeat ? "MEATBALL" : "PIZZA SLICE";
+}
 
 /// Keep in sync with `buildInventoryOverlayVertices` DROP chip.
 static constexpr float kInvDropBtnBaselineY = -0.525f;
@@ -6415,8 +6424,11 @@ struct App {
   std::unordered_map<uint64_t, uint8_t> mpClientDeliLocalTakeMeat;
   uint32_t mpClientDeliPickupSeq = 0;
   uint32_t mpClientStaffMeleeSeq = 0;
+  uint32_t mpClientFoodActionSeq = 0;
   uint32_t mpHostLastClientDeliPickupSeq = 0;
   uint32_t mpHostLastClientStaffMeleeSeq = 0;
+  uint32_t mpHostLastClientFoodActionSeq = 0;
+  uint32_t mpNextDroppedFoodId = 1;
   bool mpClientDropKickNetHitSentForAir = false;
 
   SDL_Window* window = nullptr;
@@ -8103,17 +8115,40 @@ struct App {
               [](const DeliSortItem& a, const DeliSortItem& b) { return a.d2 < b.d2; });
     const int nDeli = std::min(static_cast<int>(deliOrd.size()), kRetroMpWorldMaxDeli);
 
+    struct DropSortItem {
+      size_t index;
+      float d2;
+    };
+    std::vector<DropSortItem> dropOrd;
+    dropOrd.reserve(worldDroppedFood.size());
+    for (size_t i = 0; i < worldDroppedFood.size(); ++i) {
+      WorldDroppedFood& d = worldDroppedFood[i];
+      if (d.item != "PIZZA SLICE" && d.item != "MEATBALL")
+        continue;
+      if (d.id == 0) {
+        d.id = mpNextDroppedFoodId++;
+        if (mpNextDroppedFoodId == 0)
+          mpNextDroppedFoodId = 1;
+      }
+      const glm::vec2 dd(d.pos.x - sortC.x, d.pos.z - sortC.y);
+      dropOrd.push_back({i, glm::dot(dd, dd)});
+    }
+    std::sort(dropOrd.begin(), dropOrd.end(),
+              [](const DropSortItem& a, const DropSortItem& b) { return a.d2 < b.d2; });
+    const int nDrops = std::min(static_cast<int>(dropOrd.size()), kRetroMpWorldMaxDroppedFood);
+
     const size_t packetSize =
         sizeof(RetroMpWorldHeader) + static_cast<size_t>(nStaff) * sizeof(RetroMpStaffWire) +
-        static_cast<size_t>(nDeli) * sizeof(RetroMpDeliWire);
+        static_cast<size_t>(nDeli) * sizeof(RetroMpDeliWire) +
+        static_cast<size_t>(nDrops) * sizeof(RetroMpDroppedFoodWire);
     std::vector<uint8_t> buf(packetSize);
     auto* hdr = reinterpret_cast<RetroMpWorldHeader*>(buf.data());
     hdr->magic = kRetroMpWorldMagic;
     hdr->seq = ++netMp.worldSendSeq;
     hdr->staffCount = static_cast<uint8_t>(nStaff);
     hdr->deliCount = static_cast<uint8_t>(nDeli);
-    hdr->reserved[0] = 0;
-    hdr->reserved[1] = 0;
+    hdr->droppedFoodCount = static_cast<uint8_t>(nDrops);
+    hdr->reserved = 0;
     auto* wSt = reinterpret_cast<RetroMpStaffWire*>(buf.data() + sizeof(RetroMpWorldHeader));
     for (int i = 0; i < nStaff; ++i) {
       RetroMpStaffWire& w = wSt[i];
@@ -8216,6 +8251,18 @@ struct App {
               static_cast<uint16_t>(std::min(itPr->second * 100.f, 65535.f));
       }
     }
+    auto* wDrop = reinterpret_cast<RetroMpDroppedFoodWire*>(
+        reinterpret_cast<uint8_t*>(wDl) + static_cast<size_t>(nDeli) * sizeof(RetroMpDeliWire));
+    for (int i = 0; i < nDrops; ++i) {
+      const WorldDroppedFood& src = worldDroppedFood[dropOrd[static_cast<size_t>(i)].index];
+      RetroMpDroppedFoodWire& d = wDrop[i];
+      d.dropId = src.id;
+      d.posX = src.pos.x;
+      d.posY = src.pos.y;
+      d.posZ = src.pos.z;
+      d.foodKind = droppedFoodKindForItem(src.item);
+      d.reserved[0] = d.reserved[1] = d.reserved[2] = 0;
+    }
     netMp.sendWorldSync(buf.data(), buf.size());
   }
 
@@ -8228,11 +8275,13 @@ struct App {
     const auto* hdr = reinterpret_cast<const RetroMpWorldHeader*>(pkt.data());
     if (hdr->magic != kRetroMpWorldMagic)
       return;
-    if (hdr->staffCount > kRetroMpWorldMaxStaff || hdr->deliCount > kRetroMpWorldMaxDeli)
+    if (hdr->staffCount > kRetroMpWorldMaxStaff || hdr->deliCount > kRetroMpWorldMaxDeli ||
+        hdr->droppedFoodCount > kRetroMpWorldMaxDroppedFood)
       return;
     const size_t expectSize = sizeof(RetroMpWorldHeader) +
                               static_cast<size_t>(hdr->staffCount) * sizeof(RetroMpStaffWire) +
-                              static_cast<size_t>(hdr->deliCount) * sizeof(RetroMpDeliWire);
+                              static_cast<size_t>(hdr->deliCount) * sizeof(RetroMpDeliWire) +
+                              static_cast<size_t>(hdr->droppedFoodCount) * sizeof(RetroMpDroppedFoodWire);
     if (pkt.size() != expectSize)
       return;
     if (hdr->seq == mpLastAppliedWorldSeq)
@@ -8360,6 +8409,23 @@ struct App {
         deliMeatballReplenishTimerBySlot.erase(d.key);
       }
     }
+    const RetroMpDroppedFoodWire* wDrop = reinterpret_cast<const RetroMpDroppedFoodWire*>(
+        reinterpret_cast<const uint8_t*>(wDl) +
+        static_cast<size_t>(hdr->deliCount) * sizeof(RetroMpDeliWire));
+    worldDroppedFood.clear();
+    worldDroppedFood.reserve(hdr->droppedFoodCount);
+    for (uint32_t i = 0; i < hdr->droppedFoodCount; ++i) {
+      const RetroMpDroppedFoodWire& d = wDrop[i];
+      if (d.dropId == 0)
+        continue;
+      if (d.foodKind != kRetroMpDeliPickupPizza && d.foodKind != kRetroMpDeliPickupMeat)
+        continue;
+      WorldDroppedFood out{};
+      out.id = d.dropId;
+      out.item = droppedFoodItemForKind(d.foodKind);
+      out.pos = glm::vec3(d.posX, d.posY, d.posZ);
+      worldDroppedFood.push_back(std::move(out));
+    }
     clampMpClientDeliLocalTakesAfterWorldSync();
   }
 
@@ -8405,6 +8471,47 @@ struct App {
       deliPizzaReplenishTimerBySlot[k] = kDeliPizzaReplenishSec;
     }
     return true;
+  }
+
+  bool hostApplyClientFoodAction(const RetroMpFoodActionPacket& pkt) {
+    if (pkt.seq == 0)
+      return false;
+    if (pkt.action == kRetroMpFoodActionDrop) {
+      if (pkt.foodKind != kRetroMpDeliPickupPizza && pkt.foodKind != kRetroMpDeliPickupMeat)
+        return false;
+      if (!std::isfinite(pkt.posX) || !std::isfinite(pkt.posY) || !std::isfinite(pkt.posZ))
+        return false;
+      const glm::vec2 cam(pkt.camX, pkt.camZ);
+      const glm::vec2 pos(pkt.posX, pkt.posZ);
+      if (glm::length(pos - cam) > 2.5f)
+        return false;
+      WorldDroppedFood drop{};
+      drop.id = mpNextDroppedFoodId++;
+      if (mpNextDroppedFoodId == 0)
+        mpNextDroppedFoodId = 1;
+      drop.item = droppedFoodItemForKind(pkt.foodKind);
+      drop.pos = glm::vec3(pkt.posX, pkt.posY, pkt.posZ);
+      worldDroppedFood.push_back(std::move(drop));
+      while (worldDroppedFood.size() > 256u)
+        worldDroppedFood.erase(worldDroppedFood.begin());
+      return true;
+    }
+    if (pkt.action == kRetroMpFoodActionPickup) {
+      if (pkt.dropId == 0)
+        return false;
+      for (size_t i = 0; i < worldDroppedFood.size(); ++i) {
+        const WorldDroppedFood& d = worldDroppedFood[i];
+        if (d.id != pkt.dropId)
+          continue;
+        const glm::vec2 cam(pkt.camX, pkt.camZ);
+        const glm::vec2 pos(d.pos.x, d.pos.z);
+        if (glm::length(pos - cam) > kDeliFoodPickupRadius + 0.65f)
+          return false;
+        worldDroppedFood.erase(worldDroppedFood.begin() + static_cast<std::ptrdiff_t>(i));
+        return true;
+      }
+    }
+    return false;
   }
 
   bool hostApplyClientStaffMeleeRpc(const RetroMpStaffMeleePacket& pkt) {
@@ -8503,6 +8610,15 @@ struct App {
         continue;
       mpHostLastClientStaffMeleeSeq = p.seq;
       if (hostApplyClientStaffMeleeRpc(p))
+        flushed = true;
+    }
+    while (!netMp.hostFoodActionQueue.empty()) {
+      RetroMpFoodActionPacket p = netMp.hostFoodActionQueue.front();
+      netMp.hostFoodActionQueue.pop_front();
+      if (p.seq == 0 || p.seq <= mpHostLastClientFoodActionSeq)
+        continue;
+      mpHostLastClientFoodActionSeq = p.seq;
+      if (hostApplyClientFoodAction(p))
         flushed = true;
     }
     if (flushed)
@@ -13065,7 +13181,7 @@ struct App {
         }
       }
     }
-    if (!netMp.active || netMp.isHost) {
+    {
       const float rendSqWorld = kDeliFoodRenderDist * kDeliFoodRenderDist;
       for (size_t wi = 0; wi < worldDroppedFood.size(); ++wi) {
         const glm::vec3& dp = worldDroppedFood[wi].pos;
@@ -15119,12 +15235,14 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
   bool tryDropInventoryStackByIndex(int stackIdx) {
     if (stackIdx < 0)
       return false;
-    if (netMp.active && !netMp.isHost)
-      return false;
     const auto stacks = buildInventoryStacks(inventoryItems);
     if (stackIdx >= static_cast<int>(stacks.size()))
       return false;
     const std::string& itemName = stacks[static_cast<size_t>(stackIdx)].first;
+    const bool mpClient = netMp.active && !netMp.isHost;
+    const bool isNetworkFood = itemName == "PIZZA SLICE" || itemName == "MEATBALL";
+    if (mpClient && !isNetworkFood)
+      return false;
     auto it = std::find(inventoryItems.begin(), inventoryItems.end(), itemName);
     if (it == inventoryItems.end())
       return false;
@@ -15144,6 +15262,11 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     constexpr float kDropForwardDist = 0.48f;
     WorldDroppedFood drop{};
     drop.item = itemName;
+    if (!mpClient) {
+      drop.id = mpNextDroppedFoodId++;
+      if (mpNextDroppedFoodId == 0)
+        mpNextDroppedFoodId = 1;
+    }
     drop.pos.x = camPos.x + fwd.x * kDropForwardDist;
     drop.pos.z = camPos.z + fwd.y * kDropForwardDist;
     if (itemName == "MEATBALL")
@@ -15152,7 +15275,20 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       drop.pos.y = kGroundY + 0.042f;
     else
       drop.pos.y = kGroundY + 0.055f;
-    worldDroppedFood.push_back(std::move(drop));
+    if (mpClient) {
+      RetroMpFoodActionPacket pkt{};
+      pkt.seq = ++mpClientFoodActionSeq;
+      pkt.action = kRetroMpFoodActionDrop;
+      pkt.foodKind = droppedFoodKindForItem(itemName);
+      pkt.posX = drop.pos.x;
+      pkt.posY = drop.pos.y;
+      pkt.posZ = drop.pos.z;
+      pkt.camX = camPos.x;
+      pkt.camZ = camPos.z;
+      netMp.sendFoodActionRequest(pkt);
+    } else {
+      worldDroppedFood.push_back(std::move(drop));
+    }
     return true;
   }
 
@@ -15195,15 +15331,13 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     }
     size_t bestDropIdx = std::numeric_limits<size_t>::max();
     float bestDropD2 = kPickupRadius * kPickupRadius;
-    if (!netMp.active || netMp.isHost) {
-      for (size_t i = 0; i < worldDroppedFood.size(); ++i) {
-        const float dx = worldDroppedFood[i].pos.x - camPos.x;
-        const float dz = worldDroppedFood[i].pos.z - camPos.z;
-        const float d2 = dx * dx + dz * dz;
-        if (d2 <= bestDropD2) {
-          bestDropD2 = d2;
-          bestDropIdx = i;
-        }
+    for (size_t i = 0; i < worldDroppedFood.size(); ++i) {
+      const float dx = worldDroppedFood[i].pos.x - camPos.x;
+      const float dz = worldDroppedFood[i].pos.z - camPos.z;
+      const float d2 = dx * dx + dz * dz;
+      if (d2 <= bestDropD2) {
+        bestDropD2 = d2;
+        bestDropIdx = i;
       }
     }
     const bool haveDrop = bestDropIdx < worldDroppedFood.size();
@@ -15214,6 +15348,15 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       WorldDroppedFood picked = worldDroppedFood[bestDropIdx];
       worldDroppedFood.erase(worldDroppedFood.begin() + static_cast<std::ptrdiff_t>(bestDropIdx));
       inventoryItems.emplace_back(std::move(picked.item));
+      if (netMp.active && !netMp.isHost && picked.id != 0) {
+        RetroMpFoodActionPacket pkt{};
+        pkt.seq = ++mpClientFoodActionSeq;
+        pkt.action = kRetroMpFoodActionPickup;
+        pkt.dropId = picked.id;
+        pkt.camX = camPos.x;
+        pkt.camZ = camPos.z;
+        netMp.sendFoodActionRequest(pkt);
+      }
       ++inventoryRevision;
       const int maxScroll = std::max(0, inventoryStackRowCount() - 8);
       inventoryScrollRow = std::clamp(inventoryScrollRow, 0, maxScroll);
@@ -15302,7 +15445,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
           return true;
       }
     }
-    if ((!netMp.active || netMp.isHost)) {
+    {
       constexpr float kr2Nearby = kDeliFoodPickupRadius * kDeliFoodPickupRadius;
       for (const WorldDroppedFood& d : worldDroppedFood) {
         const float dx = d.pos.x - camPos.x;
@@ -18714,6 +18857,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     deliMeatballsBySlot.clear();
     deliMeatballReplenishTimerBySlot.clear();
     worldDroppedFood.clear();
+    mpNextDroppedFoodId = 1;
     playerHunger = kPlayerHungerMax;
     ++inventoryRevision;
     inventoryScrollRow = 0;
@@ -19223,6 +19367,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     showInventoryMenu = false;
     inventoryUiSelectedStackIdx = -1;
     worldDroppedFood.clear();
+    mpNextDroppedFoodId = 1;
     inTitleMenu = true;
     titleMenuSceneTime = 0.f;
     titleMenuSlideTime = 0.f;
@@ -19266,6 +19411,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     deliMeatballsBySlot.clear();
     deliMeatballReplenishTimerBySlot.clear();
     worldDroppedFood.clear();
+    mpNextDroppedFoodId = 1;
     mpClientDeliLocalTakePizza.clear();
     mpClientDeliLocalTakeMeat.clear();
     ++inventoryRevision;
@@ -19497,8 +19643,10 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       mpClientDeliLocalTakeMeat.clear();
       mpClientDeliPickupSeq = 0;
       mpClientStaffMeleeSeq = 0;
+      mpClientFoodActionSeq = 0;
       mpHostLastClientDeliPickupSeq = 0;
       mpHostLastClientStaffMeleeSeq = 0;
+      mpHostLastClientFoodActionSeq = 0;
       mpClientDropKickNetHitSentForAir = false;
     } else if (netMp.isHost) {
       mpClientDeliLocalTakePizza.clear();
@@ -19689,8 +19837,8 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       updateShelfEmployees(dt);
       if (netMp.active && netMp.isHost && netMp.peerHostUtf8[0] != '\0') {
         netWorldSyncAccumSec += dt;
-        constexpr float kWorldSyncHz = 12.f;
-        const float worldStep = 1.f / kWorldSyncHz;
+        const int worldHz = std::clamp(envIntOrDefault("VULKAN_GAME_MP_WORLD_HZ", 20), 5, 30);
+        const float worldStep = 1.f / static_cast<float>(worldHz);
         while (netWorldSyncAccumSec >= worldStep) {
           netWorldSyncAccumSec -= worldStep;
           buildAndSendMpWorldSync();
@@ -21544,25 +21692,16 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
           resolvePlayerAvatarPhase(netAvatarClip, phaseResolved, loopResolved);
           netLocoPhaseSec = phaseResolved;
         }
-        // Decouple network snapshots from render rate: Wine/low-FPS hosts stay responsive for peers.
-        constexpr float kNetSnapshotHz = 90.f;
-        constexpr int kNetSnapshotBurstMax = 4;
-        const float sendStep = 1.f / kNetSnapshotHz;
-        netSnapshotSendAccumSec = std::min(netSnapshotSendAccumSec + dt, sendStep * kNetSnapshotBurstMax);
-        int sends = 0;
-        while (netSnapshotSendAccumSec >= sendStep && sends < kNetSnapshotBurstMax) {
+        // Keep direct-IP snapshots paced for slow PCs: one fresh packet per update at most.
+        const int snapshotHz = std::clamp(envIntOrDefault("VULKAN_GAME_MP_SNAPSHOT_HZ", 60), 20, 120);
+        const float sendStep = 1.f / static_cast<float>(snapshotHz);
+        netSnapshotSendAccumSec = std::min(netSnapshotSendAccumSec + dt, sendStep);
+        if (netSnapshotSendAccumSec >= sendStep || netMp.lastRecvMono < 0.0) {
           netMp.sendSnapshot(camPos, yaw, pitch, eyeHeight, horizVel, netAvatarClip, netBlendFromClip,
                              netClipBlend, netLocoPhaseSec, netEmoteFlags, netEmoteAux0, netEmoteAux1,
                              netEmoteAux2,
                              netAudioPtr);
-          netSnapshotSendAccumSec -= sendStep;
-          ++sends;
-        }
-        if (sends == 0) {
-          netMp.sendSnapshot(camPos, yaw, pitch, eyeHeight, horizVel, netAvatarClip, netBlendFromClip,
-                             netClipBlend, netLocoPhaseSec, netEmoteFlags, netEmoteAux0, netEmoteAux1,
-                             netEmoteAux2,
-                             netAudioPtr);
+          netSnapshotSendAccumSec = 0.f;
         }
       } else {
         netSnapshotSendAccumSec = 0.f;
@@ -21712,25 +21851,15 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
           resolvePlayerAvatarPhase(netAvatarClip, phaseResolvedGh, loopResolvedGh);
           netLocoPhaseSec = phaseResolvedGh;
         }
-        constexpr float kNetSnapshotHzGh = 90.f;
-        constexpr int kNetSnapshotBurstMaxGh = 4;
-        const float sendStepGh = 1.f / kNetSnapshotHzGh;
-        netSnapshotSendAccumSec =
-            std::min(netSnapshotSendAccumSec + dt, sendStepGh * static_cast<float>(kNetSnapshotBurstMaxGh));
-        int sendsGh = 0;
-        while (netSnapshotSendAccumSec >= sendStepGh && sendsGh < kNetSnapshotBurstMaxGh) {
+        const int snapshotHzGh = std::clamp(envIntOrDefault("VULKAN_GAME_MP_SNAPSHOT_HZ", 60), 20, 120);
+        const float sendStepGh = 1.f / static_cast<float>(snapshotHzGh);
+        netSnapshotSendAccumSec = std::min(netSnapshotSendAccumSec + dt, sendStepGh);
+        if (netSnapshotSendAccumSec >= sendStepGh || netMp.lastRecvMono < 0.0) {
           netMp.sendSnapshot(camPos, yaw, pitch, eyeHeight, horizVel, netAvatarClip, netBlendFromClip,
                              netClipBlend, netLocoPhaseSec, netEmoteFlags, netEmoteAux0, netEmoteAux1,
                              netEmoteAux2,
                              netAudioPtrGh);
-          netSnapshotSendAccumSec -= sendStepGh;
-          ++sendsGh;
-        }
-        if (sendsGh == 0) {
-          netMp.sendSnapshot(camPos, yaw, pitch, eyeHeight, horizVel, netAvatarClip, netBlendFromClip,
-                             netClipBlend, netLocoPhaseSec, netEmoteFlags, netEmoteAux0, netEmoteAux1,
-                             netEmoteAux2,
-                             netAudioPtrGh);
+          netSnapshotSendAccumSec = 0.f;
         }
       } else {
         netSnapshotSendAccumSec = 0.f;

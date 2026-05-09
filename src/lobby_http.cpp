@@ -1,5 +1,6 @@
 #include "lobby_http.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cstddef>
 #include <cstdlib>
@@ -24,6 +25,16 @@ static std::string describeLobbyRequest(const UrlParts& u, const char* path) {
     s += ":" + std::to_string(u.port);
   s += path ? path : "/";
   return s;
+}
+
+static int lobbyTimeoutSec(const char* name, int fallback, int lo, int hi) {
+  if (const char* raw = std::getenv(name)) {
+    char* end = nullptr;
+    const long v = std::strtol(raw, &end, 10);
+    if (end != raw)
+      return static_cast<int>(std::max<long>(lo, std::min<long>(hi, v)));
+  }
+  return fallback;
 }
 
 static bool parseLobbyOrigin(const char* raw, UrlParts& out, std::string& err) {
@@ -80,8 +91,8 @@ static bool httplibGet(const UrlParts& u, const char* path, std::string& bodyOut
 #if defined(CPPHTTPLIB_OPENSSL_SUPPORT)
   if (u.tls) {
     httplib::SSLClient cli(u.host.c_str(), u.port);
-    cli.set_connection_timeout(5, 0);
-    cli.set_read_timeout(10, 0);
+    cli.set_connection_timeout(lobbyTimeoutSec("RETRO_IKEA_LOBBY_CONNECT_TIMEOUT_SEC", 2, 1, 15), 0);
+    cli.set_read_timeout(lobbyTimeoutSec("RETRO_IKEA_LOBBY_READ_TIMEOUT_SEC", 3, 1, 30), 0);
     cli.enable_server_certificate_verification(true);
     auto res = cli.Get(path);
     if (!res) {
@@ -104,8 +115,8 @@ static bool httplibGet(const UrlParts& u, const char* path, std::string& bodyOut
   }
 #endif
   httplib::Client cli(u.host.c_str(), u.port);
-  cli.set_connection_timeout(5, 0);
-  cli.set_read_timeout(10, 0);
+  cli.set_connection_timeout(lobbyTimeoutSec("RETRO_IKEA_LOBBY_CONNECT_TIMEOUT_SEC", 2, 1, 15), 0);
+  cli.set_read_timeout(lobbyTimeoutSec("RETRO_IKEA_LOBBY_READ_TIMEOUT_SEC", 3, 1, 30), 0);
   auto res = cli.Get(path);
   if (!res) {
     err = "HTTP GET failed (network)";
@@ -125,8 +136,8 @@ static bool httplibPostJson(const UrlParts& u, const char* path, const std::stri
 #if defined(CPPHTTPLIB_OPENSSL_SUPPORT)
   if (u.tls) {
     httplib::SSLClient cli(u.host.c_str(), u.port);
-    cli.set_connection_timeout(5, 0);
-    cli.set_read_timeout(10, 0);
+    cli.set_connection_timeout(lobbyTimeoutSec("RETRO_IKEA_LOBBY_CONNECT_TIMEOUT_SEC", 2, 1, 15), 0);
+    cli.set_read_timeout(lobbyTimeoutSec("RETRO_IKEA_LOBBY_READ_TIMEOUT_SEC", 3, 1, 30), 0);
     cli.enable_server_certificate_verification(true);
     httplib::Headers h{{"Content-Type", "application/json"}};
     auto res = cli.Post(path, h, json, "application/json");
@@ -149,8 +160,8 @@ static bool httplibPostJson(const UrlParts& u, const char* path, const std::stri
   }
 #endif
   httplib::Client cli(u.host.c_str(), u.port);
-  cli.set_connection_timeout(5, 0);
-  cli.set_read_timeout(10, 0);
+  cli.set_connection_timeout(lobbyTimeoutSec("RETRO_IKEA_LOBBY_CONNECT_TIMEOUT_SEC", 2, 1, 15), 0);
+  cli.set_read_timeout(lobbyTimeoutSec("RETRO_IKEA_LOBBY_READ_TIMEOUT_SEC", 3, 1, 30), 0);
   httplib::Headers h{{"Content-Type", "application/json"}};
   auto res = cli.Post(path, h, json, "application/json");
   if (!res) {

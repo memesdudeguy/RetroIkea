@@ -621,16 +621,14 @@ if(VULKAN_GAME_STAFF_DISABLE_EMBEDDED_GLB_DIFFUSE)
 endif()
 
 # Scene textures load from disk at runtime under VULKAN_GAME_ASSETS_DIR (see main.cpp create*TextureResources).
-# Optional override for deli brushed-metal. Default prefers shipped files under assets/textures/ (deli_metal_brushed
-# is optional; shelf_rack_metal_osb.jpg is bundled and reads well as brushed steel on counters).
+# Optional override for deli brushed-metal. Do not fall back to shelf/wood textures; if the
+# metal texture is absent, the procedural counter colors in main.cpp are used instead.
 set(VULKAN_GAME_DELI_METAL_TEXTURE_PATH "" CACHE FILEPATH
   "Path to deli counter brushed-metal image (empty: pick from assets/textures/)")
 if(VULKAN_GAME_DELI_METAL_TEXTURE_PATH)
   set(VULKAN_GAME_DELI_METAL_TEXTURE "${VULKAN_GAME_DELI_METAL_TEXTURE_PATH}")
 elseif(EXISTS "${VULKAN_GAME_ASSETS_SOURCE_DIR}/textures/deli_metal_brushed.jpg")
   set(VULKAN_GAME_DELI_METAL_TEXTURE "${VULKAN_GAME_ASSETS_DIR}/textures/deli_metal_brushed.jpg")
-elseif(EXISTS "${VULKAN_GAME_ASSETS_SOURCE_DIR}/textures/shelf_rack_metal_osb.jpg")
-  set(VULKAN_GAME_DELI_METAL_TEXTURE "${VULKAN_GAME_ASSETS_DIR}/textures/shelf_rack_metal_osb.jpg")
 else()
   set(VULKAN_GAME_DELI_METAL_TEXTURE "${VULKAN_GAME_ASSETS_DIR}/textures/deli_metal_brushed.jpg")
 endif()
