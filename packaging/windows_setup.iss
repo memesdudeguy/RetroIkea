@@ -1,5 +1,5 @@
 #define MyAppName "retro ikea"
-#define MyAppVersion "Beta 6"
+#define MyAppVersion "Beta 7"
 #define MyAppPublisher "NightShift"
 #define MyAppExeName "RetroIkea.exe"
 
@@ -58,6 +58,8 @@ Source: "{#RetroIkeaRepoRoot}\build-win-mingw\libssp-0.dll"; DestDir: "{app}"; F
 Source: "{#RetroIkeaRepoRoot}\build-win-mingw\zlib1.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#RetroIkeaRepoRoot}\build-win-mingw\libpng16-16.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#RetroIkeaRepoRoot}\build-win-mingw\libjpeg-8.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+; Optional Vulkan loader DLL. Usually installed by GPU drivers, but bundling helps portable/Wine installs when available.
+Source: "{#RetroIkeaRepoRoot}\build-win-mingw\vulkan-1.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 ; OpenSSL (HTTPS lobby); required — CMake must copy these next to RetroIkea.exe before ISCC (no skipifsourcedoesntexist).
 Source: "{#RetroIkeaRepoRoot}\build-win-mingw\libssl-3-x64.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RetroIkeaRepoRoot}\build-win-mingw\libcrypto-3-x64.dll"; DestDir: "{app}"; Flags: ignoreversion

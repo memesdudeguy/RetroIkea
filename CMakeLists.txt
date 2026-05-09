@@ -70,6 +70,7 @@ FetchContent_MakeAvailable(assimp)
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING)
   set(VULKAN_CROSS_LIBRARY "" CACHE FILEPATH "Path to Windows Vulkan import library (vulkan-1.lib or libvulkan-1.a)")
   set(VULKAN_CROSS_INCLUDE_DIR "" CACHE PATH "Path to Vulkan headers (directory containing vulkan/vulkan.h)")
+  set(VULKAN_GAME_MINGW_VULKAN_DLL "" CACHE FILEPATH "Optional path to vulkan-1.dll to bundle next to RetroIkea.exe")
   # MinGW cross builds often need an explicit Windows Vulkan import library path.
   set(_VULKAN_CROSS_HINTS "")
   if(DEFINED ENV{VULKAN_SDK})
@@ -758,6 +759,37 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING AND OpenSSL_FOU
       "Install mingw-w64 OpenSSL for your distro (DLLs in /usr/x86_64-w64-mingw32/bin/), or set\n"
       "  -DVULKAN_GAME_MINGW_OPENSSL_SSL_DLL=/path/to/libssl-*.dll\n"
       "  -DVULKAN_GAME_MINGW_OPENSSL_CRYPTO_DLL=/path/to/libcrypto-*.dll")
+  endif()
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING)
+  set(_vk_runtime_dll "${VULKAN_GAME_MINGW_VULKAN_DLL}")
+  if(NOT _vk_runtime_dll)
+    set(_vk_runtime_dll_candidates "")
+    if(DEFINED ENV{VULKAN_SDK})
+      list(APPEND _vk_runtime_dll_candidates
+        "$ENV{VULKAN_SDK}/Bin/vulkan-1.dll"
+        "$ENV{VULKAN_SDK}/Bin32/vulkan-1.dll")
+    endif()
+    list(APPEND _vk_runtime_dll_candidates
+      "/usr/x86_64-w64-mingw32/bin/vulkan-1.dll")
+    foreach(_vk_dll IN LISTS _vk_runtime_dll_candidates)
+      if(EXISTS "${_vk_dll}")
+        set(_vk_runtime_dll "${_vk_dll}")
+        break()
+      endif()
+    endforeach()
+  endif()
+  if(_vk_runtime_dll)
+    add_custom_command(TARGET vulkan_game POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${_vk_runtime_dll}"
+        $<TARGET_FILE_DIR:vulkan_game>/vulkan-1.dll
+      COMMENT "Copy Vulkan loader DLL next to RetroIkea.exe")
+  else()
+    message(WARNING
+      "vulkan-1.dll was not found for bundling. Set "
+      "-DVULKAN_GAME_MINGW_VULKAN_DLL=/path/to/vulkan-1.dll to include it in the installer.")
   endif()
 endif()
 
