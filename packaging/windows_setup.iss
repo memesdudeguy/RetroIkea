@@ -1,5 +1,5 @@
 #define MyAppName "retro ikea"
-#define MyAppVersion "Beta 2"
+#define MyAppVersion "Beta 3"
 #define MyAppPublisher "NightShift"
 #define MyAppExeName "RetroIkea.exe"
 
