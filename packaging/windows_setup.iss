@@ -1,5 +1,5 @@
 #define MyAppName "retro ikea"
-#define MyAppVersion "Beta 4"
+#define MyAppVersion "Beta 5"
 #define MyAppPublisher "NightShift"
 #define MyAppExeName "RetroIkea.exe"
 
@@ -23,7 +23,8 @@ OutputBaseFilename=RetroIkea-Beta-Setup
 Compression=lzma
 SolidCompression=yes
 ; IKEA-inspired palette: blue #0058AB + yellow #FFCC00 (WizardBackColor etc. need Inno Setup 6.3+).
-WizardStyle=modern windows11 light
+; Use "classic" wizard — "modern windows11 light" relies on Win11 UI paths that often crash or hang under Wine.
+WizardStyle=classic
 WizardBackColor=#FAFCFE
 WizardBackColorDynamicDark=#152838
 WizardImageBackColor=#FFCC00
@@ -31,6 +32,8 @@ WizardImageBackColorDynamicDark=#C9A000
 WizardSmallImageBackColor=#0058AB
 WizardSmallImageBackColorDynamicDark=#003D73
 ArchitecturesInstallIn64BitMode=x64compatible
+; Restart Manager (CloseApplications=yes default) often breaks or hangs Wine — disable for compatibility.
+CloseApplications=no
 ; Icons/bitmaps live next to this .iss (see packaging/). Regenerate BMPs: python packaging/generate_setup_wizard_bmps.py
 SetupIconFile=setup_icon.ico
 WizardImageFile=setup_wizard.bmp
@@ -55,9 +58,9 @@ Source: "{#RetroIkeaRepoRoot}\build-win-mingw\libssp-0.dll"; DestDir: "{app}"; F
 Source: "{#RetroIkeaRepoRoot}\build-win-mingw\zlib1.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#RetroIkeaRepoRoot}\build-win-mingw\libpng16-16.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#RetroIkeaRepoRoot}\build-win-mingw\libjpeg-8.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
-; OpenSSL (HTTPS lobby URL); match MinGW-w64 package names on your cross-build host.
-Source: "{#RetroIkeaRepoRoot}\build-win-mingw\libssl-3-x64.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "{#RetroIkeaRepoRoot}\build-win-mingw\libcrypto-3-x64.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+; OpenSSL (HTTPS lobby); required — CMake must copy these next to RetroIkea.exe before ISCC (no skipifsourcedoesntexist).
+Source: "{#RetroIkeaRepoRoot}\build-win-mingw\libssl-3-x64.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#RetroIkeaRepoRoot}\build-win-mingw\libcrypto-3-x64.dll"; DestDir: "{app}"; Flags: ignoreversion
 ; When built with -DVULKAN_GAME_WINDOWS_ALL_DYNAMIC=ON (shared Assimp + dynamic MinGW C++ runtime).
 Source: "{#RetroIkeaRepoRoot}\build-win-mingw\libassimp-5.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#RetroIkeaRepoRoot}\build-win-mingw\libgcc_s_seh-1.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
@@ -76,5 +79,5 @@ Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-Filename: "{tmp}\tailscale-setup-amd64.exe"; Parameters: "/S"; StatusMsg: "Installing Tailscale…"; Tasks: installtailscale; Flags: skipifdoesntexist waituntilterminated
+Filename: "{tmp}\tailscale-setup-amd64.exe"; Parameters: "/S"; StatusMsg: "Installing Tailscale..."; Tasks: installtailscale; Flags: skipifdoesntexist waituntilterminated
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent

@@ -6,7 +6,8 @@ services:
     runtime: python
     rootDir: server
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    # Single worker: in-memory lobby sessions must not split across processes.
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
     healthCheckPath: /healthz
     envVars:
       - key: LOBBY_TTL_SEC

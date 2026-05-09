@@ -44,6 +44,10 @@
 #include "net_p2p.hpp"
 #include "lobby_http.hpp"
 #include "portable_path.hpp"
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 // MinGW may define isfinite as a macro, which breaks qualified std::isfinite calls.
 #ifdef isfinite
 #undef isfinite
@@ -94,6 +98,39 @@ static void gamepadRadialDeadzone(float& lx, float& ly, float dz) {
   const float scale = (m - dz) / std::max(1.f - dz, 1e-4f);
   lx = (lx / m) * scale;
   ly = (ly / m) * scale;
+}
+
+static float gamepadAxisToUnit(Sint16 v) {
+  return v < 0 ? static_cast<float>(v) / 32768.f : static_cast<float>(v) / 32767.f;
+}
+
+static int joystickButtonToControllerButton(Uint8 b) {
+  // Common SDL/XInput-style raw joystick layout: A,B,X,Y,LB,RB,Back,Start,LStick,RStick.
+  // This keeps generic USB pads usable when SDL has no GameController mapping for them.
+  switch (b) {
+  case 0:
+    return SDL_CONTROLLER_BUTTON_A;
+  case 1:
+    return SDL_CONTROLLER_BUTTON_B;
+  case 2:
+    return SDL_CONTROLLER_BUTTON_X;
+  case 3:
+    return SDL_CONTROLLER_BUTTON_Y;
+  case 4:
+    return SDL_CONTROLLER_BUTTON_LEFTSHOULDER;
+  case 5:
+    return SDL_CONTROLLER_BUTTON_RIGHTSHOULDER;
+  case 6:
+    return SDL_CONTROLLER_BUTTON_BACK;
+  case 7:
+    return SDL_CONTROLLER_BUTTON_START;
+  case 8:
+    return SDL_CONTROLLER_BUTTON_LEFTSTICK;
+  case 9:
+    return SDL_CONTROLLER_BUTTON_RIGHTSTICK;
+  default:
+    return -1;
+  }
 }
 
 template <typename DownFn>
@@ -6816,6 +6853,7 @@ struct App {
   float playerDepthJumpWindowRemain = 0.f;
   bool spaceWasDown = false;
   SDL_GameController* gameController = nullptr;
+  SDL_Joystick* fallbackJoystick = nullptr;
   bool gpRtPickupHeldPrev = false;
   bool gpRbShoveHeldPrev = false;
   bool gpRStickKickHeldPrev = false;
@@ -9582,12 +9620,78 @@ struct App {
       SDL_CaptureMouse(mouseGrab ? SDL_TRUE : SDL_FALSE);
   }
 
+  void closeFallbackJoystick() {
+    if (fallbackJoystick) {
+      SDL_JoystickClose(fallbackJoystick);
+      fallbackJoystick = nullptr;
+    }
+  }
+
+  void closeGameController() {
+    if (gameController) {
+      SDL_GameControllerClose(gameController);
+      gameController = nullptr;
+    }
+  }
+
+  void openFirstAvailablePad() {
+    if (gameController || fallbackJoystick)
+      return;
+    const int n = SDL_NumJoysticks();
+    for (int ji = 0; ji < n; ++ji) {
+      if (!SDL_IsGameController(ji))
+        continue;
+      gameController = SDL_GameControllerOpen(ji);
+      if (gameController) {
+        std::cerr << "[input] GameController: " << SDL_GameControllerName(gameController) << "\n";
+        return;
+      }
+    }
+    for (int ji = 0; ji < n; ++ji) {
+      if (SDL_IsGameController(ji))
+        continue;
+      fallbackJoystick = SDL_JoystickOpen(ji);
+      if (fallbackJoystick) {
+        std::cerr << "[input] Joystick fallback: " << SDL_JoystickName(fallbackJoystick) << " (axes="
+                  << SDL_JoystickNumAxes(fallbackJoystick) << ", buttons="
+                  << SDL_JoystickNumButtons(fallbackJoystick) << ", hats="
+                  << SDL_JoystickNumHats(fallbackJoystick) << ")\n";
+        return;
+      }
+    }
+  }
+
+  bool eventMatchesFallbackJoystick(const SDL_Event& e) const {
+    if (!fallbackJoystick)
+      return false;
+    const SDL_JoystickID want = SDL_JoystickInstanceID(fallbackJoystick);
+    if (e.type == SDL_JOYBUTTONDOWN || e.type == SDL_JOYBUTTONUP)
+      return e.jbutton.which == want;
+    if (e.type == SDL_JOYAXISMOTION)
+      return e.jaxis.which == want;
+    if (e.type == SDL_JOYHATMOTION)
+      return e.jhat.which == want;
+    if (e.type == SDL_JOYDEVICEREMOVED)
+      return e.jdevice.which == want;
+    return false;
+  }
+
+  int mappedPadButtonDown(const SDL_Event& e) const {
+    if (e.type == SDL_CONTROLLERBUTTONDOWN)
+      return static_cast<int>(e.cbutton.button);
+    if (e.type == SDL_JOYBUTTONDOWN && eventMatchesFallbackJoystick(e))
+      return joystickButtonToControllerButton(e.jbutton.button);
+    return -1;
+  }
+
   void initWindow() {
     if (!std::getenv("VULKAN_GAME_MOUSE_WARP_OFF"))
       SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_MODE_WARP, "1");
     SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER) != 0)
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER) != 0)
       throw std::runtime_error(std::string("SDL_Init: ") + SDL_GetError());
+    SDL_GameControllerEventState(SDL_ENABLE);
+    SDL_JoystickEventState(SDL_ENABLE);
     if (char* base = SDL_GetBasePath()) {
       // Shortcuts often start with cwd outside the install folder; match legacy behavior.
       std::error_code ec;
@@ -9614,13 +9718,7 @@ struct App {
       std::cerr << "[vulkan_game] Windowed mode (VULKAN_GAME_WINDOWED). Omit for fullscreen desktop.\n";
     SDL_Vulkan_GetDrawableSize(window, &winW, &winH);
     SDL_RaiseWindow(window);
-    for (int ji = 0; ji < SDL_NumJoysticks(); ++ji) {
-      if (SDL_IsGameController(ji)) {
-        gameController = SDL_GameControllerOpen(ji);
-        if (gameController)
-          break;
-      }
-    }
+    openFirstAvailablePad();
     migrateLegacySaveIfNeeded();
     refreshTitleMenuContinueState();
     syncInputGrab();
@@ -15190,22 +15288,44 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_RESIZED)
       framebufferResized = true;
     if (e.type == SDL_CONTROLLERDEVICEADDED) {
-      if (!gameController && SDL_IsGameController(e.cdevice.which))
+      if (!gameController && SDL_IsGameController(e.cdevice.which)) {
+        closeFallbackJoystick();
         gameController = SDL_GameControllerOpen(e.cdevice.which);
+        if (gameController)
+          std::cerr << "[input] GameController connected: " << SDL_GameControllerName(gameController) << "\n";
+      }
       return;
     }
     if (e.type == SDL_CONTROLLERDEVICEREMOVED) {
       if (gameController) {
         SDL_Joystick* j = SDL_GameControllerGetJoystick(gameController);
         if (j && SDL_JoystickInstanceID(j) == static_cast<SDL_JoystickID>(e.cdevice.which)) {
-          SDL_GameControllerClose(gameController);
-          gameController = nullptr;
+          closeGameController();
+          openFirstAvailablePad();
         }
       }
       return;
     }
+    if (e.type == SDL_JOYDEVICEADDED) {
+      if (!gameController && !fallbackJoystick && !SDL_IsGameController(e.jdevice.which)) {
+        fallbackJoystick = SDL_JoystickOpen(e.jdevice.which);
+        if (fallbackJoystick) {
+          std::cerr << "[input] Joystick fallback connected: " << SDL_JoystickName(fallbackJoystick) << " (axes="
+                    << SDL_JoystickNumAxes(fallbackJoystick) << ", buttons="
+                    << SDL_JoystickNumButtons(fallbackJoystick) << ", hats="
+                    << SDL_JoystickNumHats(fallbackJoystick) << ")\n";
+        }
+      }
+      return;
+    }
+    if (e.type == SDL_JOYDEVICEREMOVED && eventMatchesFallbackJoystick(e)) {
+      closeFallbackJoystick();
+      openFirstAvailablePad();
+      return;
+    }
     if (inLoadingScreen)
       return;
+    const int padButtonDown = mappedPadButtonDown(e);
     if (e.type == SDL_TEXTINPUT && showPauseMenu && pauseMenuMpIpFocused) {
       for (const char* p = e.text.text; *p; ++p) {
         const unsigned char uc = static_cast<unsigned char>(*p);
@@ -15294,8 +15414,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       return;
     }
     if (inIntroSplash && (e.type == SDL_KEYDOWN || e.type == SDL_MOUSEBUTTONDOWN ||
-                          (e.type == SDL_CONTROLLERBUTTONDOWN &&
-                           e.cbutton.button == SDL_CONTROLLER_BUTTON_A))) {
+                          padButtonDown == SDL_CONTROLLER_BUTTON_A)) {
       inIntroSplash = false;
       inTitleMenu = true;
       titleMenuSceneTime = 0.f;
@@ -15312,8 +15431,8 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       syncInputGrab();
       return;
     }
-    if (e.type == SDL_CONTROLLERBUTTONDOWN && showControlsOverlay &&
-        (e.cbutton.button == SDL_CONTROLLER_BUTTON_A || e.cbutton.button == SDL_CONTROLLER_BUTTON_B)) {
+    if (showControlsOverlay &&
+        (padButtonDown == SDL_CONTROLLER_BUTTON_A || padButtonDown == SDL_CONTROLLER_BUTTON_B)) {
       showControlsOverlay = false;
       audioSetStoreDayNightCyclePaused(false);
       mouseGrab = true;
@@ -15329,7 +15448,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       if (tryHandleMenuClick(ndcX, ndcY, e.button.button))
         return;
     }
-    if (e.type == SDL_CONTROLLERBUTTONDOWN && e.cbutton.button == SDL_CONTROLLER_BUTTON_BACK &&
+    if (padButtonDown == SDL_CONTROLLER_BUTTON_BACK &&
         !inTitleMenu && !showControlsOverlay && !playerDeathShowMenu && !inIntroSplash &&
         !inLoadingScreen && !playerDeathActive && !showPauseMenu) {
       showInventoryMenu = !showInventoryMenu;
@@ -15344,7 +15463,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       syncInputGrab();
       return;
     }
-    if (e.type == SDL_CONTROLLERBUTTONDOWN && e.cbutton.button == SDL_CONTROLLER_BUTTON_START) {
+    if (padButtonDown == SDL_CONTROLLER_BUTTON_START) {
       if (showControlsOverlay) {
         showControlsOverlay = false;
         audioSetStoreDayNightCyclePaused(false);
@@ -15396,7 +15515,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
           !showInventoryMenu && !inTitleMenu)
         pendingSlideCrouchEdge = true;
     }
-    if (e.type == SDL_CONTROLLERBUTTONDOWN && e.cbutton.button == SDL_CONTROLLER_BUTTON_B &&
+    if (padButtonDown == SDL_CONTROLLER_BUTTON_B &&
         !playerDeathActive && !showPauseMenu && !showInventoryMenu && !inTitleMenu)
       pendingSlideCrouchEdge = true;
     if (e.type == SDL_KEYUP) {
@@ -19504,6 +19623,9 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     bool gpB = false;
     bool gpYBtn = false;
     bool gpSprintHeldPad = false;
+    bool gpRtHeldPad = false;
+    bool gpRbHeldPad = false;
+    bool gpRStickHeldPad = false;
     if (gameController) {
       gpA = SDL_GameControllerGetButton(gameController, SDL_CONTROLLER_BUTTON_A) != 0;
       gpB = SDL_GameControllerGetButton(gameController, SDL_CONTROLLER_BUTTON_B) != 0;
@@ -19511,16 +19633,53 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       gpSprintHeldPad =
           SDL_GameControllerGetButton(gameController, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0 ||
           SDL_GameControllerGetAxis(gameController, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 12000;
+      gpRtHeldPad = SDL_GameControllerGetAxis(gameController, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 10000;
+      gpRbHeldPad = SDL_GameControllerGetButton(gameController, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) != 0;
+      gpRStickHeldPad = SDL_GameControllerGetButton(gameController, SDL_CONTROLLER_BUTTON_RIGHTSTICK) != 0;
       Sint16 lax = SDL_GameControllerGetAxis(gameController, SDL_CONTROLLER_AXIS_LEFTX);
       Sint16 lay = SDL_GameControllerGetAxis(gameController, SDL_CONTROLLER_AXIS_LEFTY);
-      gpLX = lax / 32768.f;
-      gpLY = lay / 32768.f;
+      gpLX = gamepadAxisToUnit(lax);
+      gpLY = gamepadAxisToUnit(lay);
       gamepadRadialDeadzone(gpLX, gpLY, 0.15f);
       Sint16 rax = SDL_GameControllerGetAxis(gameController, SDL_CONTROLLER_AXIS_RIGHTX);
       Sint16 ray = SDL_GameControllerGetAxis(gameController, SDL_CONTROLLER_AXIS_RIGHTY);
-      gpRX = rax / 32768.f;
-      gpRY = ray / 32768.f;
+      gpRX = gamepadAxisToUnit(rax);
+      gpRY = gamepadAxisToUnit(ray);
       gamepadRadialDeadzone(gpRX, gpRY, 0.15f);
+    } else if (fallbackJoystick) {
+      const int axes = SDL_JoystickNumAxes(fallbackJoystick);
+      const int buttons = SDL_JoystickNumButtons(fallbackJoystick);
+      const auto joyButton = [this, buttons](int idx) -> bool {
+        return idx >= 0 && idx < buttons && SDL_JoystickGetButton(fallbackJoystick, idx) != 0;
+      };
+      gpA = joyButton(0);
+      gpB = joyButton(1);
+      gpYBtn = joyButton(3);
+      gpSprintHeldPad = joyButton(4) || (axes > 4 && SDL_JoystickGetAxis(fallbackJoystick, 4) > 12000);
+      gpRtHeldPad = axes > 5 && SDL_JoystickGetAxis(fallbackJoystick, 5) > 10000;
+      gpRbHeldPad = joyButton(5);
+      gpRStickHeldPad = joyButton(9);
+      if (axes > 0)
+        gpLX = gamepadAxisToUnit(SDL_JoystickGetAxis(fallbackJoystick, 0));
+      if (axes > 1)
+        gpLY = gamepadAxisToUnit(SDL_JoystickGetAxis(fallbackJoystick, 1));
+      gamepadRadialDeadzone(gpLX, gpLY, 0.15f);
+      if (axes > 2)
+        gpRX = gamepadAxisToUnit(SDL_JoystickGetAxis(fallbackJoystick, 2));
+      if (axes > 3)
+        gpRY = gamepadAxisToUnit(SDL_JoystickGetAxis(fallbackJoystick, 3));
+      gamepadRadialDeadzone(gpRX, gpRY, 0.15f);
+      if (SDL_JoystickNumHats(fallbackJoystick) > 0) {
+        const Uint8 hat = SDL_JoystickGetHat(fallbackJoystick, 0);
+        if (hat & SDL_HAT_LEFT)
+          gpLX = -1.f;
+        else if (hat & SDL_HAT_RIGHT)
+          gpLX = 1.f;
+        if (hat & SDL_HAT_UP)
+          gpLY = -1.f;
+        else if (hat & SDL_HAT_DOWN)
+          gpLY = 1.f;
+      }
     }
 
     const auto down = [keys, this, gpA, gpB, gpYBtn, gpSprintHeldPad](SDL_Scancode sc) -> bool {
@@ -19550,22 +19709,19 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       return down(sc);
     };
 
-    if (gameController && !showControlsOverlay && !showPauseMenu && !showInventoryMenu && !inTitleMenu &&
+    if ((gameController || fallbackJoystick) && !showControlsOverlay && !showPauseMenu && !showInventoryMenu && !inTitleMenu &&
         !playerDeathActive) {
-      const Sint16 rtAx = SDL_GameControllerGetAxis(gameController, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
-      const bool rtHeld = rtAx > 10000;
+      const bool rtHeld = gpRtHeldPad;
       if (rtHeld && !gpRtPickupHeldPrev)
         (void)tryPickupNearestDeliPizzaSlice();
       gpRtPickupHeldPrev = rtHeld;
 
-      const bool rbHeld =
-          SDL_GameControllerGetButton(gameController, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) != 0;
+      const bool rbHeld = gpRbHeldPad;
       if (mouseGrab && rbHeld && !gpRbShoveHeldPrev)
         pendingStaffShoveLmb = true;
       gpRbShoveHeldPrev = rbHeld;
 
-      const bool rstickHeld =
-          SDL_GameControllerGetButton(gameController, SDL_CONTROLLER_BUTTON_RIGHTSTICK) != 0;
+      const bool rstickHeld = gpRStickHeldPad;
       if (mouseGrab && rstickHeld && !gpRStickKickHeldPrev)
         pendingPlayerKick = true;
       gpRStickKickHeldPrev = rstickHeld;
@@ -19582,7 +19738,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
         !inTitleMenu) {
       yaw += static_cast<float>(mx) * sens;
       pitch -= static_cast<float>(my) * sens;
-      if (gameController && (std::fabs(gpRX) > 1e-5f || std::fabs(gpRY) > 1e-5f)) {
+      if ((gameController || fallbackJoystick) && (std::fabs(gpRX) > 1e-5f || std::fabs(gpRY) > 1e-5f)) {
         constexpr float kGpYawRadPerSec = 2.65f;
         constexpr float kGpPitchRadPerSec = 2.15f;
         yaw += gpRX * kGpYawRadPerSec * dt;
@@ -21849,10 +22005,8 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       SDL_DestroyWindow(window);
       window = nullptr;
     }
-    if (gameController) {
-      SDL_GameControllerClose(gameController);
-      gameController = nullptr;
-    }
+    closeGameController();
+    closeFallbackJoystick();
     IMG_Quit();
     SDL_Quit();
   }
@@ -21908,6 +22062,17 @@ int main(int argc, char** argv) {
     app.shutdown();
   } catch (const std::exception& ex) {
     std::cerr << "Error: " << ex.what() << '\n';
+#if defined(_WIN32)
+    // Explorer shortcuts often run without a console; surface the reason for "won't start".
+    MessageBoxA(nullptr, ex.what(), "retro ikea - startup failed", MB_OK | MB_ICONERROR);
+#endif
+    return 1;
+  } catch (...) {
+    std::cerr << "Error: unknown exception during startup\n";
+#if defined(_WIN32)
+    MessageBoxA(nullptr, "Unknown error during startup.", "retro ikea - startup failed",
+                MB_OK | MB_ICONERROR);
+#endif
     return 1;
   }
   return 0;

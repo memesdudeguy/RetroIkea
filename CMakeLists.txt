@@ -214,6 +214,21 @@ if(OpenSSL_FOUND)
   target_compile_definitions(vulkan_game PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
 endif()
 
+# Public lobby origin. Leave empty by default so stale/broken deployments do not show "Lobby HTTP 404";
+# set RETRO_IKEA_LOBBY_URL at runtime or configure -DRETRO_IKEA_DEFAULT_LOBBY_URL=https://your-service.
+set(RETRO_IKEA_DEFAULT_LOBBY_URL ""
+    CACHE STRING "HTTPS lobby origin when RETRO_IKEA_LOBBY_URL env is unset (no trailing slash); empty disables")
+if(NOT RETRO_IKEA_DEFAULT_LOBBY_URL STREQUAL "")
+  target_compile_definitions(vulkan_game PRIVATE
+    "RETRO_IKEA_DEFAULT_LOBBY_URL=\"${RETRO_IKEA_DEFAULT_LOBBY_URL}\"")
+endif()
+
+# MinGW OpenSSL runtime DLLs (required next to RetroIkea.exe when CPPHTTPLIB_OPENSSL_SUPPORT is on).
+set(VULKAN_GAME_MINGW_OPENSSL_SSL_DLL "" CACHE FILEPATH
+    "MinGW: path to libssl *.dll to bundle (optional if found under /usr/x86_64-w64-mingw32/bin)")
+set(VULKAN_GAME_MINGW_OPENSSL_CRYPTO_DLL "" CACHE FILEPATH
+    "MinGW: path to libcrypto *.dll to bundle (optional if found under /usr/x86_64-w64-mingw32/bin)")
+
 # All shipped art/audio under vulkan_game/assets/ (see assets/models, assets/audio, assets/textures).
 # Prefer compressed loop when present (see scripts/shrink_audio_assets.sh); else ship WAV.
 if(EXISTS "${VULKAN_GAME_ASSETS_SOURCE_DIR}/audio/store_ambient_loop.mp3")
@@ -704,17 +719,46 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING AND EXISTS "/us
       $<TARGET_FILE_DIR:vulkan_game>
     COMMENT "Copy libjpeg for SDL_image JPG")
 endif()
-# Lobby HTTPS (cpp-httplib + OpenSSL): loader needs these next to RetroIkea.exe on Windows.
-# Copy whenever MinGW OpenSSL DLLs exist (do not gate on OpenSSL_FOUND — stale cache could skip).
-if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING AND
-    EXISTS "/usr/x86_64-w64-mingw32/bin/libssl-3-x64.dll" AND
-    EXISTS "/usr/x86_64-w64-mingw32/bin/libcrypto-3-x64.dll")
-  add_custom_command(TARGET vulkan_game POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-      /usr/x86_64-w64-mingw32/bin/libssl-3-x64.dll
-      /usr/x86_64-w64-mingw32/bin/libcrypto-3-x64.dll
-      $<TARGET_FILE_DIR:vulkan_game>
-    COMMENT "Copy OpenSSL DLLs for HTTPS lobby client")
+# Lobby HTTPS (cpp-httplib + OpenSSL): DLLs must sit next to RetroIkea.exe (Wine loads them like Windows).
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING AND OpenSSL_FOUND)
+  set(_vk_mingw_ssl "")
+  set(_vk_mingw_crypto "")
+  if(VULKAN_GAME_MINGW_OPENSSL_SSL_DLL AND VULKAN_GAME_MINGW_OPENSSL_CRYPTO_DLL)
+    set(_vk_mingw_ssl "${VULKAN_GAME_MINGW_OPENSSL_SSL_DLL}")
+    set(_vk_mingw_crypto "${VULKAN_GAME_MINGW_OPENSSL_CRYPTO_DLL}")
+  else()
+    set(_vk_openssl_pairs
+      "/usr/x86_64-w64-mingw32/bin/libssl-3-x64.dll:/usr/x86_64-w64-mingw32/bin/libcrypto-3-x64.dll"
+      "/usr/x86_64-w64-mingw32/bin/libssl-3.dll:/usr/x86_64-w64-mingw32/bin/libcrypto-3.dll")
+    foreach(_vk_pair IN LISTS _vk_openssl_pairs)
+      string(REPLACE ":" ";" _vk_ab "${_vk_pair}")
+      list(GET _vk_ab 0 _vk_s)
+      list(GET _vk_ab 1 _vk_c)
+      if(EXISTS "${_vk_s}" AND EXISTS "${_vk_c}")
+        set(_vk_mingw_ssl "${_vk_s}")
+        set(_vk_mingw_crypto "${_vk_c}")
+        break()
+      endif()
+    endforeach()
+  endif()
+  if(_vk_mingw_ssl AND _vk_mingw_crypto)
+    message(STATUS "vulkan_game: bundling OpenSSL DLLs: ${_vk_mingw_ssl} ${_vk_mingw_crypto}")
+    # Always install as libssl-3-x64.dll / libcrypto-3-x64.dll (PE basename the exe imports + Inno lists).
+    add_custom_command(TARGET vulkan_game POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${_vk_mingw_ssl}"
+        $<TARGET_FILE_DIR:vulkan_game>/libssl-3-x64.dll
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${_vk_mingw_crypto}"
+        $<TARGET_FILE_DIR:vulkan_game>/libcrypto-3-x64.dll
+      COMMENT "Copy OpenSSL DLLs for HTTPS lobby client")
+  else()
+    message(FATAL_ERROR
+      "Windows cross-build links OpenSSL but MinGW OpenSSL DLLs were not found.\n"
+      "Install mingw-w64 OpenSSL for your distro (DLLs in /usr/x86_64-w64-mingw32/bin/), or set\n"
+      "  -DVULKAN_GAME_MINGW_OPENSSL_SSL_DLL=/path/to/libssl-*.dll\n"
+      "  -DVULKAN_GAME_MINGW_OPENSSL_CRYPTO_DLL=/path/to/libcrypto-*.dll")
+  endif()
 endif()
 
 # MinGW default: embed libgcc/libstdc++/winpthread. VULKAN_GAME_WINDOWS_ALL_DYNAMIC ships those DLLs instead.

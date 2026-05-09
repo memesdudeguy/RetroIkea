@@ -69,10 +69,13 @@ Notes
 - SDL2_image loads PNG/JPEG via zlib/libpng/libjpeg DLLs next to RetroIkea.exe (CMake copies them
   from the MinGW sysroot into build-win-mingw/; Inno Setup lists them in windows_setup.iss).
   Without them, UI PNGs fall back to solid blue placeholders.
-- **OpenSSL:** If the game exits immediately on launch (no window), the HTTPS lobby client may be
-  missing **libssl** / **libcrypto** DLLs next to RetroIkea.exe. CMake copies `libssl-3-x64.dll` and
-  `libcrypto-3-x64.dll` from the MinGW sysroot when OpenSSL is enabled; rebuild and reinstall, or
-  copy those two DLLs next to the exe manually.
+- **OpenSSL:** The exe imports **libssl-3-x64.dll** / **libcrypto-3-x64.dll** next to RetroIkea.exe.
+  CMake copies them from MinGW (or paths you set with `VULKAN_GAME_MINGW_OPENSSL_SSL_DLL` /
+  `VULKAN_GAME_MINGW_OPENSSL_CRYPTO_DLL`) and renames the install names to `libssl-3-x64.dll` /
+  `libcrypto-3-x64.dll`. The Inno script **requires** those two files under `build-win-mingw/` so the
+  installer cannot silently omit them. **Wine:** if an older install is missing them, copy those DLLs
+  from `/usr/x86_64-w64-mingw32/bin/` into `~/.wine/drive_c/Program Files/retro ikea/` (same folder as
+  the exe), then rebuild the installer from a clean CMake configure + build.
 
 Fully dynamic Windows cross-build (optional)
 -------------------------------------------
@@ -108,3 +111,31 @@ Vulkan loader (vulkan-1.dll)
   found”, copy vulkan-1.dll from your Wine prefix, e.g.
   ~/.wine/drive_c/windows/system32/vulkan-1.dll, into the same folder as
   RetroIkea.exe for testing only.
+
+Running the installer under Wine (Linux)
+------------------------------------------
+The setup exe is **64-bit**. Use a **64-bit Wine prefix** (common failure mode is running it in a
+pure 32-bit prefix):
+
+  WINEARCH=win64 WINEPREFIX="$HOME/.wine-retroikea" wineboot --init
+  wine64 "$HOME/Downloads/RetroIkea-Beta-Setup.exe"
+
+Silent install into the default location:
+
+  wine64 RetroIkea-Beta-Setup.exe /VERYSILENT /SUPPRESSMSGBOXES
+
+The Inno script sets **CloseApplications=no** and **WizardStyle=classic** so the Windows Restart
+Manager and Win11-style wizard do not trip Wine. Headless machines still need a display or virtual
+framebuffer for the GUI wizard unless you use `/SILENT` flags.
+
+“Game won’t start” / instant exit (Windows)
+-----------------------------------------
+1. **After Beta 4 rebuild:** startup failures show a **message box** with the error text (e.g.
+   `no Vulkan GPU`, `SDL_Init`, missing DLL). Double‑click the exe again after updating.
+2. **Vulkan:** Install/update the GPU vendor driver (NVIDIA/AMD/Intel). This game needs a working
+   Vulkan 1.1+ stack (`vulkan-1.dll` normally comes from the driver).
+3. **Missing DLL next to RetroIkea.exe:** From the same folder, open PowerShell or Command Prompt and run:
+   `RetroIkea.exe` — Windows may print which DLL failed to load. Ensure **libssl-3-x64.dll** and
+   **libcrypto-3-x64.dll** are in that folder (CMake POST_BUILD + installer copy them from MinGW when present).
+4. **Assets:** The installer lays out `{install}\assets\` beside `RetroIkea.exe`. If files were moved by hand,
+   keep that layout or reinstall.

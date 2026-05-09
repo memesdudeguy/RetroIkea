@@ -16,6 +16,16 @@ struct UrlParts {
   int port = 80;
 };
 
+static std::string describeLobbyRequest(const UrlParts& u, const char* path) {
+  std::string s = u.tls ? "https://" : "http://";
+  s += u.host;
+  const bool defaultPort = (u.tls && u.port == 443) || (!u.tls && u.port == 80);
+  if (!defaultPort)
+    s += ":" + std::to_string(u.port);
+  s += path ? path : "/";
+  return s;
+}
+
 static bool parseLobbyOrigin(const char* raw, UrlParts& out, std::string& err) {
   out = UrlParts{};
   if (!raw || raw[0] == '\0') {
@@ -79,7 +89,9 @@ static bool httplibGet(const UrlParts& u, const char* path, std::string& bodyOut
       return false;
     }
     if (res->status < 200 || res->status >= 300) {
-      err = "Lobby HTTP " + std::to_string(res->status);
+      err = "Lobby HTTP " + std::to_string(res->status) + " at " + describeLobbyRequest(u, path);
+      if (res->status == 404)
+        err += " (wrong lobby URL or deploy)";
       return false;
     }
     bodyOut = res->body;
@@ -100,7 +112,9 @@ static bool httplibGet(const UrlParts& u, const char* path, std::string& bodyOut
     return false;
   }
   if (res->status < 200 || res->status >= 300) {
-    err = "Lobby HTTP " + std::to_string(res->status);
+    err = "Lobby HTTP " + std::to_string(res->status) + " at " + describeLobbyRequest(u, path);
+    if (res->status == 404)
+      err += " (wrong lobby URL or deploy)";
     return false;
   }
   bodyOut = res->body;
@@ -121,7 +135,9 @@ static bool httplibPostJson(const UrlParts& u, const char* path, const std::stri
       return false;
     }
     if (res->status < 200 || res->status >= 300) {
-      err = "Lobby HTTP " + std::to_string(res->status);
+      err = "Lobby HTTP " + std::to_string(res->status) + " at " + describeLobbyRequest(u, path);
+      if (res->status == 404)
+        err += " (wrong lobby URL or deploy)";
       return false;
     }
     return true;
@@ -142,23 +158,39 @@ static bool httplibPostJson(const UrlParts& u, const char* path, const std::stri
     return false;
   }
   if (res->status < 200 || res->status >= 300) {
-    err = "Lobby HTTP " + std::to_string(res->status);
+    err = "Lobby HTTP " + std::to_string(res->status) + " at " + describeLobbyRequest(u, path);
+    if (res->status == 404)
+      err += " (wrong lobby URL or deploy)";
     return false;
   }
   return true;
 }
 
 static bool extractJsonStringField(const std::string& obj, const char* key, std::string& out) {
-  const std::string pat = std::string("\"") + key + "\":\"";
+  // FastAPI / Python json.dumps uses spaces: "host": "1.2.3.4" — not "host":"1.2.3.4"
+  const std::string pat = std::string("\"") + key + "\":";
   size_t p = obj.find(pat);
   if (p == std::string::npos)
     return false;
   p += pat.size();
-  size_t e = obj.find('"', p);
-  if (e == std::string::npos)
+  while (p < obj.size() && std::isspace(static_cast<unsigned char>(obj[p])))
+    ++p;
+  if (p >= obj.size() || obj[p] != '"')
     return false;
-  out.assign(obj, p, e - p);
-  return true;
+  ++p;
+  const size_t start = p;
+  while (p < obj.size()) {
+    if (obj[p] == '\\' && p + 1 < obj.size()) {
+      p += 2;
+      continue;
+    }
+    if (obj[p] == '"') {
+      out.assign(obj, start, p - start);
+      return true;
+    }
+    ++p;
+  }
+  return false;
 }
 
 static bool extractJsonIntField(const std::string& obj, const char* key, int& out) {
@@ -212,8 +244,14 @@ static std::vector<std::string> splitTopLevelJsonObjects(const std::string& arrB
 }  // namespace
 
 const char* lobbyEnvUrl() {
-  const char* e = std::getenv("RETRO_IKEA_LOBBY_URL");
-  return e ? e : "";
+  if (const char* e = std::getenv("RETRO_IKEA_LOBBY_URL"))
+    if (e[0] != '\0')
+      return e;
+#ifdef RETRO_IKEA_DEFAULT_LOBBY_URL
+  return RETRO_IKEA_DEFAULT_LOBBY_URL;
+#else
+  return "";
+#endif
 }
 
 bool lobbyFetchServerList(const char* lobbyBaseUrl, std::vector<LobbyListedServer>& out, std::string& errMsg) {

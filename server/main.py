@@ -5,12 +5,13 @@ Configure TTL via LOBBY_TTL_SEC. Bind via HOST/PORT or let the platform set PORT
 
 from __future__ import annotations
 
+import json
 import os
 import time
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
 
 TTL_SEC = float(os.environ.get("LOBBY_TTL_SEC", "90"))
@@ -68,12 +69,14 @@ def healthz() -> dict[str, str]:
 
 
 @app.get("/api/v1/servers")
-def list_servers() -> list[dict]:
+def list_servers() -> Response:
     _prune()
     out: list[dict] = []
     for sid, v in _sessions.items():
         out.append({"id": sid, "host": v["host"], "port": v["port"], "name": v.get("name", "")})
-    return out
+    # Compact JSON (no spaces) — matches naive C++ field scanner; also smaller on the wire.
+    payload = json.dumps(out, separators=(",", ":"))
+    return Response(content=payload, media_type="application/json")
 
 
 @app.post("/api/v1/servers/register")

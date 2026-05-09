@@ -1,6 +1,6 @@
 # RetroIkea lobby server
 
-In-memory session list with TTL. Game clients set `RETRO_IKEA_LOBBY_URL` to this service’s public origin (no trailing slash), e.g. `https://retro-ikea-lobby.onrender.com`.
+In-memory session list with TTL. Game clients use `RETRO_IKEA_LOBBY_URL`; you can also bake a default at build time with CMake (`-DRETRO_IKEA_DEFAULT_LOBBY_URL=https://your-service.example`). Point both at this service’s public origin with **no trailing slash**.
 
 ## Run locally
 

@@ -51,10 +51,10 @@ Produces `packaging/RetroIkea-Beta-Setup.exe` (installer) that installs `RetroIk
 
 ## Online lobby (browser server list)
 
-The game can list public hosts via a small HTTP API in [`server/`](server/). Set the environment variable **`RETRO_IKEA_LOBBY_URL`** to the deployed service origin with **no trailing slash** (for example `https://retro-ikea-lobby.onrender.com`).
+The game lists public hosts via the HTTP API in [`server/`](server/). Set **`RETRO_IKEA_LOBBY_URL`** to your deployed lobby origin — origin only, **no trailing slash**. Builds intentionally do **not** bake a public default URL unless you configure CMake with `-DRETRO_IKEA_DEFAULT_LOBBY_URL=https://your-service.example`; stale Render URLs otherwise surface as `Lobby HTTP 404`.
 
 - **Run locally:** see [`server/README.md`](server/README.md).
-- **Host on Render:** connect this GitHub repo in [Render](https://render.com) and use **Blueprint** → paste [`render.yaml`](render.yaml) at the repo root, or create a **Web Service** with root directory `server`, build `pip install -r requirements.txt`, start `uvicorn main:app --host 0.0.0.0 --port $PORT`.
+- **Host on Render:** connect this GitHub repo in [Render](https://render.com) and use **Blueprint** → paste [`render.yaml`](render.yaml) at the repo root, or create a **Web Service** with root directory `server`, build `pip install -r requirements.txt`, start `uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1`.
 
 GitHub hosts **source only** for the lobby; the Python process must run on a platform like Render, Railway, or Fly.io.
 

@@ -46,3 +46,4 @@ RB="${ROOT//\//\\}"
 # (same as /home/.../RetroIkea/assets when Z: is the Linux root).
 wine "$ISCC" "/DRetroIkeaRepoRoot=Z:${RB}" "Z:${RB}\\packaging\\windows_setup.iss"
 ls -lh "$ROOT/packaging/RetroIkea-Beta-Setup.exe"
+echo "On Linux, install/run that setup with a 64-bit Wine prefix: wine64 \"$ROOT/packaging/RetroIkea-Beta-Setup.exe\""
