@@ -274,3 +274,8 @@ struct RetroMpSession {
 };
 
 double retroMpMonotonicSec();
+
+// Best IP to publish to a public lobby: WAN check-ip first, then a Tailscale CGNAT (100.64–100.127.x.x)
+// adapter, then any private LAN address. Falls back to fallbackIfEmpty (typically the session's own
+// publicHostUtf8) when none of those probes return anything. Network calls may take ~1-2 seconds.
+bool retroMpResolveLobbyAdvertiseIp(char* out, size_t outCap, const char* fallbackIfEmpty);

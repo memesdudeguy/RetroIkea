@@ -51,12 +51,19 @@ Produces `packaging/RetroIkea-Beta-Setup.exe` (installer) that installs `RetroIk
 
 ## Online lobby (browser server list)
 
-The game lists public hosts via the HTTP API in [`server/`](server/). Set **`RETRO_IKEA_LOBBY_URL`** to your deployed lobby origin — origin only, **no trailing slash**. Builds intentionally do **not** bake a public default URL unless you configure CMake with `-DRETRO_IKEA_DEFAULT_LOBBY_URL=https://your-service.example`; stale Render URLs otherwise surface as `Lobby HTTP 404`.
+Beta builds ship with **`RETRO_IKEA_DEFAULT_LOBBY_URL=https://retro-ikea-lobby.onrender.com`** baked in via CMake, so the title-menu lobby browser is wired to a public WAN endpoint out of the box. The HTTP API itself lives in [`server/`](server/) (FastAPI). Override per-PC with `RETRO_IKEA_LOBBY_URL` or rebuild with `-DRETRO_IKEA_DEFAULT_LOBBY_URL=https://your-fork.example` to point at a fork — origin only, **no trailing slash**.
 
-- **Run locally:** see [`server/README.md`](server/README.md).
-- **Host on Render:** connect this GitHub repo in [Render](https://render.com) and use **Blueprint** → paste [`render.yaml`](render.yaml) at the repo root, or create a **Web Service** with root directory `server`, build `pip install -r requirements.txt`, start `uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1`.
+To bring the public lobby online (one-time, by the project owner):
 
-GitHub hosts **source only** for the lobby; the Python process must run on a platform like Render, Railway, or Fly.io.
+1. Sign in to [Render](https://dashboard.render.com), open **Blueprints**, point it at this repo, and apply [`render.yaml`](render.yaml). The service name must stay **`retro-ikea-lobby`** so the public URL matches the baked-in default.
+2. Wait for the first deploy to finish; visit `https://retro-ikea-lobby.onrender.com/healthz` to confirm a `{"status":"ok"}` response.
+
+After deploy:
+
+- Hosts auto-publish to the lobby the moment they pick "HOST SESSION" (background heartbeat + DELETE on stop).
+- Clients can browse via the title-menu **FIND SESSION** button without setting any env vars.
+- The free Render tier sleeps after 15 min of inactivity. The first refresh after a sleep takes ~30s — the title menu now fetches asynchronously and shows "Lobby waking up (free tier) — press REFRESH again in 30s." while it warms.
+- **Run locally** (LAN testing, no Render needed): see [`server/README.md`](server/README.md).
 
 ## Push this repo to GitHub
 

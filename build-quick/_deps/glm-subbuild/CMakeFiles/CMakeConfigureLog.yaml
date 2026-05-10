@@ -1,0 +1,79 @@
+
+---
+events:
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CMakeDetermineSystem.cmake:12 (find_program)"
+      - "CMakeLists.txt:16 (project)"
+    mode: "program"
+    variable: "CMAKE_UNAME"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: true
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "uname"
+    candidate_directories:
+      - "/opt/devkitpro/devkitPPC/bin/"
+      - "/opt/devkitpro/tools/bin/"
+      - "/home/memesdudeguy/android_translation_layer/tools/"
+      - "/usr/lib/jvm/java-17-openjdk/bin/"
+      - "/usr/local/sbin/"
+      - "/usr/local/bin/"
+      - "/usr/bin/"
+      - "/opt/android-sdk/platform-tools/"
+      - "/opt/android-sdk/tools/"
+      - "/opt/android-sdk/tools/bin/"
+      - "/opt/cxoffice/bin/"
+      - "/var/lib/flatpak/exports/bin/"
+      - "/usr/lib/jvm/default/bin/"
+      - "/usr/bin/site_perl/"
+      - "/usr/bin/vendor_perl/"
+      - "/usr/bin/core_perl/"
+      - "/bin/"
+    searched_directories:
+      - "/opt/devkitpro/devkitPPC/bin/uname"
+      - "/opt/devkitpro/tools/bin/uname"
+      - "/home/memesdudeguy/android_translation_layer/tools/uname"
+      - "/usr/lib/jvm/java-17-openjdk/bin/uname"
+      - "/usr/local/sbin/uname"
+      - "/usr/local/bin/uname"
+    found: "/usr/bin/uname"
+    search_context:
+      ENV{PATH}:
+        - "/opt/devkitpro/devkitPPC/bin"
+        - "/opt/devkitpro/tools/bin"
+        - "/home/memesdudeguy/android_translation_layer/tools"
+        - "/usr/lib/jvm/java-17-openjdk/bin"
+        - "/opt/devkitpro/tools/bin"
+        - "/opt/devkitpro/tools/bin"
+        - "/usr/local/sbin"
+        - "/usr/local/bin"
+        - "/usr/bin"
+        - "/opt/android-sdk/platform-tools"
+        - "/opt/android-sdk/tools"
+        - "/opt/android-sdk/tools/bin"
+        - "/opt/cxoffice/bin"
+        - "/var/lib/flatpak/exports/bin"
+        - "/usr/lib/jvm/default/bin"
+        - "/usr/bin/site_perl"
+        - "/usr/bin/vendor_perl"
+        - "/usr/bin/core_perl"
+        - "/opt/android-sdk/platform-tools"
+        - "/opt/android-sdk/tools"
+        - "/opt/android-sdk/tools/bin"
+        - "/opt/cxoffice/bin"
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CMakeDetermineSystem.cmake:212 (message)"
+      - "CMakeLists.txt:16 (project)"
+    message: |
+      The system is: Linux - 6.19.12-zen1-1-zen - x86_64
+...

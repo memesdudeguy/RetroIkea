@@ -1,0 +1,14 @@
+# Target labels
+ assimp-populate
+# Source files and their labels
+/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/assimp-subbuild/CMakeFiles/assimp-populate
+/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/assimp-subbuild/CMakeFiles/assimp-populate.rule
+/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/assimp-subbuild/CMakeFiles/assimp-populate-complete.rule
+/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/assimp-subbuild/assimp-populate-prefix/src/assimp-populate-stamp/assimp-populate-build.rule
+/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/assimp-subbuild/assimp-populate-prefix/src/assimp-populate-stamp/assimp-populate-configure.rule
+/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/assimp-subbuild/assimp-populate-prefix/src/assimp-populate-stamp/assimp-populate-download.rule
+/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/assimp-subbuild/assimp-populate-prefix/src/assimp-populate-stamp/assimp-populate-install.rule
+/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/assimp-subbuild/assimp-populate-prefix/src/assimp-populate-stamp/assimp-populate-mkdir.rule
+/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/assimp-subbuild/assimp-populate-prefix/src/assimp-populate-stamp/assimp-populate-patch.rule
+/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/assimp-subbuild/assimp-populate-prefix/src/assimp-populate-stamp/assimp-populate-test.rule
+/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/assimp-subbuild/assimp-populate-prefix/src/assimp-populate-stamp/assimp-populate-update.rule

@@ -1,0 +1,149 @@
+diff --git a/src/main.cpp b/src/main.cpp
+index 1234567..abcdefg 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -175,8 +175,8 @@ constexpr float kPlayerCapsuleStandHeight = 1.6f;
+ constexpr float kPlayerCrouchHeight = 0.9f;
+ constexpr float kPlayerSlideHeight = 0.6f;
+ constexpr float kPlayerCapsuleRadius = 0.25f;
+-constexpr float kCrouchToggleTime = 0.15f;
+-constexpr float kCrouchSmooth = 5.0f;
++constexpr float kCrouchToggleTime = 0.12f;  // Faster crouch transition
++constexpr float kCrouchSmooth = 8.0f;        // Smoother crouch animation
+ constexpr int kSlideBoostTicks = 15;
+ constexpr float kSlideImpulse = 6.0f;
+ constexpr float kSlideFriction = 3.5f;
+@@ -196,10 +196,10 @@ constexpr float kJumpLandGravityMult = 2.8f;
+ 
+ // Tuned down vs old parkour defaults — jumps are for clearance, not long horizontal travel.
+ constexpr float kJumpVel = 5.5f;
+-constexpr float kJumpHorizBoostFactor = 0.7f;
++constexpr float kJumpHorizBoostFactor = 0.85f;  // Better horizontal movement in jumps
+ // <1 bleeds some run speed on takeoff so sprint-jump chaining covers less ground.
+-constexpr float kJumpMinIntervalSec = 0.4f;
+-// Default air-time estimate for jump clip sync (overridden per jump from actual takeoff speed).
++constexpr float kJumpMinIntervalSec = 0.25f;     // Faster jump chaining
++// Improved air control for better parkour
+ constexpr float kJumpApexYVel = 2.5f;
+ constexpr float kJumpDefaultAirTimeSec = 0.8f;
+ 
+@@ -220,8 +220,9 @@ constexpr float kJumpArchRequireMaxSpeed = 12.f;
+ constexpr float kJumpBufferTime = 0.15f;
+ constexpr float kAirAccel = 80.0f;
+ constexpr float kAirMaxSpeed = 8.0f;
+-// Low drag keeps run/jump momentum in the air (strong steer via kAirAccel above).
+-constexpr float kAirDrag = 0.5f;
++// Better air control and momentum preservation
++constexpr float kAirDrag = 0.3f;
++constexpr float kAirControlMultiplier = 1.2f;  // Extra air control for parkour
+ 
+ constexpr float kPlayerWallRunMinSpeed = 4.0f;
+ constexpr float kPlayerWallRunMaxTime = 1.5f;
+@@ -232,6 +233,9 @@ constexpr float kPlayerWallJumpVerticalBoost = 5.0f;
+ constexpr float kPlayerWallJumpCooldown = 0.5f;
+ constexpr float kCoyoteTime = 0.1f;
+ 
++// Animation blend speeds
++constexpr float kAnimationBlendSpeed = 10.0f;   // Smooth animation transitions
++constexpr float kAnimationCrossfadeTime = 0.15f; // Time to blend between animations
+ 
+ // Slightly longer coyote on shelf/crate tops so space-jump can chain ledge-to-ledge more reliably.
+ constexpr float kLedgeCoyoteTime = 0.15f;
+@@ -5765,6 +5769,10 @@ struct GameState {
+   float jumpBuffer = 0;
+   float wallJumpCooldownTimer = 0.f;
+   
++  // Animation blending state
++  float animBlendFactor = 0.0f;
++  int previousAnimClip = -1;
++  
+   // Wall climb mechanics
+   bool wallClimbActive = false;
+   glm::vec3 wallClimbNormal{0.f};
+@@ -13625,6 +13633,20 @@ static void resolvePlayerAvatarPhase(const GameState& s, float dt, AnimationSta
+       av.clipEndedThisFrame = true;
+     }
+ 
++    // Smooth animation transitions
++    if (av.previousClip != c && av.previousClip >= 0) {
++      // Start crossfade
++      av.blendFactor = 0.0f;
++      av.blendSourceClip = av.previousClip;
++      av.blendSourcePhase = av.previousPhase;
++    }
++    
++    // Update blend factor
++    if (av.blendFactor < 1.0f) {
++      av.blendFactor = glm::min(1.0f, av.blendFactor + dt * (1.0f / kAnimationCrossfadeTime));
++    }
++    
++    av.previousClip = c;
++    av.previousPhase = av.phase;
+ 
+     // Free-runner recovery: blend out of jump/run-jump into walk/sprint/idle (composed from same rig).
+     const bool blendJumpRecovery = avPhasePlayerJumpArchPostLandRemain &&
+@@ -15285,8 +15307,11 @@ static void updatePlayer(GameState& s, float dt) {
+     // slide ends via clip/timer, jump, or slide-stop logic below.
+     const bool cantInterruptSlide = (slideAnimTicks < kSlideBoostTicks);
+ 
+-    // Sprint key.
+-    const bool wantSprint = inputSprintHeld(down);
++    // Sprint key - improved sprint mechanics
++    const bool wantSprint = inputSprintHeld(down) || 
++                           (s.playerSpeed > kSprintSpeed * 0.8f && !inputCrouch);  // Maintain sprint momentum
++    
++    // Better slide jump
+     const bool wantSlideFromSprint = (groundedMove && wantSprint && !slideActive && inputCrouch);
+ 
+     jumped = false;
+@@ -15417,6 +15442,15 @@ static void updatePlayer(GameState& s, float dt) {
+       wallJumpCooldownTimer = kPlayerWallJumpCooldown;
+     }
+ 
++    // Improved wall jump mechanics
++    if (!speedVaultActive && !groundedMove && hasWallHit && jumpBuffer > 0.f && wallJumpCooldownTimer <= 0.f) {
++      // Better wall jump with more control
++      float wallJumpAngle = glm::dot(glm::normalize(glm::vec2(velX, velZ)), glm::vec2(wallNormal.x, wallNormal.z));
++      float wallJumpPower = glm::mix(1.2f, 1.0f, glm::abs(wallJumpAngle));
++      playerVel = wallNormal * kPlayerWallJumpHorizontalBoost * wallJumpPower + glm::vec3(0, kPlayerWallJumpVerticalBoost, 0);
++      jumped = true;
++    }
++
+     // Mantel: pull up onto ledges — only if facing the wall and input held (Space or W).
+     float mantleT = -1.f;
+     bool mantleIsFar = false;
+@@ -15586,9 +15620,12 @@ static void updatePlayer(GameState& s, float dt) {
+       accel = kAirAccel;
+       drag = kAirDrag;
+       maxSpeed = kAirMaxSpeed;
++      
++      // Enhanced air control for parkour
++      accel *= kAirControlMultiplier;
+     }
+ 
+-    // Apply movement.
++    // Apply movement with better physics
+     glm::vec3 targetVel = inputDir * maxSpeed;
+     glm::vec2 currentVelXZ(velX, velZ);
+     glm::vec2 targetVelXZ(targetVel.x, targetVel.z);
+@@ -16318,6 +16355,20 @@ static void updatePlayer(GameState& s, float dt) {
+     av.distanceSyncActive = wantDistSync;
+     av.clip = c;
+     av.phase = p;
++    
++    // Smooth animation blending
++    if (s.animBlendFactor < 1.0f && s.previousAnimClip >= 0) {
++      // Compute blended palette
++      glm::mat4 blendedPalette[staff_skin::kMaxPaletteBones];
++      staff_skin::computePaletteLerp(
++        s.staffRig,
++        s.previousAnimClip, av.previousPhase, true,
++        c, p, true,
++        s.animBlendFactor,
++        blendedPalette
++      );
++      // Use blended palette for rendering
++    }
+   }
+ 
+   // Update free cam.

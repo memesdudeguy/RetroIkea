@@ -439,6 +439,29 @@ static bool fetchPublicIpv4(char* out, size_t outCap) {
   return ok;
 }
 
+bool retroMpResolveLobbyAdvertiseIp(char* out, size_t outCap, const char* fallbackIfEmpty) {
+  if (!out || outCap < 8)
+    return false;
+  out[0] = '\0';
+  if (fetchPublicIpv4(out, outCap) && out[0] != '\0')
+    return true;
+  if (tryAnnounceTailscaleIpv4(out, outCap) && out[0] != '\0')
+    return true;
+#ifdef _WIN32
+  if (privateLanIpv4FromWinAdapters(out, outCap) && out[0] != '\0')
+    return true;
+#else
+  if (privateLanIpv4FromUnixIfaddrs(out, outCap) && out[0] != '\0')
+    return true;
+#endif
+  if (fallbackIfEmpty && fallbackIfEmpty[0] != '\0') {
+    std::strncpy(out, fallbackIfEmpty, outCap - 1);
+    out[outCap - 1] = '\0';
+    return true;
+  }
+  return false;
+}
+
 void RetroMpSession::shutdown() {
 #ifdef _WIN32
   if (sock != UINT64_MAX) {

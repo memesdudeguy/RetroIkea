@@ -1,0 +1,340 @@
+libreactphysics3d.so.0.10.0: \
+  /usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/crti.o \
+  /usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/crtbeginS.o \
+  CMakeFiles/reactphysics3d.dir/src/body/Body.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/body/RigidBody.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/broadphase/DynamicAABBTree.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/narrowphase/CollisionDispatch.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/narrowphase/GJK/VoronoiSimplex.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/narrowphase/GJK/GJKAlgorithm.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/narrowphase/SAT/SATAlgorithm.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/narrowphase/SphereVsSphereAlgorithm.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/narrowphase/CapsuleVsCapsuleAlgorithm.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/narrowphase/SphereVsCapsuleAlgorithm.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/narrowphase/SphereVsConvexPolyhedronAlgorithm.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/narrowphase/CapsuleVsConvexPolyhedronAlgorithm.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/narrowphase/ConvexPolyhedronVsConvexPolyhedronAlgorithm.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/narrowphase/NarrowPhaseInput.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/narrowphase/NarrowPhaseInfoBatch.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/shapes/AABB.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/shapes/ConvexShape.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/shapes/ConvexPolyhedronShape.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/shapes/ConcaveShape.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/shapes/BoxShape.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/shapes/CapsuleShape.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/shapes/CollisionShape.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/shapes/ConvexMeshShape.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/shapes/SphereShape.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/shapes/TriangleShape.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/shapes/ConcaveMeshShape.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/shapes/HeightFieldShape.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/RaycastInfo.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/Collider.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/TriangleVertexArray.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/PolygonVertexArray.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/VertexArray.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/TriangleMesh.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/HeightField.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/ConvexMesh.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/HalfEdgeStructure.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/ContactManifold.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/constraint/BallAndSocketJoint.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/constraint/ContactPoint.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/constraint/FixedJoint.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/constraint/HingeJoint.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/constraint/Joint.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/constraint/SliderJoint.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/engine/PhysicsCommon.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/systems/ConstraintSolverSystem.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/systems/ContactSolverSystem.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/systems/DynamicsSystem.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/systems/CollisionDetectionSystem.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/systems/SolveBallAndSocketJointSystem.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/systems/SolveFixedJointSystem.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/systems/SolveHingeJointSystem.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/systems/SolveSliderJointSystem.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/engine/PhysicsWorld.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/engine/Island.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/engine/Material.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/engine/OverlappingPairs.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/engine/Entity.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/engine/EntityManager.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/systems/BroadPhaseSystem.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/components/Components.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/components/BodyComponents.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/components/RigidBodyComponents.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/components/TransformComponents.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/components/ColliderComponents.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/components/JointComponents.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/components/BallAndSocketJointComponents.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/components/FixedJointComponents.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/components/HingeJointComponents.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/components/SliderJointComponents.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/CollisionCallback.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/collision/OverlapCallback.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/mathematics/Matrix2x2.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/mathematics/Matrix3x3.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/mathematics/Quaternion.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/mathematics/Transform.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/mathematics/Vector2.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/mathematics/Vector3.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/memory/PoolAllocator.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/memory/SingleFrameAllocator.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/memory/HeapAllocator.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/memory/MemoryManager.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/memory/MemoryAllocator.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/utils/Profiler.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/utils/DefaultLogger.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/utils/DebugRenderer.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/utils/quickhull/QuickHull.cpp.o \
+  CMakeFiles/reactphysics3d.dir/src/utils/quickhull/QHHalfEdgeStructure.cpp.o \
+  /usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libstdc++.so \
+  /usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libm.so \
+  /usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libm.so \
+  /usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libm.so \
+  /usr/lib/libm.so.6 \
+  /usr/lib/libmvec.so.1 \
+  /usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libgcc_s.so \
+  /usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libgcc_s.so \
+  /usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libgcc_s.so \
+  /usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libgcc_s.so.1 \
+  /usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/libgcc.a \
+  /usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libc.so \
+  /usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libc.so \
+  /usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libc.so \
+  /usr/lib/libc.so.6 \
+  /usr/lib/libc_nonshared.a \
+  /usr/lib/ld-linux-x86-64.so.2 \
+  /usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libgcc_s.so \
+  /usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libgcc_s.so \
+  /usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libgcc_s.so \
+  /usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libgcc_s.so.1 \
+  /usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/libgcc.a \
+  /usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/crtendS.o \
+  /usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/crtn.o
+
+/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/crti.o:
+
+/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/crtbeginS.o:
+
+CMakeFiles/reactphysics3d.dir/src/body/Body.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/body/RigidBody.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/broadphase/DynamicAABBTree.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/narrowphase/CollisionDispatch.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/narrowphase/GJK/VoronoiSimplex.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/narrowphase/GJK/GJKAlgorithm.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/narrowphase/SAT/SATAlgorithm.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/narrowphase/SphereVsSphereAlgorithm.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/narrowphase/CapsuleVsCapsuleAlgorithm.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/narrowphase/SphereVsCapsuleAlgorithm.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/narrowphase/SphereVsConvexPolyhedronAlgorithm.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/narrowphase/CapsuleVsConvexPolyhedronAlgorithm.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/narrowphase/ConvexPolyhedronVsConvexPolyhedronAlgorithm.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/narrowphase/NarrowPhaseInput.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/narrowphase/NarrowPhaseInfoBatch.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/shapes/AABB.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/shapes/ConvexShape.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/shapes/ConvexPolyhedronShape.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/shapes/ConcaveShape.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/shapes/BoxShape.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/shapes/CapsuleShape.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/shapes/CollisionShape.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/shapes/ConvexMeshShape.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/shapes/SphereShape.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/shapes/TriangleShape.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/shapes/ConcaveMeshShape.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/shapes/HeightFieldShape.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/RaycastInfo.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/Collider.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/TriangleVertexArray.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/PolygonVertexArray.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/VertexArray.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/TriangleMesh.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/HeightField.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/ConvexMesh.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/HalfEdgeStructure.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/ContactManifold.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/constraint/BallAndSocketJoint.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/constraint/ContactPoint.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/constraint/FixedJoint.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/constraint/HingeJoint.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/constraint/Joint.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/constraint/SliderJoint.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/engine/PhysicsCommon.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/systems/ConstraintSolverSystem.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/systems/ContactSolverSystem.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/systems/DynamicsSystem.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/systems/CollisionDetectionSystem.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/systems/SolveBallAndSocketJointSystem.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/systems/SolveFixedJointSystem.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/systems/SolveHingeJointSystem.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/systems/SolveSliderJointSystem.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/engine/PhysicsWorld.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/engine/Island.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/engine/Material.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/engine/OverlappingPairs.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/engine/Entity.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/engine/EntityManager.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/systems/BroadPhaseSystem.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/components/Components.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/components/BodyComponents.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/components/RigidBodyComponents.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/components/TransformComponents.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/components/ColliderComponents.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/components/JointComponents.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/components/BallAndSocketJointComponents.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/components/FixedJointComponents.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/components/HingeJointComponents.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/components/SliderJointComponents.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/CollisionCallback.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/collision/OverlapCallback.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/mathematics/Matrix2x2.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/mathematics/Matrix3x3.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/mathematics/Quaternion.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/mathematics/Transform.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/mathematics/Vector2.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/mathematics/Vector3.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/memory/PoolAllocator.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/memory/SingleFrameAllocator.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/memory/HeapAllocator.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/memory/MemoryManager.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/memory/MemoryAllocator.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/utils/Profiler.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/utils/DefaultLogger.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/utils/DebugRenderer.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/utils/quickhull/QuickHull.cpp.o:
+
+CMakeFiles/reactphysics3d.dir/src/utils/quickhull/QHHalfEdgeStructure.cpp.o:
+
+/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libstdc++.so:
+
+/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libm.so:
+
+/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libm.so:
+
+/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libm.so:
+
+/usr/lib/libm.so.6:
+
+/usr/lib/libmvec.so.1:
+
+/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libgcc_s.so:
+
+/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libgcc_s.so:
+
+/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libgcc_s.so:
+
+/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libgcc_s.so.1:
+
+/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/libgcc.a:
+
+/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libc.so:
+
+/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libc.so:
+
+/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libc.so:
+
+/usr/lib/libc.so.6:
+
+/usr/lib/libc_nonshared.a:
+
+/usr/lib/ld-linux-x86-64.so.2:
+
+/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libgcc_s.so:
+
+/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libgcc_s.so:
+
+/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libgcc_s.so:
+
+/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/libgcc_s.so.1:
+
+/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/libgcc.a:
+
+/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/crtendS.o:
+
+/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/crtn.o:

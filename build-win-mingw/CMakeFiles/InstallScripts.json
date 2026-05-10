@@ -1,0 +1,15 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/cmake_install.cmake",
+		"/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/glm-build/cmake_install.cmake",
+		"/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/glm-build/glm/cmake_install.cmake",
+		"/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/cpphttplib-build/cmake_install.cmake",
+		"/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/reactphysics3d_build/cmake_install.cmake",
+		"/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/vulkan_headers-build/cmake_install.cmake",
+		"/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/assimp-build/cmake_install.cmake",
+		"/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/assimp-build/contrib/zlib/cmake_install.cmake",
+		"/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/assimp-build/code/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

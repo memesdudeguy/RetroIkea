@@ -1,0 +1,3 @@
+/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/assimp-subbuild/CMakeFiles/assimp-populate.dir
+/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/assimp-subbuild/CMakeFiles/edit_cache.dir
+/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/assimp-subbuild/CMakeFiles/rebuild_cache.dir

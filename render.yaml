@@ -1,5 +1,7 @@
 # Render Blueprint: deploy the FastAPI lobby from repo root -> New Blueprint -> paste this file.
-# After deploy, set in-game: RETRO_IKEA_LOBBY_URL=https://<your-service>.onrender.com
+# Service name MUST stay "retro-ikea-lobby" so the public URL matches the one baked into the
+# game build (RETRO_IKEA_DEFAULT_LOBBY_URL = https://retro-ikea-lobby.onrender.com).
+# Override at runtime per-PC with the RETRO_IKEA_LOBBY_URL env var if you want to fork.
 services:
   - type: web
     name: retro-ikea-lobby

@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <climits>
@@ -113,6 +114,60 @@ static int envIntOrDefault(const char* name, int fallback) {
       return static_cast<int>(v);
   }
   return fallback;
+}
+
+static float envFloatOrDefault(const char* name, float fallback) {
+  if (const char* raw = std::getenv(name)) {
+    char* end = nullptr;
+    const double v = std::strtod(raw, &end);
+    if (end != raw && std::isfinite(v))
+      return static_cast<float>(v);
+  }
+  return fallback;
+}
+
+static bool envBoolEnabled(const char* name, bool fallback = false) {
+  const char* raw = std::getenv(name);
+  if (!raw || raw[0] == '\0')
+    return fallback;
+  return raw[0] == '1' || raw[0] == 'y' || raw[0] == 'Y' || raw[0] == 't' || raw[0] == 'T';
+}
+
+// User-tunable gamepad parameters. Defaults match a console-FPS feel: smaller deadzone, mild expo for
+// precise flicks, and a "look ramp" that boosts turn speed once the stick is held at the edge for a beat.
+struct GamepadTuning {
+  float deadzone = 0.15f;          // VULKAN_GAME_GP_DEADZONE (radial, applies to both sticks)
+  float yawSpeed = 2.65f;          // VULKAN_GAME_GP_LOOK_X_SENS (rad/s at full deflection, before expo+ramp)
+  float pitchSpeed = 2.15f;        // VULKAN_GAME_GP_LOOK_Y_SENS
+  float lookExpo = 1.50f;          // VULKAN_GAME_GP_LOOK_EXPO (>=1.0; 1.0 disables curve)
+  float triggerThreshold = 0.30f;  // VULKAN_GAME_GP_TRIGGER_THRESHOLD (RT pickup edge)
+  bool invertY = false;            // VULKAN_GAME_GP_INVERT_Y
+  // Console-style turn ramp: holding the stick past kRampEngage for `lookRampSec` seconds
+  // multiplies look speed up to `lookRampBoost`. Releasing decays the ramp back to 1.0 quickly.
+  float lookRampBoost = 1.85f;     // VULKAN_GAME_GP_LOOK_RAMP_BOOST (1.0 disables ramp)
+  float lookRampSec = 0.22f;       // VULKAN_GAME_GP_LOOK_RAMP_SEC (time to reach max boost)
+};
+
+static GamepadTuning loadGamepadTuningFromEnv() {
+  GamepadTuning t{};
+  t.deadzone = std::clamp(envFloatOrDefault("VULKAN_GAME_GP_DEADZONE", 0.15f), 0.0f, 0.6f);
+  t.yawSpeed = std::clamp(envFloatOrDefault("VULKAN_GAME_GP_LOOK_X_SENS", 2.65f), 0.1f, 8.f);
+  t.pitchSpeed = std::clamp(envFloatOrDefault("VULKAN_GAME_GP_LOOK_Y_SENS", 2.15f), 0.1f, 8.f);
+  t.lookExpo = std::clamp(envFloatOrDefault("VULKAN_GAME_GP_LOOK_EXPO", 1.50f), 1.0f, 4.0f);
+  t.triggerThreshold = std::clamp(envFloatOrDefault("VULKAN_GAME_GP_TRIGGER_THRESHOLD", 0.30f), 0.05f, 0.95f);
+  t.invertY = envBoolEnabled("VULKAN_GAME_GP_INVERT_Y", false);
+  t.lookRampBoost = std::clamp(envFloatOrDefault("VULKAN_GAME_GP_LOOK_RAMP_BOOST", 1.85f), 1.0f, 4.0f);
+  t.lookRampSec = std::clamp(envFloatOrDefault("VULKAN_GAME_GP_LOOK_RAMP_SEC", 0.22f), 0.05f, 1.5f);
+  return t;
+}
+
+// Apply expo curve to right-stick deflection while preserving sign and unit cap.
+static float applyLookExpo(float v, float expo) {
+  if (expo <= 1.0001f)
+    return v;
+  const float a = std::clamp(std::fabs(v), 0.f, 1.f);
+  const float curved = std::pow(a, expo);
+  return (v < 0.f ? -curved : curved);
 }
 
 static int joystickButtonToControllerButton(Uint8 b) {
@@ -6609,6 +6664,9 @@ struct App {
   bool titleMenuPendingLobbyJoin = false;
   char lobbyHeartbeatSessionId[40]{};
   double lobbyHeartbeatAccumSec = 0.;
+  LobbyHostPublisher lobbyPublisher;
+  std::thread lobbyHostIpResolverThread;
+  std::atomic<bool> lobbyHostIpResolverCancel{false};
   bool inIntroSplash = true;
   float introSplashTime = 0.f;
   VkBuffer introSplashVertexBuffer = VK_NULL_HANDLE;
@@ -6902,6 +6960,68 @@ struct App {
   bool spaceWasDown = false;
   SDL_GameController* gameController = nullptr;
   SDL_Joystick* fallbackJoystick = nullptr;
+  GamepadTuning gamepadTuning = loadGamepadTuningFromEnv();
+  // Pad-driven lobby browser focus (cursor row through visible+hidden server entries).
+  int titleMenuLobbyPadFocus = -1;
+  // Async title-menu lobby refresh so a Render free-tier cold-start (can take 30+ seconds) does
+  // not freeze the title screen.
+  std::thread titleMenuLobbyFetchThread;
+  std::atomic<bool> titleMenuLobbyFetchInFlight{false};
+  std::mutex titleMenuLobbyResultMu;
+  std::vector<LobbyListedServer> titleMenuLobbyResultServers;
+  std::string titleMenuLobbyResultStatus;
+  bool titleMenuLobbyResultReady = false;
+  double titleMenuLobbyFetchStartMono = -1.0;
+
+  // Per-axis adaptive bias calibration for sticks (LX, LY, RX, RY in that order).
+  // Cancels resting drift up to ~0.30 magnitude and masks trigger-shaped axes that idle at ±1.0
+  // (a common SDL fallback-joystick failure mode that otherwise pins the camera looking up).
+  float gpAxisBias[4]{0.f, 0.f, 0.f, 0.f};
+  int gpAxisExtremeStreak[4]{0, 0, 0, 0};
+  bool gpAxisLikelyTrigger[4]{false, false, false, false};
+  double gpAxisCalibrationLastResetMono = -1.0;
+  // Console-style look ramp accumulator (0..1); ramps up while the stick is past kRampEngage,
+  // decays quickly when the user releases the stick.
+  float gpLookRampPhase = 0.f;
+
+  void resetGamepadAxisCalibration() {
+    for (int i = 0; i < 4; ++i) {
+      gpAxisBias[i] = 0.f;
+      gpAxisExtremeStreak[i] = 0;
+      gpAxisLikelyTrigger[i] = false;
+    }
+    gpAxisCalibrationLastResetMono = retroMpMonotonicSec();
+  }
+
+  // Adaptive bias removal + stuck-axis detection. Returns the de-biased reading clamped to [-1, 1],
+  // or 0 if the axis is likely a trigger / wired wrong (idles at extreme magnitude).
+  float applyGamepadAxisCalibration(int idx, float raw) {
+    if (idx < 0 || idx >= 4)
+      return raw;
+    if (gpAxisLikelyTrigger[idx])
+      return 0.f;
+    // Trigger / faulty-axis detector: a real analog stick rests near 0 within ~1s of connect.
+    // If the axis has stayed beyond ±0.92 for >40 consecutive frames (≈0.6s @60fps), mask it.
+    if (std::fabs(raw) > 0.92f) {
+      if (++gpAxisExtremeStreak[idx] >= 40) {
+        gpAxisLikelyTrigger[idx] = true;
+        std::fprintf(stderr,
+                     "[input] Pad axis %d idles at %.2f — looks like a trigger, masking from look/move.\n",
+                     idx, raw);
+        return 0.f;
+      }
+    } else {
+      gpAxisExtremeStreak[idx] = 0;
+    }
+    const float deBiased = raw - gpAxisBias[idx];
+    // Only update the bias when the apparent stick offset is small (i.e. the user isn't actively pushing).
+    if (std::fabs(deBiased) < 0.40f) {
+      const float learnRate = 0.03f;
+      gpAxisBias[idx] += (raw - gpAxisBias[idx]) * learnRate;
+      gpAxisBias[idx] = std::clamp(gpAxisBias[idx], -0.35f, 0.35f);
+    }
+    return std::clamp(raw - gpAxisBias[idx], -1.f, 1.f);
+  }
   bool gpRtPickupHeldPrev = false;
   bool gpRbShoveHeldPrev = false;
   bool gpRStickKickHeldPrev = false;
@@ -9796,6 +9916,7 @@ struct App {
       gameController = SDL_GameControllerOpen(ji);
       if (gameController) {
         std::cerr << "[input] GameController: " << SDL_GameControllerName(gameController) << "\n";
+        resetGamepadAxisCalibration();
         return;
       }
     }
@@ -9808,6 +9929,7 @@ struct App {
                   << SDL_JoystickNumAxes(fallbackJoystick) << ", buttons="
                   << SDL_JoystickNumButtons(fallbackJoystick) << ", hats="
                   << SDL_JoystickNumHats(fallbackJoystick) << ")\n";
+        resetGamepadAxisCalibration();
         return;
       }
     }
@@ -15008,9 +15130,11 @@ struct App {
         SDL_StopTextInput();
         mpClientSpawnSynced = false;
         mpClientLastLinkMono = -1.0;
-        netMp.startHost(kRetroMpDefaultPort);
+        stopLobbyHostPublisher();
         lobbyHeartbeatSessionId[0] = '\0';
+        netMp.startHost(kRetroMpDefaultPort);
         lobbyHeartbeatAccumSec = 0.;
+        startLobbyHostPublisher();
         recreatePauseMenuGpuMesh();
         return true;
       }
@@ -15032,6 +15156,7 @@ struct App {
         SDL_StopTextInput();
         mpClientSpawnSynced = false;
         mpClientLastLinkMono = -1.0;
+        stopLobbyHostPublisher();
         netMp.stop();
         lobbyHeartbeatSessionId[0] = '\0';
         lobbyHeartbeatAccumSec = 0.;
@@ -15404,21 +15529,17 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
         auto itPz = deliPizzaSlicesBySlot.find(k);
         if (itPz == deliPizzaSlicesBySlot.end() || itPz->second == 0)
           return false;
-        const int takeCount = static_cast<int>(itPz->second);
-        itPz->second = 0;
+        --itPz->second;
         deliPizzaReplenishTimerBySlot[k] = kDeliPizzaReplenishSec;
-        for (int i = 0; i < takeCount; ++i)
-          inventoryItems.emplace_back("PIZZA SLICE");
+        inventoryItems.emplace_back("PIZZA SLICE");
       } else if (canPickupMeatball) {
         deliMeatballsRemaining(bestWa, bestWl);
         auto itMb = deliMeatballsBySlot.find(k);
         if (itMb == deliMeatballsBySlot.end() || itMb->second == 0)
           return false;
-        const int takeCount = static_cast<int>(itMb->second);
-        itMb->second = 0;
+        --itMb->second;
         deliMeatballReplenishTimerBySlot[k] = kDeliPizzaReplenishSec;
-        for (int i = 0; i < takeCount; ++i)
-          inventoryItems.emplace_back("MEATBALL");
+        inventoryItems.emplace_back("MEATBALL");
       } else {
         return false;
       }
@@ -15429,27 +15550,17 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       dp.camZ = camPos.z;
       if (canPickupPizza) {
         dp.foodKind = kRetroMpDeliPickupPizza;
-        const int takeCount = std::clamp(pizzaRem, 1, kDeliPizzaSlicesPerCounter);
-        mpClientDeliLocalTakePizza[k] =
-            static_cast<uint8_t>(std::min<int>(255, mpClientDeliLocalTakePizza[k] + takeCount));
-        for (int i = 0; i < takeCount; ++i) {
-          inventoryItems.emplace_back("PIZZA SLICE");
-          dp.seq = ++mpClientDeliPickupSeq;
-          netMp.sendDeliPickupRequest(dp);
-        }
+        ++mpClientDeliLocalTakePizza[k];
+        inventoryItems.emplace_back("PIZZA SLICE");
       } else if (canPickupMeatball) {
         dp.foodKind = kRetroMpDeliPickupMeat;
-        const int takeCount = std::clamp(meatRem, 1, kDeliMeatballsPerCounter);
-        mpClientDeliLocalTakeMeat[k] =
-            static_cast<uint8_t>(std::min<int>(255, mpClientDeliLocalTakeMeat[k] + takeCount));
-        for (int i = 0; i < takeCount; ++i) {
-          inventoryItems.emplace_back("MEATBALL");
-          dp.seq = ++mpClientDeliPickupSeq;
-          netMp.sendDeliPickupRequest(dp);
-        }
+        ++mpClientDeliLocalTakeMeat[k];
+        inventoryItems.emplace_back("MEATBALL");
       } else {
         return false;
       }
+      dp.seq = ++mpClientDeliPickupSeq;
+      netMp.sendDeliPickupRequest(dp);
     }
     ++inventoryRevision;
     const int maxScroll = std::max(0, inventoryStackRowCount() - 8);
@@ -15503,8 +15614,10 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       if (!gameController && SDL_IsGameController(e.cdevice.which)) {
         closeFallbackJoystick();
         gameController = SDL_GameControllerOpen(e.cdevice.which);
-        if (gameController)
+        if (gameController) {
           std::cerr << "[input] GameController connected: " << SDL_GameControllerName(gameController) << "\n";
+          resetGamepadAxisCalibration();
+        }
       }
       return;
     }
@@ -15526,6 +15639,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
                     << SDL_JoystickNumAxes(fallbackJoystick) << ", buttons="
                     << SDL_JoystickNumButtons(fallbackJoystick) << ", hats="
                     << SDL_JoystickNumHats(fallbackJoystick) << ")\n";
+          resetGamepadAxisCalibration();
         }
       }
       return;
@@ -15709,6 +15823,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
           syncInputGrab();
           gameSaveWrite();
           recreatePauseMenuGpuMesh();
+          maybeLogControllerHintForPauseMenu();
         } else {
           pauseMenuMpIpFocused = false;
           SDL_StopTextInput();
@@ -15746,6 +15861,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
           if (padButtonDown == SDL_CONTROLLER_BUTTON_B) {
             titleMenuBrowseServers = false;
             titleMenuLobbyScroll = 0;
+            titleMenuLobbyPadFocus = -1;
             recreateTitleMenuMainGpuMesh();
             return;
           }
@@ -15753,14 +15869,48 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
             refreshTitleMenuLobbyFetchAndMesh();
             return;
           }
+          const int n = static_cast<int>(titleMenuLobbyServers.size());
           if (padButtonDown == SDL_CONTROLLER_BUTTON_DPAD_UP) {
-            titleMenuLobbyScroll = std::max(0, titleMenuLobbyScroll - 1);
+            if (n > 0) {
+              titleMenuLobbyPadFocus = (titleMenuLobbyPadFocus < 0)
+                                            ? std::clamp(titleMenuLobbyScroll, 0, n - 1)
+                                            : std::max(0, titleMenuLobbyPadFocus - 1);
+              if (titleMenuLobbyPadFocus < titleMenuLobbyScroll)
+                titleMenuLobbyScroll = titleMenuLobbyPadFocus;
+            } else {
+              titleMenuLobbyScroll = std::max(0, titleMenuLobbyScroll - 1);
+            }
             rebuildTitleMenuServerUiMesh();
             return;
           }
           if (padButtonDown == SDL_CONTROLLER_BUTTON_DPAD_DOWN) {
-            titleMenuLobbyScroll += 1;
+            if (n > 0) {
+              titleMenuLobbyPadFocus = (titleMenuLobbyPadFocus < 0)
+                                            ? std::clamp(titleMenuLobbyScroll, 0, n - 1)
+                                            : std::min(n - 1, titleMenuLobbyPadFocus + 1);
+              if (titleMenuLobbyPadFocus >= titleMenuLobbyScroll + kLobbyBrowserVisibleRows)
+                titleMenuLobbyScroll = titleMenuLobbyPadFocus - kLobbyBrowserVisibleRows + 1;
+            } else {
+              titleMenuLobbyScroll += 1;
+            }
             rebuildTitleMenuServerUiMesh();
+            return;
+          }
+          if (padButtonDown == SDL_CONTROLLER_BUTTON_A && n > 0) {
+            int idx = titleMenuLobbyPadFocus;
+            if (idx < 0)
+              idx = std::clamp(titleMenuLobbyScroll, 0, n - 1);
+            const LobbyListedServer& sel = titleMenuLobbyServers[static_cast<size_t>(idx)];
+            std::strncpy(titleMenuPendingLobbyJoinHost, sel.host.c_str(),
+                         sizeof(titleMenuPendingLobbyJoinHost) - 1);
+            titleMenuPendingLobbyJoinHost[sizeof(titleMenuPendingLobbyJoinHost) - 1] = '\0';
+            titleMenuPendingLobbyJoinPort = sel.port != 0 ? sel.port : kRetroMpDefaultPort;
+            titleMenuPendingLobbyJoin = true;
+            titleMenuBrowseServers = false;
+            titleMenuPickSlot = true;
+            titleMenuLobbyPadFocus = -1;
+            recreateTitleMenuMainGpuMesh();
+            recreateTitleMenuSlotGpuMesh();
             return;
           }
         } else if (titleMenuPickSlot) {
@@ -15822,14 +15972,52 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
         }
       }
       if (showInventoryMenu) {
+        constexpr int kInvVisibleRows = 8;
+        const int nRows = inventoryStackRowCount();
         bool handledInventoryPad = true;
-        if (padButtonDown == SDL_CONTROLLER_BUTTON_DPAD_UP)
-          inventoryScrollRow = std::max(0, inventoryScrollRow - 1);
-        else if (padButtonDown == SDL_CONTROLLER_BUTTON_DPAD_DOWN)
-          ++inventoryScrollRow;
-        else if (padButtonDown == SDL_CONTROLLER_BUTTON_X)
+        if (padButtonDown == SDL_CONTROLLER_BUTTON_DPAD_UP) {
+          if (nRows > 0) {
+            inventoryUiSelectedStackIdx = (inventoryUiSelectedStackIdx <= 0)
+                                              ? 0
+                                              : (inventoryUiSelectedStackIdx - 1);
+            if (inventoryUiSelectedStackIdx < inventoryScrollRow)
+              inventoryScrollRow = inventoryUiSelectedStackIdx;
+          } else {
+            inventoryScrollRow = std::max(0, inventoryScrollRow - 1);
+          }
+        } else if (padButtonDown == SDL_CONTROLLER_BUTTON_DPAD_DOWN) {
+          if (nRows > 0) {
+            inventoryUiSelectedStackIdx = (inventoryUiSelectedStackIdx < 0)
+                                              ? std::clamp(inventoryScrollRow, 0, nRows - 1)
+                                              : std::min(nRows - 1, inventoryUiSelectedStackIdx + 1);
+            if (inventoryUiSelectedStackIdx >= inventoryScrollRow + kInvVisibleRows)
+              inventoryScrollRow = inventoryUiSelectedStackIdx - kInvVisibleRows + 1;
+          } else {
+            ++inventoryScrollRow;
+          }
+        } else if (padButtonDown == SDL_CONTROLLER_BUTTON_A) {
+          // A = use/eat the focused stack (matches left-click behavior in the inventory list).
+          if (inventoryUiSelectedStackIdx >= 0 && nRows > 0) {
+            const auto stacks = buildInventoryStacks(inventoryItems);
+            const int idx = std::clamp(inventoryUiSelectedStackIdx, 0, static_cast<int>(stacks.size()) - 1);
+            if (idx >= 0 && idx < static_cast<int>(stacks.size())) {
+              const std::string& item = stacks[static_cast<size_t>(idx)].first;
+              if ((item == "PIZZA SLICE" || item == "MEATBALL") &&
+                  playerHunger < (kPlayerHungerMax - 1e-3f)) {
+                auto it = std::find(inventoryItems.begin(), inventoryItems.end(), item);
+                if (it != inventoryItems.end()) {
+                  inventoryItems.erase(it);
+                  playerHunger = std::min(kPlayerHungerMax, playerHunger + kPlayerHungerPizzaGain);
+                  ++inventoryRevision;
+                }
+              }
+            }
+          }
+          clampInventoryUiSelectedStackIdx();
+        } else if (padButtonDown == SDL_CONTROLLER_BUTTON_X) {
           (void)tryExecuteInventoryFoodDrop();
-        else if (padButtonDown == SDL_CONTROLLER_BUTTON_B || padButtonDown == SDL_CONTROLLER_BUTTON_BACK) {
+          clampInventoryUiSelectedStackIdx();
+        } else if (padButtonDown == SDL_CONTROLLER_BUTTON_B || padButtonDown == SDL_CONTROLLER_BUTTON_BACK) {
           showInventoryMenu = false;
           inventoryUiSelectedStackIdx = -1;
           audioSetStoreDayNightCyclePaused(false);
@@ -15838,21 +16026,76 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
         } else
           handledInventoryPad = false;
         if (handledInventoryPad) {
-          const int maxScroll = std::max(0, inventoryStackRowCount() - 8);
+          const int maxScroll = std::max(0, inventoryStackRowCount() - kInvVisibleRows);
           inventoryScrollRow = std::clamp(inventoryScrollRow, 0, maxScroll);
           inventoryMenuCacheScroll = -1;
           return;
         }
       }
-      if (showPauseMenu && !pauseMenuMpIpFocused &&
-          (padButtonDown == SDL_CONTROLLER_BUTTON_A || padButtonDown == SDL_CONTROLLER_BUTTON_B)) {
-        pauseMenuMpIpFocused = false;
-        SDL_StopTextInput();
-        showPauseMenu = false;
-        audioSetStoreDayNightCyclePaused(false);
-        mouseGrab = true;
-        syncInputGrab();
-        return;
+      if (showPauseMenu && !pauseMenuMpIpFocused) {
+        // Controller bindings on the pause menu (mirrors the rendered click rows).
+        // A or B = resume game; X = host; Y = join (using current IP buffer);
+        // RB = stop multiplayer; LB = save & quit to title; Back = save & quit (same as LB).
+        if (padButtonDown == SDL_CONTROLLER_BUTTON_A || padButtonDown == SDL_CONTROLLER_BUTTON_B) {
+          pauseMenuMpIpFocused = false;
+          SDL_StopTextInput();
+          showPauseMenu = false;
+          audioSetStoreDayNightCyclePaused(false);
+          mouseGrab = true;
+          syncInputGrab();
+          return;
+        }
+        if (padButtonDown == SDL_CONTROLLER_BUTTON_LEFTSHOULDER ||
+            padButtonDown == SDL_CONTROLLER_BUTTON_BACK) {
+          pauseMenuMpIpFocused = false;
+          SDL_StopTextInput();
+          gameSaveWrite();
+          returnToTitleMenuFromGame();
+          return;
+        }
+        if (padButtonDown == SDL_CONTROLLER_BUTTON_X) {
+          pauseMenuMpIpFocused = false;
+          SDL_StopTextInput();
+          mpClientSpawnSynced = false;
+          mpClientLastLinkMono = -1.0;
+          stopLobbyHostPublisher();
+          lobbyHeartbeatSessionId[0] = '\0';
+          netMp.startHost(kRetroMpDefaultPort);
+          lobbyHeartbeatAccumSec = 0.;
+          startLobbyHostPublisher();
+          recreatePauseMenuGpuMesh();
+          return;
+        }
+        if (padButtonDown == SDL_CONTROLLER_BUTTON_Y) {
+          pauseMenuMpIpFocused = false;
+          SDL_StopTextInput();
+          char joinIp[128]{};
+          uint16_t joinPort = kRetroMpDefaultPort;
+          if (parseJoinTargetIpPort(pauseMenuJoinIpBuf, joinIp, sizeof(joinIp), joinPort)) {
+            mpClientSpawnSynced = false;
+            mpClientLastLinkMono = -1.0;
+            netMp.startJoin(joinIp, joinPort);
+          } else {
+            std::fprintf(stderr,
+                         "[mp] Pad join: enter a valid IP first (use mouse on EDIT IP, or env "
+                         "VULKAN_GAME_MP_JOIN=ip[:port]). Buffer is \"%s\".\n",
+                         pauseMenuJoinIpBuf);
+          }
+          recreatePauseMenuGpuMesh();
+          return;
+        }
+        if (padButtonDown == SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) {
+          pauseMenuMpIpFocused = false;
+          SDL_StopTextInput();
+          mpClientSpawnSynced = false;
+          mpClientLastLinkMono = -1.0;
+          stopLobbyHostPublisher();
+          netMp.stop();
+          lobbyHeartbeatSessionId[0] = '\0';
+          lobbyHeartbeatAccumSec = 0.;
+          recreatePauseMenuGpuMesh();
+          return;
+        }
       }
     }
     if (e.type == SDL_MOUSEWHEEL && showInventoryMenu) {
@@ -16054,6 +16297,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
             syncInputGrab();
             gameSaveWrite();
             recreatePauseMenuGpuMesh();
+            maybeLogControllerHintForPauseMenu();
           } else {
             pauseMenuMpIpFocused = false;
             SDL_StopTextInput();
@@ -19257,26 +19501,185 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     lobbyHeartbeatSessionId[32] = '\0';
   }
 
+  // Display name shown in lobby listings. RETRO_IKEA_LOBBY_NAME lets the user pick their own.
+  std::string lobbyHostDisplayName() const {
+    if (const char* e = std::getenv("RETRO_IKEA_LOBBY_NAME"))
+      if (e[0] != '\0')
+        return std::string(e).substr(0, 48);
+    return std::string("RetroIkea");
+  }
+
+  // Begin lobby publication for the current host session. Always reachable: even with no public IP yet
+  // we register what we have, then refine asynchronously by resolving a WAN/Tailscale IP off-thread.
+  void startLobbyHostPublisher() {
+    ensureLobbyHeartbeatSessionId();
+    const char* urlRaw = lobbyEnvUrl();
+    const std::string url = urlRaw ? std::string(urlRaw) : std::string();
+    const std::string name = lobbyHostDisplayName();
+    const std::string sid = lobbyHeartbeatSessionId;
+    const std::string fallbackIp = netMp.publicHostUtf8;
+
+    lobbyPublisher.start(url, sid, fallbackIp, kRetroMpDefaultPort, name);
+
+    if (!url.empty()) {
+      std::fprintf(stderr, "[lobby] publishing host \"%s\" -> %s (initial IP=%s)\n", name.c_str(), url.c_str(),
+                   fallbackIp.empty() ? "<resolving>" : fallbackIp.c_str());
+    } else {
+      std::fprintf(stderr,
+                   "[lobby] RETRO_IKEA_LOBBY_URL is unset; this host is reachable only via direct IP %s:%u\n",
+                   fallbackIp.empty() ? "<unknown>" : fallbackIp.c_str(),
+                   static_cast<unsigned>(kRetroMpDefaultPort));
+      return;
+    }
+
+    // Refine the advertised IP off the main thread (WAN check-ip can take ~1-2s).
+    if (lobbyHostIpResolverThread.joinable()) {
+      lobbyHostIpResolverCancel.store(true, std::memory_order_release);
+      lobbyHostIpResolverThread.join();
+    }
+    lobbyHostIpResolverCancel.store(false, std::memory_order_release);
+    lobbyHostIpResolverThread = std::thread([this, url, name, fallbackIp, sid]() {
+      char ip[64]{};
+      if (!retroMpResolveLobbyAdvertiseIp(ip, sizeof ip, fallbackIp.c_str()) || ip[0] == '\0')
+        return;
+      if (lobbyHostIpResolverCancel.load(std::memory_order_acquire))
+        return;
+      // start() is idempotent: it just refreshes the publisher's host so the worker re-POSTs sooner.
+      lobbyPublisher.start(url, sid, ip, kRetroMpDefaultPort, name);
+    });
+  }
+
+  void stopLobbyHostPublisher() {
+    if (lobbyHostIpResolverThread.joinable()) {
+      lobbyHostIpResolverCancel.store(true, std::memory_order_release);
+      lobbyHostIpResolverThread.join();
+    }
+    lobbyPublisher.stop();
+  }
+
+  // Friendly translation of lobby HTTP errors so users immediately know what to do.
+  static std::string friendlyLobbyError(const std::string& err) {
+    if (err.empty())
+      return "Could not reach lobby";
+    if (err.find("404") != std::string::npos)
+      return "Lobby URL alive but no service deployed yet — host needs to apply render.yaml.";
+    if (err.find("502") != std::string::npos || err.find("503") != std::string::npos ||
+        err.find("504") != std::string::npos)
+      return "Lobby waking up (free tier) — press REFRESH again in 30s.";
+    if (err.find("network") != std::string::npos)
+      return "Cannot reach lobby — check internet, then REFRESH.";
+    return err;
+  }
+
   void refreshTitleMenuLobbyFetchAndMesh() {
     titleMenuLobbyStatus.clear();
-    const char* url = lobbyEnvUrl();
-    if (!url[0]) {
+    const char* urlRaw = lobbyEnvUrl();
+    if (!urlRaw || !urlRaw[0]) {
       titleMenuLobbyServers.clear();
-      titleMenuLobbyStatus = "Set env RETRO_IKEA_LOBBY_URL to lobby origin";
-    } else {
-      std::string err;
-      if (!lobbyFetchServerList(url, titleMenuLobbyServers, err))
-        titleMenuLobbyStatus = err.empty() ? "Could not reach lobby" : err;
-      else if (titleMenuLobbyServers.empty())
-        titleMenuLobbyStatus = "No servers — host from pause menu";
-      else
-        titleMenuLobbyStatus = std::to_string(titleMenuLobbyServers.size()) + " server(s)";
+      titleMenuLobbyStatus =
+          "Set RETRO_IKEA_LOBBY_URL or rebuild with -DRETRO_IKEA_DEFAULT_LOBBY_URL=";
+      const int maxScroll0 = 0;
+      titleMenuLobbyScroll = std::clamp(titleMenuLobbyScroll, 0, maxScroll0);
+      uploadUiMeshToGpu(buildTitleMenuServerBrowserVertices(titleMenuLobbyServers, titleMenuLobbyScroll,
+                                                            titleMenuLobbyStatus),
+                        titleMenuServerVertexBuffer, titleMenuServerVertexBufferMemory,
+                        titleMenuServerVertexCount);
+      return;
     }
+    if (titleMenuLobbyFetchInFlight.load(std::memory_order_acquire)) {
+      // Still waiting on previous fetch — show an "in flight" message and let it finish.
+      titleMenuLobbyStatus = "Refreshing lobby…";
+      uploadUiMeshToGpu(buildTitleMenuServerBrowserVertices(titleMenuLobbyServers, titleMenuLobbyScroll,
+                                                            titleMenuLobbyStatus),
+                        titleMenuServerVertexBuffer, titleMenuServerVertexBufferMemory,
+                        titleMenuServerVertexCount);
+      return;
+    }
+    if (titleMenuLobbyFetchThread.joinable())
+      titleMenuLobbyFetchThread.join();
+    titleMenuLobbyFetchInFlight.store(true, std::memory_order_release);
+    titleMenuLobbyFetchStartMono = retroMpMonotonicSec();
+    titleMenuLobbyStatus = "Refreshing lobby…";
+    const int maxScroll = std::max(0, static_cast<int>(titleMenuLobbyServers.size()) - kLobbyBrowserVisibleRows);
+    titleMenuLobbyScroll = std::clamp(titleMenuLobbyScroll, 0, maxScroll);
+    uploadUiMeshToGpu(buildTitleMenuServerBrowserVertices(titleMenuLobbyServers, titleMenuLobbyScroll,
+                                                          titleMenuLobbyStatus),
+                      titleMenuServerVertexBuffer, titleMenuServerVertexBufferMemory,
+                      titleMenuServerVertexCount);
+
+    const std::string url = urlRaw;
+    titleMenuLobbyFetchThread = std::thread([this, url]() {
+      // Cold-start tolerant timeouts: Render free-tier wake-up can take 30+ seconds.
+      // We set env vars locally for this fetch (lobby_http reads them per-call).
+      std::vector<LobbyListedServer> servers;
+      std::string err;
+      // Backup env values so we don't permanently override the user's settings.
+      const char* prevConn = std::getenv("RETRO_IKEA_LOBBY_CONNECT_TIMEOUT_SEC");
+      const char* prevRead = std::getenv("RETRO_IKEA_LOBBY_READ_TIMEOUT_SEC");
+      const std::string savedConn = prevConn ? prevConn : "";
+      const std::string savedRead = prevRead ? prevRead : "";
+      const bool hadConn = prevConn != nullptr;
+      const bool hadRead = prevRead != nullptr;
+#ifdef _WIN32
+      _putenv_s("RETRO_IKEA_LOBBY_CONNECT_TIMEOUT_SEC", "8");
+      _putenv_s("RETRO_IKEA_LOBBY_READ_TIMEOUT_SEC", "30");
+#else
+      setenv("RETRO_IKEA_LOBBY_CONNECT_TIMEOUT_SEC", "8", 1);
+      setenv("RETRO_IKEA_LOBBY_READ_TIMEOUT_SEC", "30", 1);
+#endif
+      const bool ok = lobbyFetchServerList(url.c_str(), servers, err);
+#ifdef _WIN32
+      if (hadConn) _putenv_s("RETRO_IKEA_LOBBY_CONNECT_TIMEOUT_SEC", savedConn.c_str());
+      else _putenv_s("RETRO_IKEA_LOBBY_CONNECT_TIMEOUT_SEC", "");
+      if (hadRead) _putenv_s("RETRO_IKEA_LOBBY_READ_TIMEOUT_SEC", savedRead.c_str());
+      else _putenv_s("RETRO_IKEA_LOBBY_READ_TIMEOUT_SEC", "");
+#else
+      if (hadConn) setenv("RETRO_IKEA_LOBBY_CONNECT_TIMEOUT_SEC", savedConn.c_str(), 1);
+      else unsetenv("RETRO_IKEA_LOBBY_CONNECT_TIMEOUT_SEC");
+      if (hadRead) setenv("RETRO_IKEA_LOBBY_READ_TIMEOUT_SEC", savedRead.c_str(), 1);
+      else unsetenv("RETRO_IKEA_LOBBY_READ_TIMEOUT_SEC");
+#endif
+      std::lock_guard<std::mutex> lk(titleMenuLobbyResultMu);
+      if (!ok) {
+        titleMenuLobbyResultStatus = friendlyLobbyError(err);
+        titleMenuLobbyResultServers.clear();
+      } else if (servers.empty()) {
+        titleMenuLobbyResultStatus = "No hosts online — host one from pause menu";
+        titleMenuLobbyResultServers.clear();
+      } else {
+        titleMenuLobbyResultStatus = std::to_string(servers.size()) + " server(s)";
+        titleMenuLobbyResultServers = std::move(servers);
+      }
+      titleMenuLobbyResultReady = true;
+      titleMenuLobbyFetchInFlight.store(false, std::memory_order_release);
+    });
+  }
+
+  // Called every frame while the title menu lobby browser is open. Picks up async fetch results.
+  void pollTitleMenuLobbyFetchResult() {
+    bool consume = false;
+    {
+      std::lock_guard<std::mutex> lk(titleMenuLobbyResultMu);
+      if (titleMenuLobbyResultReady) {
+        titleMenuLobbyServers = std::move(titleMenuLobbyResultServers);
+        titleMenuLobbyResultServers.clear();
+        titleMenuLobbyStatus = std::move(titleMenuLobbyResultStatus);
+        titleMenuLobbyResultStatus.clear();
+        titleMenuLobbyResultReady = false;
+        consume = true;
+      }
+    }
+    if (!consume)
+      return;
     const int n = static_cast<int>(titleMenuLobbyServers.size());
     const int maxScroll = std::max(0, n - kLobbyBrowserVisibleRows);
     titleMenuLobbyScroll = std::clamp(titleMenuLobbyScroll, 0, maxScroll);
-    uploadUiMeshToGpu(buildTitleMenuServerBrowserVertices(titleMenuLobbyServers, titleMenuLobbyScroll, titleMenuLobbyStatus),
-                      titleMenuServerVertexBuffer, titleMenuServerVertexBufferMemory, titleMenuServerVertexCount);
+    if (titleMenuLobbyPadFocus >= n)
+      titleMenuLobbyPadFocus = n > 0 ? n - 1 : -1;
+    uploadUiMeshToGpu(buildTitleMenuServerBrowserVertices(titleMenuLobbyServers, titleMenuLobbyScroll,
+                                                          titleMenuLobbyStatus),
+                      titleMenuServerVertexBuffer, titleMenuServerVertexBufferMemory,
+                      titleMenuServerVertexCount);
   }
 
   void rebuildTitleMenuServerUiMesh() {
@@ -19288,34 +19691,56 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
   }
 
   const char* pauseMenuMpStatusCstr() const {
-    static thread_local char st[192];
+    static thread_local char st[320];
+    char base[200]{};
     if (!netMp.active)
-      std::snprintf(st, sizeof st, "MULTIPLAYER: OFF");
+      std::snprintf(base, sizeof base, "MULTIPLAYER: OFF");
     else if (netMp.isHost) {
+      char hostLine[160];
       if (netMp.remoteValid(3.f) && netMp.peerHostUtf8[0] != '\0')
-        std::snprintf(st, sizeof st, "HOST LINKED %s:%u", netMp.peerHostUtf8,
+        std::snprintf(hostLine, sizeof hostLine, "HOST LINKED %s:%u", netMp.peerHostUtf8,
                       static_cast<unsigned>(netMp.peerPort));
       else if (netMp.publicHostUtf8[0] != '\0') {
         int ipa = -1;
         int ipb = -1;
         const bool tsHint = std::sscanf(netMp.publicHostUtf8, "%d.%d", &ipa, &ipb) == 2 && ipa == 100 &&
                            ipb >= 64 && ipb <= 127;
-        std::snprintf(st, sizeof st,
+        std::snprintf(hostLine, sizeof hostLine,
                       tsHint ? "HOST WAITING TS %s:%u"
                              : "HOST WAITING %s:%u",
                       netMp.publicHostUtf8, static_cast<unsigned>(kRetroMpDefaultPort));
       }
       else
-        std::snprintf(st, sizeof st, "HOST WAITING UDP %u", static_cast<unsigned>(kRetroMpDefaultPort));
+        std::snprintf(hostLine, sizeof hostLine, "HOST WAITING UDP %u", static_cast<unsigned>(kRetroMpDefaultPort));
+      const std::string lobby = lobbyPublisher.statusText();
+      std::snprintf(base, sizeof base, "%s | LOBBY %s", hostLine, lobby.c_str());
     } else {
       if (netMp.remoteValid(3.f))
-        std::snprintf(st, sizeof st, "CLIENT LINKED %s:%u", netMp.peerHostUtf8,
+        std::snprintf(base, sizeof base, "CLIENT LINKED %s:%u", netMp.peerHostUtf8,
                       static_cast<unsigned>(netMp.peerPort));
       else
-        std::snprintf(st, sizeof st, "CLIENT CONNECTING %s:%u", netMp.peerHostUtf8,
+        std::snprintf(base, sizeof base, "CLIENT CONNECTING %s:%u", netMp.peerHostUtf8,
                       static_cast<unsigned>(netMp.peerPort));
     }
+    std::snprintf(st, sizeof st, "%s", base);
     return st;
+  }
+
+  // Emitted on first pause-menu open per session when a pad is connected, so controller users discover bindings.
+  bool controllerHintLoggedThisSession = false;
+  void maybeLogControllerHintForPauseMenu() {
+    if (controllerHintLoggedThisSession || (!gameController && !fallbackJoystick))
+      return;
+    controllerHintLoggedThisSession = true;
+    std::fprintf(stderr,
+                 "[input] Pause menu controller bindings: A/B = resume, X = host session, "
+                 "Y = join (uses current IP buffer), RB = stop multiplayer, LB/Back = save & quit, "
+                 "START = toggle pause.\n");
+    std::fprintf(stderr,
+                 "[input] Inventory bindings: dpad up/down = select, A = eat, X = drop, B/Back = close.\n");
+    std::fprintf(stderr,
+                 "[input] Lobby browser bindings: dpad up/down = select server, A = join, "
+                 "Y = refresh, B = back.\n");
   }
 
   void recreatePauseMenuGpuMesh() {
@@ -19656,19 +20081,10 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     fpLocoAvatarYawFlip = 0.f;
     const bool uiMenuFreeze = (showControlsOverlay || inTitleMenu) && !playerDeathActive;
     netMp.pollReceive(dt);
-    if (const char* lobbyUrl = lobbyEnvUrl(); lobbyUrl[0] && netMp.active && netMp.isHost &&
-                                            netMp.publicHostUtf8[0] != '\0' && !inTitleMenu) {
-      lobbyHeartbeatAccumSec += static_cast<double>(dt);
-      constexpr double kLobbyHeartbeatSec = 20.0;
-      if (lobbyHeartbeatAccumSec >= kLobbyHeartbeatSec) {
-        lobbyHeartbeatAccumSec = 0.;
-        ensureLobbyHeartbeatSessionId();
-        std::string hbErr;
-        (void)lobbyRegisterHeartbeat(lobbyUrl, lobbyHeartbeatSessionId, netMp.publicHostUtf8, kRetroMpDefaultPort,
-                                     "RetroIkea", hbErr);
-      }
-    } else if (!netMp.active || !netMp.isHost)
-      lobbyHeartbeatAccumSec = 0.;
+    // Lobby host publishing: the LobbyHostPublisher worker thread keeps the entry alive and resolves
+    // the best advertise IP on its own; here we just stop it once the host session ends.
+    if (lobbyPublisher.active() && (!netMp.active || !netMp.isHost))
+      stopLobbyHostPublisher();
     if (netMp.active && netMp.consumeRemoteDeathRetry()) {
       // Peer pressed RETRY: respawn locally only if we're still in death flow (don't re-roll spawn if alive).
       if (playerDeathActive || playerDeathShowMenu)
@@ -19915,6 +20331,8 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       audioSetLowHealthHeartbeat(playerHealth > 0.f && playerHealth < kPlayerHealthMercyCap);
       tickPlayerDeathScene(dt);
       titleMenuSceneTime += dt;
+      if (titleMenuBrowseServers)
+        pollTitleMenuLobbyFetchResult();
       const bool titleSubUi = titleMenuPickSlot || titleMenuBrowseServers;
       if (titleMenuSlideWasSlot != titleSubUi) {
         titleMenuSlideTime = 0.f;
@@ -19963,38 +20381,46 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       gpA = SDL_GameControllerGetButton(gameController, SDL_CONTROLLER_BUTTON_A) != 0;
       gpB = SDL_GameControllerGetButton(gameController, SDL_CONTROLLER_BUTTON_B) != 0;
       gpYBtn = SDL_GameControllerGetButton(gameController, SDL_CONTROLLER_BUTTON_Y) != 0;
+      const int kTriggerOnRaw =
+          static_cast<int>(std::clamp(gamepadTuning.triggerThreshold * 32767.f, 1.f, 32767.f));
       gpSprintHeldPad =
           SDL_GameControllerGetButton(gameController, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0 ||
-          SDL_GameControllerGetAxis(gameController, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 12000;
-      gpRtHeldPad = SDL_GameControllerGetAxis(gameController, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 10000;
+          SDL_GameControllerGetAxis(gameController, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > kTriggerOnRaw;
+      gpRtHeldPad = SDL_GameControllerGetAxis(gameController, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > kTriggerOnRaw;
       gpRbHeldPad = SDL_GameControllerGetButton(gameController, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) != 0;
       gpRStickHeldPad = SDL_GameControllerGetButton(gameController, SDL_CONTROLLER_BUTTON_RIGHTSTICK) != 0;
       Sint16 lax = SDL_GameControllerGetAxis(gameController, SDL_CONTROLLER_AXIS_LEFTX);
       Sint16 lay = SDL_GameControllerGetAxis(gameController, SDL_CONTROLLER_AXIS_LEFTY);
-      gpLX = gamepadAxisToUnit(lax);
-      gpLY = gamepadAxisToUnit(lay);
-      gamepadRadialDeadzone(gpLX, gpLY, 0.15f);
+      gpLX = applyGamepadAxisCalibration(0, gamepadAxisToUnit(lax));
+      gpLY = applyGamepadAxisCalibration(1, gamepadAxisToUnit(lay));
+      gamepadRadialDeadzone(gpLX, gpLY, gamepadTuning.deadzone);
       Sint16 rax = SDL_GameControllerGetAxis(gameController, SDL_CONTROLLER_AXIS_RIGHTX);
       Sint16 ray = SDL_GameControllerGetAxis(gameController, SDL_CONTROLLER_AXIS_RIGHTY);
-      gpRX = gamepadAxisToUnit(rax);
-      gpRY = gamepadAxisToUnit(ray);
-      gamepadRadialDeadzone(gpRX, gpRY, 0.15f);
+      gpRX = applyGamepadAxisCalibration(2, gamepadAxisToUnit(rax));
+      gpRY = applyGamepadAxisCalibration(3, gamepadAxisToUnit(ray));
+      gamepadRadialDeadzone(gpRX, gpRY, gamepadTuning.deadzone);
     } else if (fallbackJoystick) {
       const int axes = SDL_JoystickNumAxes(fallbackJoystick);
       gpA = fallbackJoystickButton(envIntOrDefault("VULKAN_GAME_JOY_A", 0));
       gpB = fallbackJoystickButton(envIntOrDefault("VULKAN_GAME_JOY_B", 1));
       gpYBtn = fallbackJoystickButton(envIntOrDefault("VULKAN_GAME_JOY_Y", 3));
       gpSprintHeldPad = fallbackJoystickButton(envIntOrDefault("VULKAN_GAME_JOY_LB", 4)) ||
-                        fallbackJoystickAxis(envIntOrDefault("VULKAN_GAME_JOY_LT_AXIS", 4)) > 0.35f;
-      gpRtHeldPad = fallbackJoystickAxis(envIntOrDefault("VULKAN_GAME_JOY_RT_AXIS", 5)) > 0.30f;
+                        fallbackJoystickAxis(envIntOrDefault("VULKAN_GAME_JOY_LT_AXIS", 4)) >
+                            gamepadTuning.triggerThreshold;
+      gpRtHeldPad = fallbackJoystickAxis(envIntOrDefault("VULKAN_GAME_JOY_RT_AXIS", 5)) >
+                    gamepadTuning.triggerThreshold;
       gpRbHeldPad = fallbackJoystickButton(envIntOrDefault("VULKAN_GAME_JOY_RB", 5));
       gpRStickHeldPad = fallbackJoystickButton(envIntOrDefault("VULKAN_GAME_JOY_RS", 9));
-      gpLX = fallbackJoystickAxis(envIntOrDefault("VULKAN_GAME_JOY_LX_AXIS", 0));
-      gpLY = fallbackJoystickAxis(envIntOrDefault("VULKAN_GAME_JOY_LY_AXIS", 1));
-      gamepadRadialDeadzone(gpLX, gpLY, 0.15f);
-      gpRX = fallbackJoystickAxis(envIntOrDefault("VULKAN_GAME_JOY_RX_AXIS", axes >= 5 ? 3 : 2));
-      gpRY = fallbackJoystickAxis(envIntOrDefault("VULKAN_GAME_JOY_RY_AXIS", axes >= 5 ? 4 : 3));
-      gamepadRadialDeadzone(gpRX, gpRY, 0.15f);
+      gpLX = applyGamepadAxisCalibration(0,
+          fallbackJoystickAxis(envIntOrDefault("VULKAN_GAME_JOY_LX_AXIS", 0)));
+      gpLY = applyGamepadAxisCalibration(1,
+          fallbackJoystickAxis(envIntOrDefault("VULKAN_GAME_JOY_LY_AXIS", 1)));
+      gamepadRadialDeadzone(gpLX, gpLY, gamepadTuning.deadzone);
+      gpRX = applyGamepadAxisCalibration(2,
+          fallbackJoystickAxis(envIntOrDefault("VULKAN_GAME_JOY_RX_AXIS", axes >= 5 ? 3 : 2)));
+      gpRY = applyGamepadAxisCalibration(3,
+          fallbackJoystickAxis(envIntOrDefault("VULKAN_GAME_JOY_RY_AXIS", axes >= 5 ? 4 : 3)));
+      gamepadRadialDeadzone(gpRX, gpRY, gamepadTuning.deadzone);
       if (SDL_JoystickNumHats(fallbackJoystick) > 0) {
         const Uint8 hat = SDL_JoystickGetHat(fallbackJoystick, 0);
         if (hat & SDL_HAT_LEFT)
@@ -20064,11 +20490,25 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
         !inTitleMenu) {
       yaw += static_cast<float>(mx) * sens;
       pitch -= static_cast<float>(my) * sens;
-      if ((gameController || fallbackJoystick) && (std::fabs(gpRX) > 1e-5f || std::fabs(gpRY) > 1e-5f)) {
-        constexpr float kGpYawRadPerSec = 2.65f;
-        constexpr float kGpPitchRadPerSec = 2.15f;
-        yaw += gpRX * kGpYawRadPerSec * dt;
-        pitch -= gpRY * kGpPitchRadPerSec * dt;
+      if (gameController || fallbackJoystick) {
+        const float deflection = std::hypot(gpRX, gpRY);
+        // Console feel: ramp up turn speed while the stick is held past 0.85, decay fast on release.
+        constexpr float kRampEngage = 0.85f;
+        constexpr float kRampDisengage = 0.10f;
+        const float rampTau = std::max(0.05f, gamepadTuning.lookRampSec);
+        if (deflection > kRampEngage)
+          gpLookRampPhase = std::min(1.f, gpLookRampPhase + dt / rampTau);
+        else if (deflection < kRampDisengage)
+          gpLookRampPhase = std::max(0.f, gpLookRampPhase - dt / 0.06f);
+        const float rampMul =
+            1.f + (std::max(1.f, gamepadTuning.lookRampBoost) - 1.f) * gpLookRampPhase;
+        if (deflection > 1e-5f) {
+          const float curvedX = applyLookExpo(gpRX, gamepadTuning.lookExpo);
+          const float curvedY = applyLookExpo(gpRY, gamepadTuning.lookExpo);
+          const float pitchSign = gamepadTuning.invertY ? +1.f : -1.f;
+          yaw += curvedX * gamepadTuning.yawSpeed * rampMul * dt;
+          pitch += pitchSign * curvedY * gamepadTuning.pitchSpeed * rampMul * dt;
+        }
       }
       // Keyboard look if the mouse is ignored (Wayland / bad relative-mode drivers).
       const float lk = 2.4f * dt;
@@ -21995,6 +22435,9 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
   bool running = true;
 
   void shutdown() {
+    stopLobbyHostPublisher();
+    if (titleMenuLobbyFetchThread.joinable())
+      titleMenuLobbyFetchThread.join();
     netMp.shutdown();
     vkDeviceWaitIdle(device);
     savePipelineCacheToDisk();

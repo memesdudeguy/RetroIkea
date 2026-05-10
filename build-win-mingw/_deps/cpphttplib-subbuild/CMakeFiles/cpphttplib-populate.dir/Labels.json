@@ -1,0 +1,46 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/cpphttplib-subbuild/CMakeFiles/cpphttplib-populate"
+		},
+		{
+			"file" : "/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/cpphttplib-subbuild/CMakeFiles/cpphttplib-populate.rule"
+		},
+		{
+			"file" : "/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/cpphttplib-subbuild/CMakeFiles/cpphttplib-populate-complete.rule"
+		},
+		{
+			"file" : "/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/cpphttplib-subbuild/cpphttplib-populate-prefix/src/cpphttplib-populate-stamp/cpphttplib-populate-build.rule"
+		},
+		{
+			"file" : "/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/cpphttplib-subbuild/cpphttplib-populate-prefix/src/cpphttplib-populate-stamp/cpphttplib-populate-configure.rule"
+		},
+		{
+			"file" : "/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/cpphttplib-subbuild/cpphttplib-populate-prefix/src/cpphttplib-populate-stamp/cpphttplib-populate-download.rule"
+		},
+		{
+			"file" : "/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/cpphttplib-subbuild/cpphttplib-populate-prefix/src/cpphttplib-populate-stamp/cpphttplib-populate-install.rule"
+		},
+		{
+			"file" : "/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/cpphttplib-subbuild/cpphttplib-populate-prefix/src/cpphttplib-populate-stamp/cpphttplib-populate-mkdir.rule"
+		},
+		{
+			"file" : "/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/cpphttplib-subbuild/cpphttplib-populate-prefix/src/cpphttplib-populate-stamp/cpphttplib-populate-patch.rule"
+		},
+		{
+			"file" : "/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/cpphttplib-subbuild/cpphttplib-populate-prefix/src/cpphttplib-populate-stamp/cpphttplib-populate-test.rule"
+		},
+		{
+			"file" : "/home/memesdudeguy/Downloads/RetroIkea/build-win-mingw/_deps/cpphttplib-subbuild/cpphttplib-populate-prefix/src/cpphttplib-populate-stamp/cpphttplib-populate-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"cpphttplib-populate"
+		],
+		"name" : "cpphttplib-populate"
+	}
+}

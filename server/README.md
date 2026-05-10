@@ -1,6 +1,6 @@
 # RetroIkea lobby server
 
-In-memory session list with TTL. Game clients use `RETRO_IKEA_LOBBY_URL`; you can also bake a default at build time with CMake (`-DRETRO_IKEA_DEFAULT_LOBBY_URL=https://your-service.example`). Point both at this service’s public origin with **no trailing slash**.
+Public WAN-reachable session list with TTL. Beta builds ship with `RETRO_IKEA_DEFAULT_LOBBY_URL=https://retro-ikea-lobby.onrender.com` baked in via CMake, so once the Render Blueprint in [`render.yaml`](../render.yaml) is applied (service name must stay **`retro-ikea-lobby`**), every player's title-menu lobby browser connects automatically — no per-PC env var needed. Override per-PC with `RETRO_IKEA_LOBBY_URL`, or rebuild with `-DRETRO_IKEA_DEFAULT_LOBBY_URL=https://your-fork.example` to point at a fork. Origin only, **no trailing slash**.
 
 ## Run locally
 

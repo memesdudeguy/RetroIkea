@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC -O3 -DNDEBUG -shared -Wl,--dependency-file=CMakeFiles/glm.dir/link.d -Wl,-soname,libglm.so -o libglm.so CMakeFiles/glm.dir/detail/glm.cpp.o

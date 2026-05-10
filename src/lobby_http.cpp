@@ -2,10 +2,13 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <utility>
 
 #include <httplib.h>
 
@@ -177,6 +180,45 @@ static bool httplibPostJson(const UrlParts& u, const char* path, const std::stri
   return true;
 }
 
+static bool httplibDelete(const UrlParts& u, const char* path, std::string& err) {
+#if defined(CPPHTTPLIB_OPENSSL_SUPPORT)
+  if (u.tls) {
+    httplib::SSLClient cli(u.host.c_str(), u.port);
+    cli.set_connection_timeout(lobbyTimeoutSec("RETRO_IKEA_LOBBY_CONNECT_TIMEOUT_SEC", 1, 1, 15), 0);
+    cli.set_read_timeout(lobbyTimeoutSec("RETRO_IKEA_LOBBY_READ_TIMEOUT_SEC", 2, 1, 30), 0);
+    cli.enable_server_certificate_verification(true);
+    auto res = cli.Delete(path);
+    if (!res) {
+      err = "HTTPS DELETE failed (network)";
+      return false;
+    }
+    if (res->status < 200 || res->status >= 300) {
+      err = "Lobby HTTP " + std::to_string(res->status) + " at " + describeLobbyRequest(u, path);
+      return false;
+    }
+    return true;
+  }
+#else
+  if (u.tls) {
+    err = "HTTPS lobby URL needs an OpenSSL-enabled build (install OpenSSL dev, rebuild)";
+    return false;
+  }
+#endif
+  httplib::Client cli(u.host.c_str(), u.port);
+  cli.set_connection_timeout(lobbyTimeoutSec("RETRO_IKEA_LOBBY_CONNECT_TIMEOUT_SEC", 1, 1, 15), 0);
+  cli.set_read_timeout(lobbyTimeoutSec("RETRO_IKEA_LOBBY_READ_TIMEOUT_SEC", 2, 1, 30), 0);
+  auto res = cli.Delete(path);
+  if (!res) {
+    err = "HTTP DELETE failed (network)";
+    return false;
+  }
+  if (res->status < 200 || res->status >= 300) {
+    err = "Lobby HTTP " + std::to_string(res->status) + " at " + describeLobbyRequest(u, path);
+    return false;
+  }
+  return true;
+}
+
 static bool extractJsonStringField(const std::string& obj, const char* key, std::string& out) {
   // FastAPI / Python json.dumps uses spaces: "host": "1.2.3.4" — not "host":"1.2.3.4"
   const std::string pat = std::string("\"") + key + "\":";
@@ -310,4 +352,172 @@ bool lobbyRegisterHeartbeat(const char* lobbyBaseUrl, const char* sessionId, con
   std::string json = std::string("{\"id\":\"") + sessionId + "\",\"host\":\"" + hostIpv4 + "\",\"port\":" +
                      std::to_string(static_cast<unsigned>(port)) + ",\"name\":\"" + escName + "\"}";
   return httplibPostJson(u, "/api/v1/servers/register", json, errMsg);
+}
+
+bool lobbyUnregisterServer(const char* lobbyBaseUrl, const char* sessionId, std::string& errMsg) {
+  if (!sessionId || sessionId[0] == '\0') {
+    errMsg = "Missing session id for lobby unregister";
+    return false;
+  }
+  UrlParts u;
+  if (!parseLobbyOrigin(lobbyBaseUrl, u, errMsg))
+    return false;
+  std::string path = std::string("/api/v1/servers/") + sessionId;
+  return httplibDelete(u, path.c_str(), errMsg);
+}
+
+namespace {
+std::chrono::seconds lobbyHeartbeatPeriod() {
+  if (const char* raw = std::getenv("RETRO_IKEA_LOBBY_HEARTBEAT_SEC")) {
+    char* end = nullptr;
+    long v = std::strtol(raw, &end, 10);
+    if (end != raw && v >= 5 && v <= 60)
+      return std::chrono::seconds(v);
+  }
+  return std::chrono::seconds(15);
+}
+}  // namespace
+
+LobbyHostPublisher::~LobbyHostPublisher() {
+  stop();
+}
+
+void LobbyHostPublisher::start(const std::string& url, const std::string& sessionId, const std::string& host,
+                               uint16_t port, const std::string& name) {
+  std::unique_lock<std::mutex> lk(mu_);
+  url_ = url;
+  sessionId_ = sessionId;
+  host_ = host;
+  port_ = port;
+  name_ = name;
+  fieldsDirty_ = true;
+  firstHeartbeatSent_ = false;
+  if (url.empty()) {
+    state_.store(State::kDisabled, std::memory_order_release);
+    lastErr_ = "Set RETRO_IKEA_LOBBY_URL to publish this host";
+  } else if (host.empty() || sessionId.empty()) {
+    state_.store(State::kRegistering, std::memory_order_release);
+    lastErr_.clear();
+  } else {
+    state_.store(State::kRegistering, std::memory_order_release);
+    lastErr_.clear();
+  }
+  if (!worker_.joinable()) {
+    stopRequested_.store(false, std::memory_order_release);
+    active_.store(true, std::memory_order_release);
+    worker_ = std::thread(&LobbyHostPublisher::workerLoop, this);
+  } else {
+    cv_.notify_all();
+  }
+}
+
+void LobbyHostPublisher::stop() {
+  std::thread joiner;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!worker_.joinable())
+      return;
+    stopRequested_.store(true, std::memory_order_release);
+    cv_.notify_all();
+    joiner = std::move(worker_);
+  }
+  if (joiner.joinable())
+    joiner.join();
+  active_.store(false, std::memory_order_release);
+  state_.store(State::kIdle, std::memory_order_release);
+}
+
+bool LobbyHostPublisher::postHeartbeatLocked(std::string& errOut) {
+  std::string url, sessionId, host, name;
+  uint16_t port = 0;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    url = url_;
+    sessionId = sessionId_;
+    host = host_;
+    name = name_;
+    port = port_;
+    fieldsDirty_ = false;
+  }
+  if (url.empty() || host.empty() || sessionId.empty()) {
+    errOut = host.empty() ? "no public IP yet" : "publisher not configured";
+    return false;
+  }
+  return lobbyRegisterHeartbeat(url.c_str(), sessionId.c_str(), host.c_str(), port,
+                                name.empty() ? "RetroIkea" : name.c_str(), errOut);
+}
+
+void LobbyHostPublisher::workerLoop() {
+  const auto period = lobbyHeartbeatPeriod();
+  while (!stopRequested_.load(std::memory_order_acquire)) {
+    std::string err;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (!url_.empty() && !host_.empty() && !sessionId_.empty()) {
+        if (state_.load(std::memory_order_acquire) != State::kRegistered)
+          state_.store(State::kRegistering, std::memory_order_release);
+      }
+    }
+    const bool ok = postHeartbeatLocked(err);
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (ok) {
+        if (!firstHeartbeatSent_)
+          std::fprintf(stderr, "[lobby] host listed as \"%s\" at %s:%u\n",
+                       (name_.empty() ? "RetroIkea" : name_.c_str()), host_.c_str(),
+                       static_cast<unsigned>(port_));
+        firstHeartbeatSent_ = true;
+        lastNamePublished_ = name_;
+        lastErr_.clear();
+        state_.store(State::kRegistered, std::memory_order_release);
+      } else {
+        lastErr_ = err;
+        if (url_.empty())
+          state_.store(State::kDisabled, std::memory_order_release);
+        else
+          state_.store(State::kError, std::memory_order_release);
+      }
+    }
+    std::unique_lock<std::mutex> lk(mu_);
+    cv_.wait_for(lk, period, [this] {
+      return stopRequested_.load(std::memory_order_acquire) || fieldsDirty_;
+    });
+  }
+
+  // Final DELETE so the lobby drops the entry without waiting for TTL.
+  std::string url, sessionId;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    url = url_;
+    sessionId = sessionId_;
+  }
+  if (!url.empty() && !sessionId.empty() && firstHeartbeatSent_) {
+    std::string err;
+    if (lobbyUnregisterServer(url.c_str(), sessionId.c_str(), err))
+      std::fprintf(stderr, "[lobby] unregistered host\n");
+    else
+      std::fprintf(stderr, "[lobby] unregister failed: %s\n", err.c_str());
+  }
+}
+
+std::string LobbyHostPublisher::statusText() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  switch (state_.load(std::memory_order_acquire)) {
+    case State::kIdle:
+      return "OFF";
+    case State::kRegistering:
+      if (host_.empty())
+        return "WAITING FOR PUBLIC IP";
+      return "REGISTERING\xE2\x80\xA6";
+    case State::kRegistered: {
+      std::string s = "LISTED AS ";
+      s += lastNamePublished_.empty() ? std::string("RETROIKEA") : lastNamePublished_;
+      return s;
+    }
+    case State::kError:
+      return std::string("ERR ") + lastErr_;
+    case State::kDisabled:
+      return lastErr_.empty() ? std::string("LOBBY URL NOT SET") : lastErr_;
+  }
+  return "?";
 }

@@ -216,15 +216,17 @@ if(OpenSSL_FOUND)
   target_compile_definitions(vulkan_game PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
 endif()
 
-# Public lobby origin. Leave empty by default so stale/broken deployments do not show "Lobby HTTP 404";
-# set RETRO_IKEA_LOBBY_URL at runtime or configure -DRETRO_IKEA_DEFAULT_LOBBY_URL=https://your-service.
-set(RETRO_IKEA_DEFAULT_LOBBY_URL ""
+# Public lobby origin baked into release builds so the WAN server browser works out of the box.
+# Matches the service name in render.yaml ("retro-ikea-lobby"); deploying that blueprint exposes
+# the FastAPI lobby at this canonical URL. Override at configure time with -DRETRO_IKEA_DEFAULT_LOBBY_URL=
+# or per-process at runtime via the RETRO_IKEA_LOBBY_URL env var.
+set(RETRO_IKEA_DEFAULT_LOBBY_URL "https://retro-ikea-lobby.onrender.com"
     CACHE STRING "HTTPS lobby origin when RETRO_IKEA_LOBBY_URL env is unset (no trailing slash); empty disables")
 if(NOT RETRO_IKEA_DEFAULT_LOBBY_URL STREQUAL "")
   target_compile_definitions(vulkan_game PRIVATE
     "RETRO_IKEA_DEFAULT_LOBBY_URL=\"${RETRO_IKEA_DEFAULT_LOBBY_URL}\"")
 endif()
-set(RETRO_IKEA_RELEASE_TAG "beta-10"
+set(RETRO_IKEA_RELEASE_TAG "beta-13"
     CACHE STRING "GitHub release tag baked into the Windows self-updater")
 target_compile_definitions(vulkan_game PRIVATE
   "RETRO_IKEA_RELEASE_TAG=\"${RETRO_IKEA_RELEASE_TAG}\"")
