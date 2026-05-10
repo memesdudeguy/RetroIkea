@@ -216,17 +216,21 @@ if(OpenSSL_FOUND)
   target_compile_definitions(vulkan_game PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
 endif()
 
-# Public lobby origin baked into release builds so the WAN server browser works out of the box.
-# Matches the service name in render.yaml ("retro-ikea-lobby"); deploying that blueprint exposes
-# the FastAPI lobby at this canonical URL. Override at configure time with -DRETRO_IKEA_DEFAULT_LOBBY_URL=
-# or per-process at runtime via the RETRO_IKEA_LOBBY_URL env var.
-set(RETRO_IKEA_DEFAULT_LOBBY_URL "https://retro-ikea-lobby.onrender.com"
-    CACHE STRING "HTTPS lobby origin when RETRO_IKEA_LOBBY_URL env is unset (no trailing slash); empty disables")
+# Default lobby endpoint baked into release builds. Two URL schemes are supported:
+#   - github://owner/repo[/branch]   — GitHub-only lobby (this is the new default). The game reads
+#     lobby/registry.json over raw.githubusercontent.com (anonymous) and hosts publish heartbeats
+#     by triggering the lobby workflow via the GitHub Dispatch API (needs RETRO_IKEA_GH_TOKEN env).
+#   - https://host[:port]            — Classic FastAPI lobby (e.g. self-hosted on Render). The
+#     game POSTs heartbeats to /api/v1/servers/register and reads /api/v1/servers.
+# Override at configure time with -DRETRO_IKEA_DEFAULT_LOBBY_URL=, or per-process via the
+# RETRO_IKEA_LOBBY_URL env var. Empty string disables the lobby entirely.
+set(RETRO_IKEA_DEFAULT_LOBBY_URL "github://memesdudeguy/RetroIkea"
+    CACHE STRING "Lobby endpoint: github://owner/repo[/branch] or https://host[:port] (no trailing slash); empty disables")
 if(NOT RETRO_IKEA_DEFAULT_LOBBY_URL STREQUAL "")
   target_compile_definitions(vulkan_game PRIVATE
     "RETRO_IKEA_DEFAULT_LOBBY_URL=\"${RETRO_IKEA_DEFAULT_LOBBY_URL}\"")
 endif()
-set(RETRO_IKEA_RELEASE_TAG "beta-13"
+set(RETRO_IKEA_RELEASE_TAG "beta-15"
     CACHE STRING "GitHub release tag baked into the Windows self-updater")
 target_compile_definitions(vulkan_game PRIVATE
   "RETRO_IKEA_RELEASE_TAG=\"${RETRO_IKEA_RELEASE_TAG}\"")

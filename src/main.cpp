@@ -4898,21 +4898,25 @@ static std::vector<Vertex> buildControlsHelpOverlayVertices() {
   static char kTitle[] = "CONTROLS";
   static char kBody[] = "WASD / STICK       MOVE\n"
                         "MOUSE / R STICK    LOOK\n"
-                        "SPACE / A          JUMP\n"
+                        "SPACE / SOUTH (A)  JUMP\n"
                         "SHIFT / LB (LT)    SPRINT\n"
-                        "C / B              CROUCH\n"
+                        "C / EAST (B)       CROUCH\n"
                         "C + SHIFT + FWD    SLIDE\n"
                         "\n"
                         "SPACE AT LEDGE     GRAB / CLIMB\n"
                         "SPACE AT WALL      WALL JUMP / CLIMB\n"
                         "SHIFT AT WALL      WALL RUN\n"
-                        "X / Y              CANCEL CLIMB\n"
+                        "WEST (X) / NORTH   CANCEL CLIMB\n"
                         "\n"
                         "LMB / RB           SHOVE STAFF\n"
                         "R3 (PRESS STICK)   KICK\n"
-                        "RT / X (WEST)      PICK UP FOOD\n"
+                        "E / SOUTH / RT     PICK UP FOOD\n"
                         "START              PAUSE   BACK = INV\n"
-                        "ESC                PAUSE";
+                        "ESC                PAUSE\n"
+                        "\n"
+                        "MENUS (PAD): DPAD UP/DOWN MOVE FOCUS\n"
+                        "             SOUTH (A) CONFIRM\n"
+                        "             EAST  (B) BACK / RESUME";
   static char kDismiss[] = "PRESS ANY KEY TO CONTINUE";
   constexpr float kHelpPxToNdc = 0.00052f;
 
@@ -5174,8 +5178,9 @@ static bool parseJoinTargetIpPort(const char* raw, char* outIp, size_t outIpCap,
   return true;
 }
 
+// padFocusedRow: 0..4 = clickable rows (RESUME, EXIT, HOST, JOIN, STOP), -1 = no pad focus.
 static std::vector<Vertex> buildPauseMenuOverlayVertices(const char* mpStatusLine, const char* hostBtnLine,
-                                                           const char* ipLine6) {
+                                                           const char* ipLine6, int padFocusedRow = -1) {
   const glm::vec3 n{0.0f, 0.0f, 1.0f};
   std::vector<Vertex> mesh;
   mesh.reserve(1200);
@@ -5279,6 +5284,15 @@ static std::vector<Vertex> buildPauseMenuOverlayVertices(const char* mpStatusLin
     appendOptionBtnQuads(mesh, n, kSub, line2Y, kPauseSubPx, pauseLineMul, panelHalfW - 0.02f);
     appendHudFontMultilineCentered(mesh, n, kUiIkeaFontOpt, kSub, 0.f, line2Y, kPauseSubPx,
                                    kIkeaMenuFontTrackPx, pauseLineMul);
+    if (padFocusedRow >= 0 && padFocusedRow < 5) {
+      const float lineH = gHudUiFontLineSkipPx * kPauseSubPx;
+      const float step = lineH * pauseLineMul;
+      const float baselineY = line2Y - static_cast<float>(padFocusedRow) * step;
+      static const char kCh[] = ">";
+      const float chW = measureHudFontRunPx(kCh, 1, kIkeaMenuFontTrackPx) * kPauseSubPx;
+      appendHudFontRun(mesh, n, kUiIkeaFontAcc, kCh, 1, -(panelHalfW - 0.06f) - chW * 0.5f,
+                       baselineY, kPauseSubPx, kIkeaMenuFontTrackPx);
+    }
   } else {
     static char kTxt[] = "PAUSED\nRESUME\nEXIT";
     constexpr float scale = 0.0046f;
@@ -5776,7 +5790,8 @@ static std::vector<Vertex> buildLoadingScreenVertices() {
   return mesh;
 }
 
-static std::vector<Vertex> buildTitleMenuMainOverlayVertices(bool showContinue) {
+// padFocusedRow: 0-based clickable option row to highlight with a chevron (-1 = no pad focus).
+static std::vector<Vertex> buildTitleMenuMainOverlayVertices(bool showContinue, int padFocusedRow = -1) {
   const glm::vec3 n{0.0f, 0.0f, 1.0f};
   std::vector<Vertex> mesh;
   mesh.reserve(1200);
@@ -5851,6 +5866,16 @@ static std::vector<Vertex> buildTitleMenuMainOverlayVertices(bool showContinue) 
     appendOptionBtnQuads(mesh, n, kSub, line2Y, kSubPx, kTitleMenuOptionLineSkipMul, panelHalfW - 0.02f);
     appendHudFontMultilineCentered(mesh, n, kUiIkeaFontOpt, kSub, 0.f, line2Y, kSubPx,
                                    kIkeaMenuFontTrackPx, kTitleMenuOptionLineSkipMul);
+    const int totalRows = showContinue ? 4 : 3;
+    if (padFocusedRow >= 0 && padFocusedRow < totalRows) {
+      const float lineH = gHudUiFontLineSkipPx * kSubPx;
+      const float step = lineH * kTitleMenuOptionLineSkipMul;
+      const float baselineY = line2Y - static_cast<float>(padFocusedRow) * step;
+      static const char kCh[] = ">";
+      const float chW = measureHudFontRunPx(kCh, 1, kIkeaMenuFontTrackPx) * kSubPx;
+      appendHudFontRun(mesh, n, kUiIkeaFontAcc, kCh, 1, -(panelHalfW - 0.06f) - chW * 0.5f,
+                       baselineY, kSubPx, kIkeaMenuFontTrackPx);
+    }
   } else {
     const char* fb = showContinue ? "CONTINUE\nNEW GAME\nONLINE\nEXIT" : "NEW GAME\nONLINE\nEXIT";
     constexpr float scale = 0.0048f;
@@ -5862,7 +5887,9 @@ static std::vector<Vertex> buildTitleMenuMainOverlayVertices(bool showContinue) 
   return mesh;
 }
 
-static std::vector<Vertex> buildTitleMenuSlotPickerVertices(const std::array<bool, 4>& slotUsed) {
+// padFocusedRow: 0..3 = saved slot row, 4 = BACK (matches click rowHit indices) — -1 = no pad focus.
+static std::vector<Vertex> buildTitleMenuSlotPickerVertices(const std::array<bool, 4>& slotUsed,
+                                                            int padFocusedRow = -1) {
   const glm::vec3 n{0.0f, 0.0f, 1.0f};
   std::vector<Vertex> mesh;
   mesh.reserve(1400);
@@ -5943,6 +5970,17 @@ static std::vector<Vertex> buildTitleMenuSlotPickerVertices(const std::array<boo
     appendOptionBtnQuads(mesh, n, block, line2Y, kSubPx, kIkeaMenuOptionLineSkipMul, panelHalfW - 0.02f);
     appendHudFontMultilineCentered(mesh, n, kUiIkeaFontOpt, block, 0.f, line2Y, kSubPx,
                                    kIkeaMenuFontTrackPx, kIkeaMenuOptionLineSkipMul);
+    // padFocusedRow indices match computeTitleMenuSlotPickerClickLayout: 1..4 are the slot rows
+    // and 6 is BACK (rows 0/5 are the "CHOOSE SAVE SLOT" header and a blank line).
+    if (padFocusedRow >= 0 && padFocusedRow < subLines) {
+      const float lineH = gHudUiFontLineSkipPx * kSubPx;
+      const float step = lineH * kIkeaMenuOptionLineSkipMul;
+      const float baselineY = line2Y - static_cast<float>(padFocusedRow) * step;
+      static const char kCh[] = ">";
+      const float chW = measureHudFontRunPx(kCh, 1, kIkeaMenuFontTrackPx) * kSubPx;
+      appendHudFontRun(mesh, n, kUiIkeaFontAcc, kCh, 1, -(panelHalfW - 0.06f) - chW * 0.5f,
+                       baselineY, kSubPx, kIkeaMenuFontTrackPx);
+    }
   } else {
     constexpr float scale = 0.0042f;
     stb_easy_font_spacing(-0.5f);
@@ -6041,9 +6079,11 @@ static UiMenuClickLayout computeTitleMenuServerBrowserClickLayout(const std::vec
   return L;
 }
 
+// padFocusedServerIdx: index into `servers` of the row to highlight (-1 = no pad focus).
 static std::vector<Vertex> buildTitleMenuServerBrowserVertices(const std::vector<LobbyListedServer>& servers,
                                                                int scrollInOut,
-                                                               const std::string& statusLine) {
+                                                               const std::string& statusLine,
+                                                               int padFocusedServerIdx = -1) {
   const glm::vec3 n{0.0f, 0.0f, 1.0f};
   std::vector<Vertex> mesh;
   mesh.reserve(2500);
@@ -6119,6 +6159,23 @@ static std::vector<Vertex> buildTitleMenuServerBrowserVertices(const std::vector
     appendOptionBtnQuads(mesh, n, block, line2Y, kSubPx, kIkeaMenuOptionLineSkipMul, panelHalfW - 0.02f);
     appendHudFontMultilineCentered(mesh, n, kUiIkeaFontOpt, block, 0.f, line2Y, kSubPx,
                                    kIkeaMenuFontTrackPx, kIkeaMenuOptionLineSkipMul);
+    // Server browser block layout (matches fillLobbyBrowserBlock): row 0 = "FIND SESSION",
+    // row 1 = status, row 2 = "REFRESH", rows 3..3+visibleRows-1 = server entries (scrolled),
+    // last row = "BACK". When the user has pad-focused a server, light up its visible row.
+    if (padFocusedServerIdx >= 0 && !servers.empty()) {
+      const int visibleStart = scrollTmp;
+      const int visibleRow = padFocusedServerIdx - visibleStart;
+      if (visibleRow >= 0 && visibleRow < kLobbyBrowserVisibleRows) {
+        const int row = 3 + visibleRow;
+        const float lineH = gHudUiFontLineSkipPx * kSubPx;
+        const float step = lineH * kIkeaMenuOptionLineSkipMul;
+        const float baselineY = line2Y - static_cast<float>(row) * step;
+        static const char kCh[] = ">";
+        const float chW = measureHudFontRunPx(kCh, 1, kIkeaMenuFontTrackPx) * kSubPx;
+        appendHudFontRun(mesh, n, kUiIkeaFontAcc, kCh, 1, -(panelHalfW - 0.06f) - chW * 0.5f,
+                         baselineY, kSubPx, kIkeaMenuFontTrackPx);
+      }
+    }
   } else {
     constexpr float scale = 0.0042f;
     stb_easy_font_spacing(-0.5f);
@@ -6188,7 +6245,8 @@ static float wrapAnglePi(float a) {
 static void buildHealthHudOverlayVertices(float hp, float hpMax, float hunger, float hungerMax, float yawRad,
                                           float selfX, float selfZ, bool hasRemotePlayer,
                                           float remoteX, float remoteZ, int dayCount,
-                                          bool showInteractHint, std::vector<Vertex>& mesh) {
+                                          bool showInteractHint, bool padInteractHint,
+                                          std::vector<Vertex>& mesh) {
   const glm::vec3 n{0.0f, 0.0f, 1.0f};
   mesh.clear();
   mesh.reserve(2200);
@@ -6374,12 +6432,17 @@ static void buildHealthHudOverlayVertices(float hp, float hpMax, float hunger, f
   }
 
   if (showInteractHint) {
-    static const char kHint[] = "PRESS E TO PICK UP";
+    // Swap the interact glyph + verb depending on the active input device so a controller user
+    // sees "PRESS A TO PICK UP" instead of an E-key hint they can't act on.
+    static const char kHintKb[] = "PRESS E TO PICK UP";
+    static const char kHintPad[] = "PRESS A TO PICK UP";
+    const char* kHint = padInteractHint ? kHintPad : kHintKb;
+    const size_t hintLen = std::strlen(kHint);
     constexpr float kHintPx = 0.00056f;
     constexpr float hintY = -0.15f;
     if (gHudUiFontReady) {
-      const float hintW = measureHudFontRunPx(kHint, std::strlen(kHint)) * kHintPx;
-      appendHudFontRun(mesh, n, kUiHudFontAcc, kHint, std::strlen(kHint), -0.5f * hintW, hintY, kHintPx);
+      const float hintW = measureHudFontRunPx(kHint, hintLen) * kHintPx;
+      appendHudFontRun(mesh, n, kUiHudFontAcc, kHint, hintLen, -0.5f * hintW, hintY, kHintPx);
     } else {
       const int w = stb_easy_font_width(const_cast<char*>(kHint));
       const float tw = static_cast<float>(w) * 0.0011f;
@@ -6712,6 +6775,7 @@ struct App {
   float healthHudCacheRemoteZ = 1e10f;
   int healthHudCacheDayCount = -1;
   bool healthHudCacheInteractHint = false;
+  bool healthHudCachePadInteractHint = false;
   int uboCachedExtraBlend = 0;
   int uboCachedStaffTexBlend = 255;
   VkBuffer signVertexBuffer = VK_NULL_HANDLE;
@@ -6961,6 +7025,17 @@ struct App {
   SDL_GameController* gameController = nullptr;
   SDL_Joystick* fallbackJoystick = nullptr;
   GamepadTuning gamepadTuning = loadGamepadTuningFromEnv();
+  // "Most recent input device" sticky state — flips to kPad on any controller event and back to
+  // kMouseKb on real mouse/keyboard activity. The UI uses it to hide the system cursor, switch
+  // interact prompts to controller glyphs, and gate hover-driven row highlights.
+  enum class ActiveInputMode : int { kMouseKb = 0, kPad = 1 };
+  ActiveInputMode activeInputMode = ActiveInputMode::kMouseKb;
+  double activeInputModeChangedMono = -1.0;
+  // Console-style focus indices for menus that previously only responded to mouse rowHit().
+  // -1 means "no pad focus yet" (defaults to row 0 on first DPAD movement).
+  int titleMenuMainPadFocus = -1;
+  int titleMenuSlotPadFocus = -1;
+  int pauseMenuPadFocus = -1;
   // Pad-driven lobby browser focus (cursor row through visible+hidden server entries).
   int titleMenuLobbyPadFocus = -1;
   // Async title-menu lobby refresh so a Render free-tier cold-start (can take 30+ seconds) does
@@ -9853,11 +9928,38 @@ struct App {
     return any;
   }
 
+  // Treat pad input as "hot" for ~5 minutes after the most recent pad event so the user can put
+  // the mouse down without immediately losing the controller-style cursor-hidden UI.
+  bool isPadInputModeActive() const {
+    return activeInputMode == ActiveInputMode::kPad;
+  }
+
+  // Latch the most-recent input device. Re-enables the cursor automatically when the user grabs
+  // the mouse, and forces a UI mesh refresh for menus that use pad-only focus highlights.
+  void noteInputFromMouseKb() {
+    if (activeInputMode != ActiveInputMode::kMouseKb) {
+      activeInputMode = ActiveInputMode::kMouseKb;
+      activeInputModeChangedMono = retroMpMonotonicSec();
+      onActiveInputModeChanged();
+    }
+  }
+  void noteInputFromPad() {
+    if (activeInputMode != ActiveInputMode::kPad) {
+      activeInputMode = ActiveInputMode::kPad;
+      activeInputModeChangedMono = retroMpMonotonicSec();
+      onActiveInputModeChanged();
+    }
+  }
+  // Defined later (onActiveInputModeChangedImpl) once recreate*GpuMesh helpers are in scope.
+  void onActiveInputModeChanged() { onActiveInputModeChangedImpl(); }
+
   void syncInputGrab() {
+    const bool padHot = isPadInputModeActive();
     if (showControlsOverlay) {
       SDL_SetRelativeMouseMode(SDL_FALSE);
-      SDL_ShowCursor(SDL_ENABLE);
-      applyYellowMenuCursorIfNeeded();
+      SDL_ShowCursor(padHot ? SDL_DISABLE : SDL_ENABLE);
+      if (!padHot)
+        applyYellowMenuCursorIfNeeded();
       if (std::getenv("VULKAN_GAME_MOUSE_CAPTURE"))
         SDL_CaptureMouse(SDL_FALSE);
       return;
@@ -9871,16 +9973,18 @@ struct App {
     }
     if (inIntroSplash) {
       SDL_SetRelativeMouseMode(SDL_FALSE);
-      SDL_ShowCursor(SDL_ENABLE);
-      applyYellowMenuCursorIfNeeded();
+      SDL_ShowCursor(padHot ? SDL_DISABLE : SDL_ENABLE);
+      if (!padHot)
+        applyYellowMenuCursorIfNeeded();
       if (std::getenv("VULKAN_GAME_MOUSE_CAPTURE"))
         SDL_CaptureMouse(SDL_FALSE);
       return;
     }
     if (inTitleMenu || showPauseMenu || showInventoryMenu || playerDeathShowMenu) {
       SDL_SetRelativeMouseMode(SDL_FALSE);
-      SDL_ShowCursor(SDL_ENABLE);
-      applyYellowMenuCursorIfNeeded();
+      SDL_ShowCursor(padHot ? SDL_DISABLE : SDL_ENABLE);
+      if (!padHot)
+        applyYellowMenuCursorIfNeeded();
       if (std::getenv("VULKAN_GAME_MOUSE_CAPTURE"))
         SDL_CaptureMouse(SDL_FALSE);
       return;
@@ -14387,6 +14491,7 @@ struct App {
       const bool canShowInteractHint =
           !showPauseMenu && !showInventoryMenu && !showControlsOverlay && !playerDeathActive && !inTitleMenu &&
           canPickupNearbyDeliFood();
+      const bool padInteractHint = isPadInputModeActive();
       const bool hudDirty =
           healthHudCachedVertexCount == 0 ||
           std::fabs(playerHealth - healthHudCacheHp) > kHudHpCacheEps ||
@@ -14400,11 +14505,12 @@ struct App {
           (hasRemotePlayer && (std::fabs(remoteX - healthHudCacheRemoteX) > kHudPosCacheEps ||
                                std::fabs(remoteZ - healthHudCacheRemoteZ) > kHudPosCacheEps)) ||
           curDayCount != healthHudCacheDayCount ||
-          canShowInteractHint != healthHudCacheInteractHint;
+          canShowInteractHint != healthHudCacheInteractHint ||
+          padInteractHint != healthHudCachePadInteractHint;
       if (hudDirty) {
         buildHealthHudOverlayVertices(playerHealth, kPlayerHealthMax, playerHunger, kPlayerHungerMax, yaw,
                                       camPos.x, camPos.z, hasRemotePlayer, remoteX, remoteZ, curDayCount,
-                                      canShowInteractHint, healthHudVertexCache);
+                                      canShowInteractHint, padInteractHint, healthHudVertexCache);
         healthHudCacheHp = playerHealth;
         healthHudCacheHpMax = kPlayerHealthMax;
         healthHudCacheHunger = playerHunger;
@@ -14417,6 +14523,7 @@ struct App {
         healthHudCacheRemoteZ = remoteZ;
         healthHudCacheDayCount = curDayCount;
         healthHudCacheInteractHint = canShowInteractHint;
+        healthHudCachePadInteractHint = padInteractHint;
         healthHudCachedVertexCount = static_cast<uint32_t>(healthHudVertexCache.size());
         const VkDeviceSize hudBytes =
             sizeof(Vertex) * static_cast<VkDeviceSize>(healthHudCachedVertexCount);
@@ -15610,6 +15717,39 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       running = false;
     if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_RESIZED)
       framebufferResized = true;
+    // Track which device most recently produced input so the UI can hide the cursor + show pad
+    // focus chevrons + change interact prompts to controller glyphs. We only flip on real movement
+    // (not warp-induced 0,0 motion) and on real button events so a stationary mouse never overrides
+    // active controller play.
+    if (e.type == SDL_CONTROLLERBUTTONDOWN || e.type == SDL_CONTROLLERAXISMOTION) {
+      // Filter out tiny analog drift below ~25% deflection so a slow-leaking stick doesn't fight
+      // the keyboard for input mode ownership.
+      if (e.type == SDL_CONTROLLERBUTTONDOWN ||
+          std::abs(static_cast<int>(e.caxis.value)) > 8000) {
+        noteInputFromPad();
+      }
+    }
+    if (e.type == SDL_JOYBUTTONDOWN || e.type == SDL_JOYHATMOTION) {
+      noteInputFromPad();
+    }
+    if (e.type == SDL_JOYAXISMOTION && std::abs(static_cast<int>(e.jaxis.value)) > 8000) {
+      noteInputFromPad();
+    }
+    if (e.type == SDL_KEYDOWN || e.type == SDL_TEXTINPUT) {
+      noteInputFromMouseKb();
+    }
+    if (e.type == SDL_MOUSEMOTION && (e.motion.xrel != 0 || e.motion.yrel != 0)) {
+      noteInputFromMouseKb();
+    }
+    if (e.type == SDL_MOUSEBUTTONDOWN || e.type == SDL_MOUSEWHEEL) {
+      noteInputFromMouseKb();
+    }
+    // While a pad is the active device and we are inside a clickable menu, swallow stray
+    // mouse-button clicks so a face-down mouse on the desk can't accidentally pick a row.
+    if (isPadInputModeActive() && e.type == SDL_MOUSEBUTTONDOWN &&
+        (inTitleMenu || showPauseMenu || showInventoryMenu || playerDeathShowMenu) &&
+        !showControlsOverlay)
+      return;
     if (e.type == SDL_CONTROLLERDEVICEADDED) {
       if (!gameController && SDL_IsGameController(e.cdevice.which)) {
         closeFallbackJoystick();
@@ -15743,6 +15883,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
                           padButtonDown == SDL_CONTROLLER_BUTTON_A)) {
       inIntroSplash = false;
       inTitleMenu = true;
+      titleMenuMainPadFocus = 0;
       titleMenuSceneTime = 0.f;
       titleMenuSlideTime = 0.f;
       titleMenuSlideWasSlot = false;
@@ -15818,6 +15959,9 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
         showPauseMenu = !showPauseMenu;
         if (showPauseMenu) {
           pauseMenuMpIpFocused = false;
+          // Default focus to RESUME row so the first D-pad movement is meaningful and the
+          // chevron is visible immediately if the user is on a controller.
+          pauseMenuPadFocus = 0;
           audioSetStoreDayNightCyclePaused(false);
           mouseGrab = false;
           syncInputGrab();
@@ -15826,6 +15970,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
           maybeLogControllerHintForPauseMenu();
         } else {
           pauseMenuMpIpFocused = false;
+          pauseMenuPadFocus = -1;
           SDL_StopTextInput();
           audioSetStoreDayNightCyclePaused(false);
           mouseGrab = true;
@@ -15914,41 +16059,118 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
             return;
           }
         } else if (titleMenuPickSlot) {
+          // Slot picker focus rows: 1..4 are slots 0..3, 6 is BACK (matches click rowHit indices).
+          // We keep an internal slotIndex (-1=BACK, 0..3=slot rows) and translate to the chevron row.
+          auto focusRowToSlot = [](int focusRow) {
+            if (focusRow >= 1 && focusRow <= kGameSaveSlotCount) return focusRow - 1;
+            return -1;
+          };
+          if (titleMenuSlotPadFocus < 0 ||
+              (titleMenuSlotPadFocus != 6 && (titleMenuSlotPadFocus < 1 || titleMenuSlotPadFocus > 4)))
+            titleMenuSlotPadFocus = 1;
+          if (padButtonDown == SDL_CONTROLLER_BUTTON_DPAD_UP) {
+            if (titleMenuSlotPadFocus == 6)
+              titleMenuSlotPadFocus = 4;
+            else if (titleMenuSlotPadFocus > 1)
+              titleMenuSlotPadFocus -= 1;
+            else
+              titleMenuSlotPadFocus = 6;
+            recreateTitleMenuSlotGpuMesh();
+            return;
+          }
+          if (padButtonDown == SDL_CONTROLLER_BUTTON_DPAD_DOWN) {
+            if (titleMenuSlotPadFocus == 6)
+              titleMenuSlotPadFocus = 1;
+            else if (titleMenuSlotPadFocus < 4)
+              titleMenuSlotPadFocus += 1;
+            else
+              titleMenuSlotPadFocus = 6;
+            recreateTitleMenuSlotGpuMesh();
+            return;
+          }
           if (padButtonDown == SDL_CONTROLLER_BUTTON_B) {
             titleMenuPickSlot = false;
             titleMenuPendingLobbyJoin = false;
             titleMenuPendingLobbyJoinHost[0] = '\0';
+            titleMenuSlotPadFocus = -1;
             recreateTitleMenuMainGpuMesh();
             return;
           }
-          if (padButtonDown == SDL_CONTROLLER_BUTTON_A) {
+          if (padButtonDown == SDL_CONTROLLER_BUTTON_A ||
+              padButtonDown == SDL_CONTROLLER_BUTTON_START) {
+            if (titleMenuSlotPadFocus == 6) {
+              titleMenuPickSlot = false;
+              titleMenuPendingLobbyJoin = false;
+              titleMenuPendingLobbyJoinHost[0] = '\0';
+              titleMenuSlotPadFocus = -1;
+              recreateTitleMenuMainGpuMesh();
+              return;
+            }
+            const int slot = focusRowToSlot(titleMenuSlotPadFocus);
+            if (slot >= 0 && slot < kGameSaveSlotCount) {
+              beginGameFromSaveSlot(slot);
+              return;
+            }
+          }
+          // Hold-over: number-button shortcuts so people who learned the old bindings keep working.
+          if (padButtonDown == SDL_CONTROLLER_BUTTON_X) {
             beginGameFromSaveSlot(0);
             return;
           }
-          if (padButtonDown == SDL_CONTROLLER_BUTTON_X) {
+          if (padButtonDown == SDL_CONTROLLER_BUTTON_Y) {
             beginGameFromSaveSlot(1);
             return;
           }
-          if (padButtonDown == SDL_CONTROLLER_BUTTON_Y) {
-            beginGameFromSaveSlot(2);
+        } else {
+          // Console-style focus navigation: D-pad up/down moves the focused row, A confirms,
+          // B exits. X/Y kept as power-user shortcuts so legacy bindings still work.
+          const int rowCount = titleMenuHasContinue ? 4 : 3;
+          if (titleMenuMainPadFocus < 0 || titleMenuMainPadFocus >= rowCount)
+            titleMenuMainPadFocus = 0;
+          if (padButtonDown == SDL_CONTROLLER_BUTTON_DPAD_UP) {
+            titleMenuMainPadFocus = (titleMenuMainPadFocus + rowCount - 1) % rowCount;
+            recreateTitleMenuMainGpuMesh();
             return;
           }
-        } else {
+          if (padButtonDown == SDL_CONTROLLER_BUTTON_DPAD_DOWN) {
+            titleMenuMainPadFocus = (titleMenuMainPadFocus + 1) % rowCount;
+            recreateTitleMenuMainGpuMesh();
+            return;
+          }
           if (padButtonDown == SDL_CONTROLLER_BUTTON_B) {
             running = false;
             return;
           }
-          if (padButtonDown == SDL_CONTROLLER_BUTTON_A) {
-            if (titleMenuHasContinue)
+          if (padButtonDown == SDL_CONTROLLER_BUTTON_A ||
+              padButtonDown == SDL_CONTROLLER_BUTTON_START) {
+            const bool hasC = titleMenuHasContinue;
+            const int row = titleMenuMainPadFocus;
+            if (hasC && row == 0) {
               continueFromLastSave();
-            else {
-              titleMenuPickSlot = true;
-              recreateTitleMenuSlotGpuMesh();
+              return;
             }
-            return;
+            const int newGameRow = hasC ? 1 : 0;
+            const int onlineRow = hasC ? 2 : 1;
+            const int exitRow = hasC ? 3 : 2;
+            if (row == newGameRow) {
+              titleMenuPickSlot = true;
+              titleMenuSlotPadFocus = 1;
+              recreateTitleMenuSlotGpuMesh();
+              return;
+            }
+            if (row == onlineRow) {
+              titleMenuBrowseServers = true;
+              refreshTitleMenuLobbyFetchAndMesh();
+              return;
+            }
+            if (row == exitRow) {
+              running = false;
+              return;
+            }
           }
           if (padButtonDown == SDL_CONTROLLER_BUTTON_X) {
             titleMenuPickSlot = true;
+            titleMenuSlotPadFocus = 1;
             recreateTitleMenuSlotGpuMesh();
             return;
           }
@@ -16033,17 +16255,98 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
         }
       }
       if (showPauseMenu && !pauseMenuMpIpFocused) {
-        // Controller bindings on the pause menu (mirrors the rendered click rows).
-        // A or B = resume game; X = host; Y = join (using current IP buffer);
-        // RB = stop multiplayer; LB = save & quit to title; Back = save & quit (same as LB).
-        if (padButtonDown == SDL_CONTROLLER_BUTTON_A || padButtonDown == SDL_CONTROLLER_BUTTON_B) {
+        // Console-style focus navigation: D-pad up/down moves focus across the 5 clickable rows
+        // (RESUME, EXIT, HOST, JOIN, STOP), A confirms the focused row, B always resumes. Existing
+        // shortcut bindings (X=host, Y=join, RB=stop, LB/Back=save+quit) are kept so power users
+        // don't have to re-learn anything.
+        constexpr int kPauseRowResume = 0;
+        constexpr int kPauseRowExit = 1;
+        constexpr int kPauseRowHost = 2;
+        constexpr int kPauseRowJoin = 3;
+        constexpr int kPauseRowStopMp = 4;
+        if (pauseMenuPadFocus < 0 || pauseMenuPadFocus > kPauseRowStopMp)
+          pauseMenuPadFocus = kPauseRowResume;
+        if (padButtonDown == SDL_CONTROLLER_BUTTON_DPAD_UP) {
+          pauseMenuPadFocus = (pauseMenuPadFocus + (kPauseRowStopMp + 1) - 1) % (kPauseRowStopMp + 1);
+          recreatePauseMenuGpuMesh();
+          return;
+        }
+        if (padButtonDown == SDL_CONTROLLER_BUTTON_DPAD_DOWN) {
+          pauseMenuPadFocus = (pauseMenuPadFocus + 1) % (kPauseRowStopMp + 1);
+          recreatePauseMenuGpuMesh();
+          return;
+        }
+        if (padButtonDown == SDL_CONTROLLER_BUTTON_B) {
           pauseMenuMpIpFocused = false;
           SDL_StopTextInput();
           showPauseMenu = false;
+          pauseMenuPadFocus = -1;
           audioSetStoreDayNightCyclePaused(false);
           mouseGrab = true;
           syncInputGrab();
           return;
+        }
+        if (padButtonDown == SDL_CONTROLLER_BUTTON_A ||
+            padButtonDown == SDL_CONTROLLER_BUTTON_START) {
+          if (pauseMenuPadFocus == kPauseRowResume) {
+            pauseMenuMpIpFocused = false;
+            SDL_StopTextInput();
+            showPauseMenu = false;
+            audioSetStoreDayNightCyclePaused(false);
+            mouseGrab = true;
+            syncInputGrab();
+            return;
+          }
+          if (pauseMenuPadFocus == kPauseRowExit) {
+            pauseMenuMpIpFocused = false;
+            SDL_StopTextInput();
+            gameSaveWrite();
+            returnToTitleMenuFromGame();
+            return;
+          }
+          if (pauseMenuPadFocus == kPauseRowHost) {
+            pauseMenuMpIpFocused = false;
+            SDL_StopTextInput();
+            mpClientSpawnSynced = false;
+            mpClientLastLinkMono = -1.0;
+            stopLobbyHostPublisher();
+            lobbyHeartbeatSessionId[0] = '\0';
+            netMp.startHost(kRetroMpDefaultPort);
+            lobbyHeartbeatAccumSec = 0.;
+            startLobbyHostPublisher();
+            recreatePauseMenuGpuMesh();
+            return;
+          }
+          if (pauseMenuPadFocus == kPauseRowJoin) {
+            pauseMenuMpIpFocused = false;
+            SDL_StopTextInput();
+            char joinIp[128]{};
+            uint16_t joinPort = kRetroMpDefaultPort;
+            if (parseJoinTargetIpPort(pauseMenuJoinIpBuf, joinIp, sizeof(joinIp), joinPort)) {
+              mpClientSpawnSynced = false;
+              mpClientLastLinkMono = -1.0;
+              netMp.startJoin(joinIp, joinPort);
+            } else {
+              std::fprintf(stderr,
+                           "[mp] Pad join: enter a valid IP first (use mouse on EDIT IP, or env "
+                           "VULKAN_GAME_MP_JOIN=ip[:port]). Buffer is \"%s\".\n",
+                           pauseMenuJoinIpBuf);
+            }
+            recreatePauseMenuGpuMesh();
+            return;
+          }
+          if (pauseMenuPadFocus == kPauseRowStopMp) {
+            pauseMenuMpIpFocused = false;
+            SDL_StopTextInput();
+            mpClientSpawnSynced = false;
+            mpClientLastLinkMono = -1.0;
+            stopLobbyHostPublisher();
+            netMp.stop();
+            lobbyHeartbeatSessionId[0] = '\0';
+            lobbyHeartbeatAccumSec = 0.;
+            recreatePauseMenuGpuMesh();
+            return;
+          }
         }
         if (padButtonDown == SDL_CONTROLLER_BUTTON_LEFTSHOULDER ||
             padButtonDown == SDL_CONTROLLER_BUTTON_BACK) {
@@ -16136,6 +16439,13 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     if (e.type == SDL_KEYDOWN && e.key.repeat == 0 && e.key.keysym.sym == SDLK_e &&
         !showControlsOverlay && !showPauseMenu && !showInventoryMenu && !playerDeathActive &&
         !inTitleMenu) {
+      if (tryPickupNearestDeliPizzaSlice())
+        return;
+    }
+    // Console-style "press A to interact": when in-game with no menu open, A fires pickup just like
+    // the keyboard E key. RT keeps working too (existing per-frame trigger watcher in mainLoop).
+    if (padButtonDown == SDL_CONTROLLER_BUTTON_A && mouseGrab && !showControlsOverlay &&
+        !showPauseMenu && !showInventoryMenu && !playerDeathActive && !inTitleMenu) {
       if (tryPickupNearestDeliPizzaSlice())
         return;
     }
@@ -16292,6 +16602,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
           showPauseMenu = !showPauseMenu;
           if (showPauseMenu) {
             pauseMenuMpIpFocused = false;
+            pauseMenuPadFocus = 0;
             audioSetStoreDayNightCyclePaused(false);
             mouseGrab = false;
             syncInputGrab();
@@ -16300,6 +16611,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
             maybeLogControllerHintForPauseMenu();
           } else {
             pauseMenuMpIpFocused = false;
+            pauseMenuPadFocus = -1;
             SDL_StopTextInput();
             audioSetStoreDayNightCyclePaused(false);
             mouseGrab = true;
@@ -19478,15 +19790,17 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
 
   void recreateTitleMenuMainGpuMesh() {
     refreshTitleMenuContinueState();
-    uploadUiMeshToGpu(buildTitleMenuMainOverlayVertices(titleMenuHasContinue), titleMenuMainVertexBuffer,
-                      titleMenuMainVertexBufferMemory, titleMenuMainVertexCount);
+    const int focus = isPadInputModeActive() ? titleMenuMainPadFocus : -1;
+    uploadUiMeshToGpu(buildTitleMenuMainOverlayVertices(titleMenuHasContinue, focus),
+                      titleMenuMainVertexBuffer, titleMenuMainVertexBufferMemory, titleMenuMainVertexCount);
   }
 
   void recreateTitleMenuSlotGpuMesh() {
     std::array<bool, 4> used{};
     for (int i = 0; i < kGameSaveSlotCount; ++i)
       used[static_cast<size_t>(i)] = saveSlotFileLooksValid(gameSaveSlotPath(i));
-    uploadUiMeshToGpu(buildTitleMenuSlotPickerVertices(used), titleMenuSlotVertexBuffer,
+    const int focus = isPadInputModeActive() ? titleMenuSlotPadFocus : -1;
+    uploadUiMeshToGpu(buildTitleMenuSlotPickerVertices(used, focus), titleMenuSlotVertexBuffer,
                       titleMenuSlotVertexBufferMemory, titleMenuSlotVertexCount);
   }
 
@@ -19581,7 +19895,8 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       const int maxScroll0 = 0;
       titleMenuLobbyScroll = std::clamp(titleMenuLobbyScroll, 0, maxScroll0);
       uploadUiMeshToGpu(buildTitleMenuServerBrowserVertices(titleMenuLobbyServers, titleMenuLobbyScroll,
-                                                            titleMenuLobbyStatus),
+                                                            titleMenuLobbyStatus,
+                                                            isPadInputModeActive() ? titleMenuLobbyPadFocus : -1),
                         titleMenuServerVertexBuffer, titleMenuServerVertexBufferMemory,
                         titleMenuServerVertexCount);
       return;
@@ -19590,7 +19905,8 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       // Still waiting on previous fetch — show an "in flight" message and let it finish.
       titleMenuLobbyStatus = "Refreshing lobby…";
       uploadUiMeshToGpu(buildTitleMenuServerBrowserVertices(titleMenuLobbyServers, titleMenuLobbyScroll,
-                                                            titleMenuLobbyStatus),
+                                                            titleMenuLobbyStatus,
+                                                            isPadInputModeActive() ? titleMenuLobbyPadFocus : -1),
                         titleMenuServerVertexBuffer, titleMenuServerVertexBufferMemory,
                         titleMenuServerVertexCount);
       return;
@@ -19603,7 +19919,8 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     const int maxScroll = std::max(0, static_cast<int>(titleMenuLobbyServers.size()) - kLobbyBrowserVisibleRows);
     titleMenuLobbyScroll = std::clamp(titleMenuLobbyScroll, 0, maxScroll);
     uploadUiMeshToGpu(buildTitleMenuServerBrowserVertices(titleMenuLobbyServers, titleMenuLobbyScroll,
-                                                          titleMenuLobbyStatus),
+                                                          titleMenuLobbyStatus,
+                                                          isPadInputModeActive() ? titleMenuLobbyPadFocus : -1),
                       titleMenuServerVertexBuffer, titleMenuServerVertexBufferMemory,
                       titleMenuServerVertexCount);
 
@@ -19677,7 +19994,8 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     if (titleMenuLobbyPadFocus >= n)
       titleMenuLobbyPadFocus = n > 0 ? n - 1 : -1;
     uploadUiMeshToGpu(buildTitleMenuServerBrowserVertices(titleMenuLobbyServers, titleMenuLobbyScroll,
-                                                          titleMenuLobbyStatus),
+                                                          titleMenuLobbyStatus,
+                                                          isPadInputModeActive() ? titleMenuLobbyPadFocus : -1),
                       titleMenuServerVertexBuffer, titleMenuServerVertexBufferMemory,
                       titleMenuServerVertexCount);
   }
@@ -19686,7 +20004,9 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     const int n = static_cast<int>(titleMenuLobbyServers.size());
     const int maxScroll = std::max(0, n - kLobbyBrowserVisibleRows);
     titleMenuLobbyScroll = std::clamp(titleMenuLobbyScroll, 0, maxScroll);
-    uploadUiMeshToGpu(buildTitleMenuServerBrowserVertices(titleMenuLobbyServers, titleMenuLobbyScroll, titleMenuLobbyStatus),
+    uploadUiMeshToGpu(buildTitleMenuServerBrowserVertices(titleMenuLobbyServers, titleMenuLobbyScroll,
+                                                          titleMenuLobbyStatus,
+                                                          isPadInputModeActive() ? titleMenuLobbyPadFocus : -1),
                       titleMenuServerVertexBuffer, titleMenuServerVertexBufferMemory, titleMenuServerVertexCount);
   }
 
@@ -19743,6 +20063,26 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
                  "Y = refresh, B = back.\n");
   }
 
+  // Defined here, after the recreate*GpuMesh helpers, so it can call them. Triggered whenever the
+  // active input device flips between mouse/keyboard and a controller; rebuilds open-menu meshes
+  // so focus chevrons appear (pad) or disappear (mouse) immediately, and re-syncs the cursor.
+  // Implementation deferred via this stub forward-declared earlier in the class body.
+  void onActiveInputModeChangedImpl() {
+    syncInputGrab();
+    if (inTitleMenu) {
+      if (titleMenuBrowseServers)
+        rebuildTitleMenuServerUiMesh();
+      if (titleMenuPickSlot)
+        recreateTitleMenuSlotGpuMesh();
+      if (!titleMenuPickSlot && !titleMenuBrowseServers)
+        recreateTitleMenuMainGpuMesh();
+    }
+    if (showPauseMenu)
+      recreatePauseMenuGpuMesh();
+    if (showInventoryMenu)
+      inventoryMenuCacheScroll = -1;
+  }
+
   void recreatePauseMenuGpuMesh() {
     if (netMp.active && netMp.isHost)
       netMp.refreshAnnounceJoinIpv4();
@@ -19750,8 +20090,9 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
     std::snprintf(hostB, sizeof hostB, "HOST SESSION (UDP %u)", static_cast<unsigned>(kRetroMpDefaultPort));
     char ipL[128];
     std::snprintf(ipL, sizeof ipL, "IP %s", pauseMenuJoinIpBuf);
-    uploadUiMeshToGpu(buildPauseMenuOverlayVertices(pauseMenuMpStatusCstr(), hostB, ipL), pauseMenuVertexBuffer,
-                      pauseMenuVertexBufferMemory, pauseMenuVertexCount);
+    const int focus = isPadInputModeActive() ? pauseMenuPadFocus : -1;
+    uploadUiMeshToGpu(buildPauseMenuOverlayVertices(pauseMenuMpStatusCstr(), hostB, ipL, focus),
+                      pauseMenuVertexBuffer, pauseMenuVertexBufferMemory, pauseMenuVertexCount);
   }
 
   void destroyTitleMenuGpuMeshes() {
@@ -19826,11 +20167,14 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
 
   void returnToTitleMenuFromGame() {
     showPauseMenu = false;
+    pauseMenuPadFocus = -1;
     showInventoryMenu = false;
     inventoryUiSelectedStackIdx = -1;
     worldDroppedFood.clear();
     mpNextDroppedFoodId = 1;
     inTitleMenu = true;
+    titleMenuMainPadFocus = 0;
+    titleMenuSlotPadFocus = -1;
     titleMenuSceneTime = 0.f;
     titleMenuSlideTime = 0.f;
     titleMenuSlideWasSlot = false;

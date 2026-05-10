@@ -1,0 +1,61 @@
+name: lobby
+
+# GitHub-only RetroIkea lobby. Hosts publish heartbeats by triggering this
+# workflow via repository_dispatch (event_type=lobby_register / lobby_unregister)
+# from inside the game; clients read the resulting `lobby/registry.json` over
+# the unauthenticated raw.githubusercontent.com CDN. No external server needed.
+#
+# Trade-off: GitHub Actions runs take 10-30s to spin up a runner, so a freshly
+# launched host appears in the browser within ~30-60s — slower than a dedicated
+# server but free, durable, and stateless.
+
+on:
+  repository_dispatch:
+    types: [lobby_register, lobby_unregister]
+  schedule:
+    # GitHub free tier honors cron at ~5 min granularity; this prunes any host
+    # whose `expires_at` has passed without a refresh heartbeat.
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Serialize updates so two near-simultaneous heartbeats don't race on the same
+# registry file. cancel-in-progress is false: every register/unregister must be
+# applied (lossless), but they queue rather than parallelize.
+concurrency:
+  group: lobby-registry
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Apply lobby change
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: python tools/lobby_apply.py
+
+      - name: Commit & push registry
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add lobby/registry.json
+          if git diff --cached --quiet; then
+            echo "[lobby] no changes; skipping commit"
+            exit 0
+          fi
+          # The concurrency group above serializes runs, so a simple commit+push
+          # is safe: only one lobby workflow can be in this step at a time.
+          git commit -m "lobby: ${{ github.event_name }} ${{ github.event.action }}" --allow-empty-message
+          git push

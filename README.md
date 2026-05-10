@@ -51,19 +51,33 @@ Produces `packaging/RetroIkea-Beta-Setup.exe` (installer) that installs `RetroIk
 
 ## Online lobby (browser server list)
 
-Beta builds ship with **`RETRO_IKEA_DEFAULT_LOBBY_URL=https://retro-ikea-lobby.onrender.com`** baked in via CMake, so the title-menu lobby browser is wired to a public WAN endpoint out of the box. The HTTP API itself lives in [`server/`](server/) (FastAPI). Override per-PC with `RETRO_IKEA_LOBBY_URL` or rebuild with `-DRETRO_IKEA_DEFAULT_LOBBY_URL=https://your-fork.example` to point at a fork — origin only, **no trailing slash**.
+Beta builds ship with **`RETRO_IKEA_DEFAULT_LOBBY_URL=github://memesdudeguy/RetroIkea`** baked in via CMake. The lobby is hosted **entirely on GitHub** — no external server, no Render, no Fly.io:
 
-To bring the public lobby online (one-time, by the project owner):
+- A small JSON file ([`lobby/registry.json`](lobby/registry.json)) tracked in this repo is the lobby state.
+- Clients read it via `https://raw.githubusercontent.com/memesdudeguy/RetroIkea/main/lobby/registry.json` (anonymous, free, CDN-cached).
+- Hosts publish heartbeats by triggering the [`lobby` workflow](.github/workflows/lobby.yml) through GitHub's `repository_dispatch` API (`event_type=lobby_register` / `lobby_unregister`).
+- A scheduled run of the same workflow prunes any entry whose `expires_at` has passed (~5 min granularity on the free GitHub Actions tier).
 
-1. Sign in to [Render](https://dashboard.render.com), open **Blueprints**, point it at this repo, and apply [`render.yaml`](render.yaml). The service name must stay **`retro-ikea-lobby`** so the public URL matches the baked-in default.
-2. Wait for the first deploy to finish; visit `https://retro-ikea-lobby.onrender.com/healthz` to confirm a `{"status":"ok"}` response.
+Trade-off: GitHub Actions runs take 10–30s to spin up a runner, so a freshly launched host appears in the browser within ~30–60s — slower than a dedicated server but free, durable, and stateless. Cold-start tolerant timeouts (8s connect / 30s read) are baked into the title-menu fetch.
 
-After deploy:
+### Hosts: how to publish to the public lobby
 
-- Hosts auto-publish to the lobby the moment they pick "HOST SESSION" (background heartbeat + DELETE on stop).
-- Clients can browse via the title-menu **FIND SESSION** button without setting any env vars.
-- The free Render tier sleeps after 15 min of inactivity. The first refresh after a sleep takes ~30s — the title menu now fetches asynchronously and shows "Lobby waking up (free tier) — press REFRESH again in 30s." while it warms.
-- **Run locally** (LAN testing, no Render needed): see [`server/README.md`](server/README.md).
+The dispatch API requires authentication, so each host needs a personal access token:
+
+1. Open <https://github.com/settings/personal-access-tokens/new>.
+2. Create a **fine-grained token** with **only** these scopes on `memesdudeguy/RetroIkea`:
+   - **Contents: Read & Write** (so the lobby workflow can commit registry updates the token triggered).
+3. Set `RETRO_IKEA_GH_TOKEN=<token>` in the launching shell / environment before `RetroIkea.exe`. Without the token, the host can still browse and join lobbies — they just can't be listed in the public registry.
+4. The pause-menu status line shows `LISTED AS …` once the dispatch succeeds and the workflow commit has propagated to the raw CDN.
+
+Skip everything above if you only want to **join** existing servers — the lobby browser works without any token.
+
+### Self-hosted alternative (legacy FastAPI server)
+
+If you'd rather run your own always-on lobby (faster registration than GitHub Actions, no PAT requirement), the FastAPI app in [`server/`](server/) is still here:
+
+- **Run locally:** see [`server/README.md`](server/README.md).
+- **Deploy on Render / Fly.io / Railway:** apply [`render.yaml`](render.yaml) or run `uvicorn server.main:app` from the repo root. Then point the game at it with `RETRO_IKEA_LOBBY_URL=https://your-host.example` or rebuild with `-DRETRO_IKEA_DEFAULT_LOBBY_URL=https://your-host.example`.
 
 ## Push this repo to GitHub
 

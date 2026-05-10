@@ -20,6 +20,56 @@ struct UrlParts {
   int port = 80;
 };
 
+// Parsed "github://owner/repo[/branch]" form. branch defaults to "main" so the
+// canonical default URL stays compact: github://memesdudeguy/RetroIkea.
+struct GhRepoTarget {
+  std::string owner;
+  std::string repo;
+  std::string branch;
+};
+
+static bool parseGithubLobbyUrl(const char* raw, GhRepoTarget& out, std::string& err) {
+  out = GhRepoTarget{};
+  if (!raw)
+    return false;
+  std::string u(raw);
+  while (!u.empty() && (u.back() == '/' || u.back() == ' '))
+    u.pop_back();
+  constexpr const char* kPrefix = "github://";
+  constexpr size_t kPrefixLen = 9;  // strlen("github://")
+  if (u.size() < kPrefixLen || u.compare(0, kPrefixLen, kPrefix) != 0)
+    return false;  // Not a github URL; let the caller try regular http(s).
+  u.erase(0, kPrefixLen);
+  const size_t firstSlash = u.find('/');
+  if (firstSlash == std::string::npos || firstSlash == 0) {
+    err = "github lobby URL needs owner/repo (e.g. github://memesdudeguy/RetroIkea)";
+    return false;
+  }
+  out.owner = u.substr(0, firstSlash);
+  std::string rest = u.substr(firstSlash + 1);
+  const size_t secondSlash = rest.find('/');
+  if (secondSlash == std::string::npos) {
+    out.repo = rest;
+    out.branch = "main";
+  } else {
+    out.repo = rest.substr(0, secondSlash);
+    out.branch = rest.substr(secondSlash + 1);
+    if (out.branch.empty())
+      out.branch = "main";
+  }
+  if (out.owner.empty() || out.repo.empty()) {
+    err = "github lobby URL is missing owner or repo";
+    return false;
+  }
+  return true;
+}
+
+static bool isGithubLobbyUrl(const char* raw) {
+  if (!raw)
+    return false;
+  return std::strncmp(raw, "github://", 9) == 0;
+}
+
 static std::string describeLobbyRequest(const UrlParts& u, const char* path) {
   std::string s = u.tls ? "https://" : "http://";
   s += u.host;
@@ -219,6 +269,92 @@ static bool httplibDelete(const UrlParts& u, const char* path, std::string& err)
   return true;
 }
 
+// Read https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}. Anonymous; no token
+// needed. Subject to GitHub's 60-req/hour/IP unauth rate limit, which is plenty for periodic
+// browser refreshes (the title menu typically only refreshes when the user pushes REFRESH).
+static bool githubRawGet(const GhRepoTarget& gh, const char* path, std::string& bodyOut,
+                         std::string& err) {
+#if !defined(CPPHTTPLIB_OPENSSL_SUPPORT)
+  err = "GitHub-only lobby needs an OpenSSL-enabled build (HTTPS to raw.githubusercontent.com)";
+  return false;
+#else
+  httplib::SSLClient cli("raw.githubusercontent.com", 443);
+  cli.set_connection_timeout(lobbyTimeoutSec("RETRO_IKEA_LOBBY_CONNECT_TIMEOUT_SEC", 4, 1, 30), 0);
+  cli.set_read_timeout(lobbyTimeoutSec("RETRO_IKEA_LOBBY_READ_TIMEOUT_SEC", 8, 1, 60), 0);
+  cli.enable_server_certificate_verification(true);
+  std::string p = "/" + gh.owner + "/" + gh.repo + "/" + gh.branch + "/" + (path ? path : "");
+  // raw.githubusercontent.com follows the same `User-Agent: ...` etiquette as the API.
+  httplib::Headers h{{"User-Agent", "RetroIkea-Lobby/1"}};
+  auto res = cli.Get(p.c_str(), h);
+  if (!res) {
+    err = "raw.githubusercontent.com unreachable (network)";
+    return false;
+  }
+  if (res->status == 404) {
+    err = "GitHub lobby registry not found at " + p +
+          " — has the lobby workflow ever run? (it auto-creates the file).";
+    return false;
+  }
+  if (res->status < 200 || res->status >= 300) {
+    err = "GitHub raw HTTP " + std::to_string(res->status) + " at " + p;
+    return false;
+  }
+  bodyOut = res->body;
+  return true;
+#endif
+}
+
+// POST https://api.github.com/repos/{owner}/{repo}/dispatches with a personal access token to
+// trigger the lobby workflow. Token comes from RETRO_IKEA_GH_TOKEN at runtime — there is no
+// safe way to bake a write token into the public game binary. The token only needs the
+// "Contents: Read & Write" fine-grained scope on the lobby repo (so the workflow can commit
+// the registry update) — it never touches user files.
+static bool githubDispatchEvent(const GhRepoTarget& gh, const char* eventType,
+                                const std::string& clientPayloadJson, std::string& err) {
+#if !defined(CPPHTTPLIB_OPENSSL_SUPPORT)
+  err = "GitHub-only lobby needs an OpenSSL-enabled build (HTTPS to api.github.com)";
+  return false;
+#else
+  const char* token = std::getenv("RETRO_IKEA_GH_TOKEN");
+  if (!token || token[0] == '\0') {
+    err = "Set RETRO_IKEA_GH_TOKEN to a fine-grained PAT (Contents: Read & Write on " +
+          gh.owner + "/" + gh.repo + ") so this host can publish to the lobby.";
+    return false;
+  }
+  httplib::SSLClient cli("api.github.com", 443);
+  cli.set_connection_timeout(lobbyTimeoutSec("RETRO_IKEA_LOBBY_CONNECT_TIMEOUT_SEC", 4, 1, 30), 0);
+  cli.set_read_timeout(lobbyTimeoutSec("RETRO_IKEA_LOBBY_READ_TIMEOUT_SEC", 8, 1, 60), 0);
+  cli.enable_server_certificate_verification(true);
+  std::string body = std::string("{\"event_type\":\"") + eventType +
+                     "\",\"client_payload\":" + clientPayloadJson + "}";
+  std::string auth = std::string("Bearer ") + token;
+  httplib::Headers h{
+      {"User-Agent", "RetroIkea-Lobby/1"},
+      {"Accept", "application/vnd.github+json"},
+      {"X-GitHub-Api-Version", "2022-11-28"},
+      {"Authorization", auth},
+  };
+  std::string path = "/repos/" + gh.owner + "/" + gh.repo + "/dispatches";
+  auto res = cli.Post(path.c_str(), h, body, "application/json");
+  if (!res) {
+    err = "api.github.com unreachable (network)";
+    return false;
+  }
+  // 204 No Content is the documented success for repository_dispatch.
+  if (res->status < 200 || res->status >= 300) {
+    err = "GitHub dispatch HTTP " + std::to_string(res->status) + " at " + path;
+    if (res->status == 401)
+      err += " — RETRO_IKEA_GH_TOKEN missing or wrong";
+    else if (res->status == 403)
+      err += " — token lacks Contents write on " + gh.owner + "/" + gh.repo;
+    else if (res->status == 404)
+      err += " — repo not found / token has no access";
+    return false;
+  }
+  return true;
+#endif
+}
+
 static bool extractJsonStringField(const std::string& obj, const char* key, std::string& out) {
   // FastAPI / Python json.dumps uses spaces: "host": "1.2.3.4" — not "host":"1.2.3.4"
   const std::string pat = std::string("\"") + key + "\":";
@@ -309,6 +445,41 @@ const char* lobbyEnvUrl() {
 
 bool lobbyFetchServerList(const char* lobbyBaseUrl, std::vector<LobbyListedServer>& out, std::string& errMsg) {
   out.clear();
+  if (isGithubLobbyUrl(lobbyBaseUrl)) {
+    GhRepoTarget gh;
+    if (!parseGithubLobbyUrl(lobbyBaseUrl, gh, errMsg))
+      return false;
+    std::string body;
+    if (!githubRawGet(gh, "lobby/registry.json", body, errMsg))
+      return false;
+    // The GitHub-only lobby JSON has the form
+    //   { "version": 1, "ttl_sec": 90, "servers": [ {id,host,port,name,expires_at}, ... ] }
+    // Locate the "servers" array, then split top-level objects out of it.
+    const std::string serversKey = "\"servers\":";
+    size_t kp = body.find(serversKey);
+    if (kp == std::string::npos)
+      return true;  // No servers field yet — empty list, not an error.
+    kp += serversKey.size();
+    while (kp < body.size() && std::isspace(static_cast<unsigned char>(body[kp])))
+      ++kp;
+    if (kp >= body.size() || body[kp] != '[')
+      return true;
+    const auto objs = splitTopLevelJsonObjects(body.substr(kp));
+    for (const std::string& seg : objs) {
+      LobbyListedServer row{};
+      extractJsonStringField(seg, "id", row.id);
+      extractJsonStringField(seg, "host", row.host);
+      int port = 27341;
+      extractJsonIntField(seg, "port", port);
+      if (port < 1 || port > 65535)
+        port = 27341;
+      row.port = static_cast<uint16_t>(port);
+      extractJsonStringField(seg, "name", row.name);
+      if (!row.host.empty())
+        out.push_back(std::move(row));
+    }
+    return true;
+  }
   UrlParts u;
   if (!parseLobbyOrigin(lobbyBaseUrl, u, errMsg))
     return false;
@@ -338,9 +509,6 @@ bool lobbyRegisterHeartbeat(const char* lobbyBaseUrl, const char* sessionId, con
     errMsg = "Missing session or host for lobby register";
     return false;
   }
-  UrlParts u;
-  if (!parseLobbyOrigin(lobbyBaseUrl, u, errMsg))
-    return false;
   std::string escName;
   if (displayName && displayName[0] != '\0') {
     escName = displayName;
@@ -351,6 +519,15 @@ bool lobbyRegisterHeartbeat(const char* lobbyBaseUrl, const char* sessionId, con
   }
   std::string json = std::string("{\"id\":\"") + sessionId + "\",\"host\":\"" + hostIpv4 + "\",\"port\":" +
                      std::to_string(static_cast<unsigned>(port)) + ",\"name\":\"" + escName + "\"}";
+  if (isGithubLobbyUrl(lobbyBaseUrl)) {
+    GhRepoTarget gh;
+    if (!parseGithubLobbyUrl(lobbyBaseUrl, gh, errMsg))
+      return false;
+    return githubDispatchEvent(gh, "lobby_register", json, errMsg);
+  }
+  UrlParts u;
+  if (!parseLobbyOrigin(lobbyBaseUrl, u, errMsg))
+    return false;
   return httplibPostJson(u, "/api/v1/servers/register", json, errMsg);
 }
 
@@ -358,6 +535,13 @@ bool lobbyUnregisterServer(const char* lobbyBaseUrl, const char* sessionId, std:
   if (!sessionId || sessionId[0] == '\0') {
     errMsg = "Missing session id for lobby unregister";
     return false;
+  }
+  if (isGithubLobbyUrl(lobbyBaseUrl)) {
+    GhRepoTarget gh;
+    if (!parseGithubLobbyUrl(lobbyBaseUrl, gh, errMsg))
+      return false;
+    std::string json = std::string("{\"id\":\"") + sessionId + "\"}";
+    return githubDispatchEvent(gh, "lobby_unregister", json, errMsg);
   }
   UrlParts u;
   if (!parseLobbyOrigin(lobbyBaseUrl, u, errMsg))
@@ -367,13 +551,18 @@ bool lobbyUnregisterServer(const char* lobbyBaseUrl, const char* sessionId, std:
 }
 
 namespace {
-std::chrono::seconds lobbyHeartbeatPeriod() {
+std::chrono::seconds lobbyHeartbeatPeriod(const std::string& url) {
   if (const char* raw = std::getenv("RETRO_IKEA_LOBBY_HEARTBEAT_SEC")) {
     char* end = nullptr;
     long v = std::strtol(raw, &end, 10);
-    if (end != raw && v >= 5 && v <= 60)
+    if (end != raw && v >= 5 && v <= 300)
       return std::chrono::seconds(v);
   }
+  // GitHub Actions is paced in ~30s units (queue + runner spin-up); heartbeat slower than the
+  // FastAPI default to avoid filling the workflow queue with redundant register events while
+  // still beating the 90s registry TTL comfortably.
+  if (url.size() >= 9 && url.compare(0, 9, "github://") == 0)
+    return std::chrono::seconds(30);
   return std::chrono::seconds(15);
 }
 }  // namespace
@@ -448,7 +637,12 @@ bool LobbyHostPublisher::postHeartbeatLocked(std::string& errOut) {
 }
 
 void LobbyHostPublisher::workerLoop() {
-  const auto period = lobbyHeartbeatPeriod();
+  std::string snapshotUrl;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    snapshotUrl = url_;
+  }
+  const auto period = lobbyHeartbeatPeriod(snapshotUrl);
   while (!stopRequested_.load(std::memory_order_acquire)) {
     std::string err;
     {
