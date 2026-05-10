@@ -44,6 +44,7 @@
 #include "net_p2p.hpp"
 #include "lobby_http.hpp"
 #include "portable_path.hpp"
+#include "self_update.hpp"
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -22322,6 +22323,14 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
 
 int main(int argc, char** argv) {
   try {
+    std::string updateStatus;
+    if (retroIkeaAutoUpdateMaybeLaunch(updateStatus)) {
+      std::fprintf(stderr, "[update] %s; exiting old game process.\n", updateStatus.c_str());
+      return 0;
+    }
+    if (!updateStatus.empty())
+      std::fprintf(stderr, "[update] %s\n", updateStatus.c_str());
+
     App app;
     app.netMp.initFromArgs(argc, argv);
     app.initWindow();

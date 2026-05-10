@@ -188,6 +188,7 @@ add_executable(vulkan_game
   src/net_p2p.cpp
   src/lobby_http.cpp
   src/portable_path.cpp
+  src/self_update.cpp
 )
 
 if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Windows")
@@ -223,6 +224,10 @@ if(NOT RETRO_IKEA_DEFAULT_LOBBY_URL STREQUAL "")
   target_compile_definitions(vulkan_game PRIVATE
     "RETRO_IKEA_DEFAULT_LOBBY_URL=\"${RETRO_IKEA_DEFAULT_LOBBY_URL}\"")
 endif()
+set(RETRO_IKEA_RELEASE_TAG "beta-10"
+    CACHE STRING "GitHub release tag baked into the Windows self-updater")
+target_compile_definitions(vulkan_game PRIVATE
+  "RETRO_IKEA_RELEASE_TAG=\"${RETRO_IKEA_RELEASE_TAG}\"")
 
 # MinGW OpenSSL runtime DLLs (required next to RetroIkea.exe when CPPHTTPLIB_OPENSSL_SUPPORT is on).
 set(VULKAN_GAME_MINGW_OPENSSL_SSL_DLL "" CACHE FILEPATH
