@@ -1,6 +1,8 @@
 #include "net_p2p.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -57,6 +59,16 @@ static bool setNonBlocking(SockT s) {
 static bool envFlagEnabled(const char* name) {
   const char* v = std::getenv(name);
   return v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T');
+}
+
+static int envIntClamped(const char* name, int fallback, int lo, int hi) {
+  if (const char* raw = std::getenv(name)) {
+    char* end = nullptr;
+    const long v = std::strtol(raw, &end, 10);
+    if (end != raw)
+      return static_cast<int>(std::clamp<long>(v, lo, hi));
+  }
+  return fallback;
 }
 
 static void tuneUdpLowLatency(SockT s) {
@@ -700,7 +712,7 @@ bool RetroMpSession::initFromArgs(int argc, char** argv) {
   return startJoin(joinIp, joinPort);
 }
 
-void RetroMpSession::pollReceive(float /*wallDt*/) {
+void RetroMpSession::pollReceive(float wallDt) {
   if (!active)
     return;
 
@@ -708,7 +720,11 @@ void RetroMpSession::pollReceive(float /*wallDt*/) {
   sockaddr_in from{};
   socklen_t fromLen = sizeof(from);
 
-  for (;;) {
+  int packetBudget = envIntClamped("VULKAN_GAME_MP_RECV_BUDGET", 192, 32, 512);
+  if (std::isfinite(wallDt) && wallDt > (1.f / 35.f))
+    packetBudget = std::min(packetBudget, envIntClamped("VULKAN_GAME_MP_SLOW_RECV_BUDGET", 96, 16, 256));
+
+  for (int packetsRead = 0; packetsRead < packetBudget; ++packetsRead) {
 #ifdef _WIN32
     int r = ::recvfrom(static_cast<SOCKET>(sock), reinterpret_cast<char*>(dgram), static_cast<int>(sizeof(dgram)), 0,
                        reinterpret_cast<sockaddr*>(&from), &fromLen);

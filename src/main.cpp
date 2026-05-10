@@ -746,7 +746,12 @@ constexpr uint32_t kMaxDeliPizzaInstances = 2048;
 constexpr uint32_t kMaxDeliMeatballInstances = 2048;
 constexpr int kDeliPizzaSlicesPerCounter = 6;
 constexpr int kDeliMeatballsPerCounter = 6;
+constexpr float kDeliFoodPickupRadius = 1.0f;
 constexpr float kDeliFoodRenderDist = 10.0f;
+constexpr float kDefaultNewGameSpawnX = 0.f;
+constexpr float kDefaultNewGameSpawnZ = 6.f;
+constexpr float kSpawnFoodPickupRadius = 5.75f;
+constexpr float kSpawnFoodPickupAreaRadius = 8.0f;
 constexpr uint32_t kMaxMarketInstances = 512;
 constexpr int kDeliBiomeClusterSpan = 10;
 constexpr int kDeliClearPad = 1;
@@ -769,6 +774,14 @@ struct Vertex {
   glm::vec4 color; // .a = 1 for world geometry; staff uses .a for baked part tag
   glm::vec2 uv{};
 };
+
+static float deliFoodPickupRadiusAt(float x, float z) {
+  const float dx = x - kDefaultNewGameSpawnX;
+  const float dz = z - kDefaultNewGameSpawnZ;
+  if (dx * dx + dz * dz <= kSpawnFoodPickupAreaRadius * kSpawnFoodPickupAreaRadius)
+    return kSpawnFoodPickupRadius;
+  return kDeliFoodPickupRadius;
+}
 
 static inline glm::vec4 vrgb(const glm::vec3& c) {
   return glm::vec4(c, 1.f);
@@ -1363,7 +1376,6 @@ constexpr float kPlayerHungerDrainPerSec = 0.25f;
 // At 0 hunger: lose HP until death or hunger is restored (pizza / deli).
 constexpr float kPlayerHungerStarveDamagePerSec = 12.f;
 constexpr float kDeliPizzaReplenishSec = 300.f;
-constexpr float kDeliFoodPickupRadius = 1.0f;
 constexpr float kPlayerScreenDamagePulseRefDmg = 50.f;
 constexpr float kPlayerScreenDamagePulseDecayPerSec = 2.05f;
 constexpr float kFallDamageEarthG = 9.81f;
@@ -2068,6 +2080,15 @@ static int shelfBiomeClusterCoord(int worldI, int span) {
   return -((-worldI + span - 1) / span);
 }
 
+static bool spawnDeliSlot(int worldAisleI, int worldAlongI) {
+  return worldAisleI >= -1 && worldAisleI <= 0 && worldAlongI >= 0 && worldAlongI <= 1;
+}
+
+static bool spawnDeliClearZone(int worldAisleI, int worldAlongI) {
+  return worldAisleI >= -1 - kDeliClearPad && worldAisleI <= 0 + kDeliClearPad &&
+         worldAlongI >= 0 - kDeliClearPad && worldAlongI <= 1 + kDeliClearPad;
+}
+
 static bool deliClusterBase(int ca, int cl, int& baseA, int& baseL) {
   const uint32_t h = scp3008ShelfHash(ca, cl, 0xDE11B10E);
   if ((h % 8u) != 0u) return false;
@@ -2087,6 +2108,8 @@ static bool deliClusterBase(int ca, int cl, int& baseA, int& baseL) {
 }
 
 static bool cellInDeliClearZone(int worldAisleI, int worldAlongI) {
+  if (spawnDeliClearZone(worldAisleI, worldAlongI))
+    return true;
   const int ca = shelfBiomeClusterCoord(worldAisleI, kDeliBiomeClusterSpan);
   const int cl = shelfBiomeClusterCoord(worldAlongI, kDeliBiomeClusterSpan);
   int baseA, baseL;
@@ -4061,13 +4084,15 @@ static bool shelfRackIntersectsAnyPillar(float cx, float cz, float yawDeg) {
 }
 
 static bool deliBarSlotOccupied(int worldAisleI, int worldAlongI) {
-  const int ca = shelfBiomeClusterCoord(worldAisleI, kDeliBiomeClusterSpan);
-  const int cl = shelfBiomeClusterCoord(worldAlongI, kDeliBiomeClusterSpan);
-  int baseA, baseL;
-  if (!deliClusterBase(ca, cl, baseA, baseL)) return false;
-  const int da = worldAisleI - baseA;
-  const int dl = worldAlongI - baseL;
-  if (da < 0 || da > 1 || dl < 0 || dl > 1) return false;
+  if (!spawnDeliSlot(worldAisleI, worldAlongI)) {
+    const int ca = shelfBiomeClusterCoord(worldAisleI, kDeliBiomeClusterSpan);
+    const int cl = shelfBiomeClusterCoord(worldAlongI, kDeliBiomeClusterSpan);
+    int baseA, baseL;
+    if (!deliClusterBase(ca, cl, baseA, baseL)) return false;
+    const int da = worldAisleI - baseA;
+    const int dl = worldAlongI - baseL;
+    if (da < 0 || da > 1 || dl < 0 || dl > 1) return false;
+  }
   const float cx = (static_cast<float>(worldAisleI) + 0.5f) * kShelfAisleModulePitch;
   const float cz = (static_cast<float>(worldAlongI) + 0.5f) * kShelfAlongAislePitch;
   const float hl = kDeliCounterHalfL + kDeliCounterTopOverhang;
@@ -8439,7 +8464,7 @@ struct App {
     const float cx = (static_cast<float>(wa) + 0.5f) * kShelfAisleModulePitch;
     const float cz = (static_cast<float>(wl) + 0.5f) * kShelfAlongAislePitch;
     const float d = glm::length(pc - glm::vec2(cx, cz));
-    if (d > kDeliFoodPickupRadius + kPickupSlack)
+    if (d > deliFoodPickupRadiusAt(pkt.camX, pkt.camZ) + kPickupSlack)
       return false;
 
     const uint64_t k = deliPizzaSlotKey(wa, wl);
@@ -10565,11 +10590,6 @@ struct App {
     if (!ok)
       ok = tryLoadTextureFile(VULKAN_GAME_ASSETS_DIR "/textures/deli_metal_brushed.jpg",
                               "assets/textures/deli_metal_brushed.jpg", deliMetalTextureImage,
-                              deliMetalTextureMemory, deliMetalTextureView, deliMetalTextureSampler);
-    // Ship folder often has no deli_metal_brushed.jpg — reuse bundled shelf steel so deli counters aren't flat grey.
-    if (!ok)
-      ok = tryLoadTextureFile(VULKAN_GAME_ASSETS_DIR "/textures/shelf_rack_metal_osb.jpg",
-                              "assets/textures/shelf_rack_metal_osb.jpg", deliMetalTextureImage,
                               deliMetalTextureMemory, deliMetalTextureView, deliMetalTextureSampler);
     if (!ok) {
       std::cerr << "[tex] deli metal: no texture candidates loaded — brushed grey placeholder\n";
@@ -15091,6 +15111,8 @@ struct App {
 static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
   if (!gDeliMeatballMeshLoaded)
     return false;
+  if (spawnDeliSlot(worldAisleI, worldAlongI))
+    return (((worldAisleI + 1) + worldAlongI) & 1) == 0;
   const int ca = shelfBiomeClusterCoord(worldAisleI, kDeliBiomeClusterSpan);
   const int cl = shelfBiomeClusterCoord(worldAlongI, kDeliBiomeClusterSpan);
   int baseA, baseL;
@@ -15299,7 +15321,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
   }
 
   bool tryPickupNearestDeliPizzaSlice() {
-    constexpr float kPickupRadius = kDeliFoodPickupRadius;
+    const float kPickupRadius = deliFoodPickupRadiusAt(camPos.x, camPos.z);
     int waMin, waMax, wlMin, wlMax;
     shelfGridWindowForRange(camPos.x, camPos.z, kPickupRadius + 1.0f, waMin, waMax, wlMin, wlMax);
     bool foundDeli = false;
@@ -15381,38 +15403,52 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
         auto itPz = deliPizzaSlicesBySlot.find(k);
         if (itPz == deliPizzaSlicesBySlot.end() || itPz->second == 0)
           return false;
-        --itPz->second;
+        const int takeCount = static_cast<int>(itPz->second);
+        itPz->second = 0;
         deliPizzaReplenishTimerBySlot[k] = kDeliPizzaReplenishSec;
-        inventoryItems.emplace_back("PIZZA SLICE");
+        for (int i = 0; i < takeCount; ++i)
+          inventoryItems.emplace_back("PIZZA SLICE");
       } else if (canPickupMeatball) {
         deliMeatballsRemaining(bestWa, bestWl);
         auto itMb = deliMeatballsBySlot.find(k);
         if (itMb == deliMeatballsBySlot.end() || itMb->second == 0)
           return false;
-        --itMb->second;
+        const int takeCount = static_cast<int>(itMb->second);
+        itMb->second = 0;
         deliMeatballReplenishTimerBySlot[k] = kDeliPizzaReplenishSec;
-        inventoryItems.emplace_back("MEATBALL");
+        for (int i = 0; i < takeCount; ++i)
+          inventoryItems.emplace_back("MEATBALL");
       } else {
         return false;
       }
     } else {
       RetroMpDeliPickupPacket dp{};
-      dp.seq = ++mpClientDeliPickupSeq;
       dp.deliSlotKey = k;
       dp.camX = camPos.x;
       dp.camZ = camPos.z;
       if (canPickupPizza) {
         dp.foodKind = kRetroMpDeliPickupPizza;
-        ++mpClientDeliLocalTakePizza[k];
-        inventoryItems.emplace_back("PIZZA SLICE");
+        const int takeCount = std::clamp(pizzaRem, 1, kDeliPizzaSlicesPerCounter);
+        mpClientDeliLocalTakePizza[k] =
+            static_cast<uint8_t>(std::min<int>(255, mpClientDeliLocalTakePizza[k] + takeCount));
+        for (int i = 0; i < takeCount; ++i) {
+          inventoryItems.emplace_back("PIZZA SLICE");
+          dp.seq = ++mpClientDeliPickupSeq;
+          netMp.sendDeliPickupRequest(dp);
+        }
       } else if (canPickupMeatball) {
         dp.foodKind = kRetroMpDeliPickupMeat;
-        ++mpClientDeliLocalTakeMeat[k];
-        inventoryItems.emplace_back("MEATBALL");
+        const int takeCount = std::clamp(meatRem, 1, kDeliMeatballsPerCounter);
+        mpClientDeliLocalTakeMeat[k] =
+            static_cast<uint8_t>(std::min<int>(255, mpClientDeliLocalTakeMeat[k] + takeCount));
+        for (int i = 0; i < takeCount; ++i) {
+          inventoryItems.emplace_back("MEATBALL");
+          dp.seq = ++mpClientDeliPickupSeq;
+          netMp.sendDeliPickupRequest(dp);
+        }
       } else {
         return false;
       }
-      netMp.sendDeliPickupRequest(dp);
     }
     ++inventoryRevision;
     const int maxScroll = std::max(0, inventoryStackRowCount() - 8);
@@ -15421,7 +15457,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
   }
 
   bool canPickupNearbyDeliFood() {
-    constexpr float kPickupRadius = kDeliFoodPickupRadius;
+    const float kPickupRadius = deliFoodPickupRadiusAt(camPos.x, camPos.z);
     int waMin, waMax, wlMin, wlMax;
     shelfGridWindowForRange(camPos.x, camPos.z, kPickupRadius + 1.0f, waMin, waMax, wlMin, wlMax);
     float bestD2 = kPickupRadius * kPickupRadius;
@@ -15446,7 +15482,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
       }
     }
     {
-      constexpr float kr2Nearby = kDeliFoodPickupRadius * kDeliFoodPickupRadius;
+      const float kr2Nearby = kPickupRadius * kPickupRadius;
       for (const WorldDroppedFood& d : worldDroppedFood) {
         const float dx = d.pos.x - camPos.x;
         const float dz = d.pos.z - camPos.z;
@@ -19399,7 +19435,7 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
   }
 
   void applyDefaultNewGameState() {
-    camPos = glm::vec3(0.f, kGroundY + kEyeHeight, 6.f);
+    camPos = glm::vec3(kDefaultNewGameSpawnX, kGroundY + kEyeHeight, kDefaultNewGameSpawnZ);
     yaw = -glm::pi<float>() * 0.5f;
     pitch = 0.f;
     eyeHeight = kEyeHeight;
@@ -19836,12 +19872,13 @@ static bool deliCounterUsesMeatballs(int worldAisleI, int worldAlongI) {
 #endif
       updateShelfEmployees(dt);
       if (netMp.active && netMp.isHost && netMp.peerHostUtf8[0] != '\0') {
-        netWorldSyncAccumSec += dt;
+        // Keep host world-state traffic paced after frame hitches; slow PCs should not burst catch-up packets.
         const int worldHz = std::clamp(envIntOrDefault("VULKAN_GAME_MP_WORLD_HZ", 20), 5, 30);
         const float worldStep = 1.f / static_cast<float>(worldHz);
-        while (netWorldSyncAccumSec >= worldStep) {
-          netWorldSyncAccumSec -= worldStep;
+        netWorldSyncAccumSec = std::min(netWorldSyncAccumSec + dt, worldStep);
+        if (netWorldSyncAccumSec >= worldStep) {
           buildAndSendMpWorldSync();
+          netWorldSyncAccumSec = 0.f;
         }
       } else {
         netWorldSyncAccumSec = 0.f;
